@@ -19,8 +19,8 @@ impl KernelReadBinding {
         if !Weak::ptr_eq(&scope.peers, &Arc::downgrade(peers)) {
             return Some(Reason::InputOwnerMismatch);
         }
-        if !self.original_peer_identity_is_current(&scope, observed_at) {
-            return Some(Reason::InputReadPeerRejected);
+        if let Some(reason) = self.original_peer_identity_rejection(&scope, observed_at) {
+            return Some(reason);
         }
         if !scope.is_live(observed_at) {
             return Some(Reason::InputScopeNotLive);

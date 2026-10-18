@@ -259,3 +259,91 @@ async fn first_read_peer_wrong_vip_offline_and_weak_owners_never_grant_credit() 
         "immutable metadata remains historical only"
     );
 }
+
+#[tokio::test]
+async fn read_peer_revalidation_diagnostic_distinguishes_actual_try_lock_sites() {
+    use FullRetentionLossReason as Reason;
+    let (setup, _parent, peers) = setup().await;
+    let first = collect(&setup.session);
+    assert_eq!(first.current_rejection(&peers, Instant::now()), None);
+    {
+        let gate = peers.network_epoch_gate();
+        let _held = gate.try_lock().unwrap();
+        assert_eq!(
+            first.current_rejection(&peers, Instant::now()),
+            Some(Reason::ReadPeerEpochContended)
+        );
+    }
+    peers.with_original_kernel_peer_connections_held_for_test(|| {
+        assert_eq!(
+            first.current_rejection(&peers, Instant::now()),
+            Some(Reason::ReadPeerConnectionsContended)
+        );
+    });
+    peers.with_original_kernel_peer_membership_held_for_test(|| {
+        assert_eq!(
+            first.current_rejection(&peers, Instant::now()),
+            Some(Reason::ReadPeerMembershipContended)
+        );
+    });
+    no_kernel_credit(&setup.session);
+}
+
+#[tokio::test]
+async fn read_peer_revalidation_diagnostic_keeps_identity_generation_and_lifecycle_distinct() {
+    use FullRetentionLossReason as Reason;
+    let (setup, _parent, peers) = setup().await;
+    let first = collect(&setup.session);
+    let foreign =
+        PeerManager::new(crate::Config::generate_default("http://ctrl.test", "default").unwrap());
+    assert_eq!(
+        first.current_rejection(&foreign, Instant::now()),
+        Some(Reason::ReadPeerIdentityRejected)
+    );
+    peers
+        .advance_network_generation("read-peer-negative-diagnostic")
+        .await;
+    assert_eq!(
+        first.current_rejection(&peers, Instant::now()),
+        Some(Reason::ReadPeerGenerationChanged)
+    );
+    no_kernel_credit(&setup.session);
+    let (other, _parent, peers) = self::setup().await;
+    let first = collect(&other.session);
+    peers.remove_peer(PEER).await;
+    peers.add_peer(&info()).await;
+    assert_eq!(
+        first.current_rejection(&peers, Instant::now()),
+        Some(Reason::ReadPeerLifecycleChanged)
+    );
+    no_kernel_credit(&other.session);
+}
+
+#[tokio::test]
+async fn read_peer_revalidation_diagnostic_never_refills_first_capture_or_first_loss() {
+    use FullRetentionLossReason as Reason;
+    let (setup, _parent, peers) = setup().await;
+    let gate = peers.network_epoch_gate();
+    let held = gate.try_lock().unwrap();
+    let first = collect(&setup.session);
+    let rejected = first.current_rejection(&peers, Instant::now()).unwrap();
+    assert_eq!(rejected, Reason::ReadPeerEpochContended);
+    setup.session.original_full_retention_lost(rejected);
+    drop(held);
+    let same = collect(&setup.session);
+    assert!(Arc::ptr_eq(&first, &same));
+    assert_eq!(
+        same.current_rejection(&peers, Instant::now()),
+        Some(rejected)
+    );
+    setup
+        .session
+        .original_full_retention_lost(Reason::ReadPeerGenerationChanged);
+    let value = serde_json::to_value(setup.session.snapshot().unwrap()).unwrap();
+    assert_eq!(
+        value["first_original_full_retention_loss"],
+        "read_peer_epoch_contended"
+    );
+    assert_eq!(value["original_full_retention_complete"], false);
+    no_kernel_credit(&setup.session);
+}

@@ -53,10 +53,17 @@ impl FirstReadPeer {
         Self { original }
     }
 
-    fn is_current(&self, peers: &PeerManager, at: Instant) -> bool {
+    fn current_rejection(
+        &self,
+        peers: &PeerManager,
+        at: Instant,
+    ) -> Option<FullRetentionLossReason> {
         self.original
             .as_ref()
-            .is_ok_and(|original| original.try_identity_at(peers, at).is_ok())
+            .map_err(|reason| *reason)
+            .and_then(|original| original.try_identity_at(peers, at))
+            .err()
+            .map(FullRetentionLossReason::read_peer)
     }
 
     #[cfg(unix)]
@@ -101,19 +108,20 @@ impl CaptureSession {
 }
 
 impl KernelReadBinding {
-    pub(super) fn original_peer_identity_is_current(
+    pub(super) fn original_peer_identity_rejection(
         &self,
         scope: &CaptureSession,
         at: Instant,
-    ) -> bool {
-        scope.peers.upgrade().is_some_and(|peers| {
-            !self.original_peers.is_empty()
-                && self.original_peers.len() == self.slots.len()
-                && self
-                    .original_peers
-                    .iter()
-                    .all(|original| original.is_current(&peers, at))
-        })
+    ) -> Option<FullRetentionLossReason> {
+        let Some(peers) = scope.peers.upgrade() else {
+            return Some(FullRetentionLossReason::ReadPeerOwnerUnavailable);
+        };
+        if self.original_peers.is_empty() || self.original_peers.len() != self.slots.len() {
+            return Some(FullRetentionLossReason::ReadPeerBindingsInvalid);
+        }
+        self.original_peers
+            .iter()
+            .find_map(|original| original.current_rejection(&peers, at))
     }
 
     pub(crate) fn original_peer_matches_encryption(

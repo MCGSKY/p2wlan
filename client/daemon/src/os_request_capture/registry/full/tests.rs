@@ -336,3 +336,52 @@ async fn encryption_capture_diagnostic_records_without_registry_lock_or_rearm() 
     drop(held);
     assert_no_full_credit(&setup.session, false);
 }
+
+#[test]
+fn read_peer_revalidation_diagnostic_codes_append_without_changing_old_codes_or_first_loss() {
+    use super::super::FullRetentionLoss;
+    use crate::overlay_requests::{
+        OverlayCreditLockSite as Lock, OverlayCreditOutcome as Outcome, OverlayCreditStale as Stale,
+    };
+    use FullRetentionLossReason::*;
+    assert_eq!(RoutedRoomPermitRejected as u8, 36);
+    assert_eq!(InputReadPeerRejected as u8, 30);
+    assert_eq!(InputRegistryContended as u8, 17);
+    for (code, reason, text) in [
+        (37, ReadPeerOwnerUnavailable, "read_peer_owner_unavailable"),
+        (38, ReadPeerBindingsInvalid, "read_peer_bindings_invalid"),
+        (39, ReadPeerIdentityRejected, "read_peer_identity_rejected"),
+        (40, ReadPeerEpochContended, "read_peer_epoch_contended"),
+        (
+            41,
+            ReadPeerConnectionsContended,
+            "read_peer_connections_contended",
+        ),
+        (
+            42,
+            ReadPeerMembershipContended,
+            "read_peer_membership_contended",
+        ),
+        (
+            43,
+            ReadPeerGenerationChanged,
+            "read_peer_generation_changed",
+        ),
+        (44, ReadPeerLifecycleChanged, "read_peer_lifecycle_changed"),
+        (45, ReadPeerStateRejected, "read_peer_state_rejected"),
+    ] {
+        assert_eq!(reason as u8, code);
+        let first = FullRetentionLoss::new();
+        first.record(reason);
+        first.record(InputReadPeerRejected);
+        assert_eq!(serde_json::to_value(first.snapshot()).unwrap(), text);
+    }
+    assert_eq!(
+        FullRetentionLossReason::read_peer(Outcome::Contended(Lock::Emit)),
+        InputReadPeerRejected
+    );
+    assert_eq!(
+        FullRetentionLossReason::read_peer(Outcome::Stale(Stale::PeerState)),
+        ReadPeerStateRejected
+    );
+}
