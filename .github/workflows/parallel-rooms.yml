@@ -204,8 +204,16 @@ jobs:
             --report "$RUNNER_TEMP/linux-tun-application/report.json" \
             --report "$RUNNER_TEMP/linux-tun-recovery/report.json" \
             --report "$RUNNER_TEMP/linux-tun-server-stall/report.json" \
-            --report "$RUNNER_TEMP/linux-tun-room-revocation/report.json" \
             --output "$RUNNER_TEMP/linux-tun-original-programs"
+      - name: Retain original room revocation failure programs
+        if: failure()
+        run: |
+          sudo --preserve-env=GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT python3 scripts/parallel-rooms/retain_linux_tun_programs.py \
+            --daemon target/debug/p2wlan-daemon \
+            --control target/debug/p2wlan-control \
+            --head "$(git rev-parse HEAD)" \
+            --report "$RUNNER_TEMP/linux-tun-room-revocation/report.json" \
+            --output "$RUNNER_TEMP/linux-tun-room-revocation-original-programs"
       - name: Retain original supplementary Relay failure programs
         if: failure()
         run: |
@@ -229,6 +237,7 @@ jobs:
             ${{ runner.temp }}/linux-tun-recovery/
             ${{ runner.temp }}/linux-tun-server-stall/
             ${{ runner.temp }}/linux-tun-room-revocation/
+            ${{ runner.temp }}/linux-tun-room-revocation-original-programs/
             ${{ runner.temp }}/linux-tun-original-programs/
             ${{ runner.temp }}/linux-tun-relay-udp/
             ${{ runner.temp }}/linux-tun-relay-tcp/
