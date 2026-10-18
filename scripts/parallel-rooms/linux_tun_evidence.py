@@ -541,9 +541,7 @@ def main() -> int:
                             and application_ok)
         if args.kernel_read_facts:
             original_kernel = report.get("original_kernel_read_observations", {})
-            qualified = original_kernel.get("passed") is True and original_kernel.get("full128_owner_evidence_complete") is True
-            if args.room_revocation:
-                qualified = report.get("room_revocation", {}).get("passed") is True
+            qualified = revoke_contract.kernel_evidence_passed(report, room_revocation=args.room_revocation)
             report["kernel_environment_verified"] = qualified
             report["canonical_current_owner_verified"] = qualified and original_kernel.get("canonical_current_owner_verified") is True
             report["passed"] = report["passed"] and qualified
@@ -563,11 +561,12 @@ def main() -> int:
         result["original_write_observations_passed"] = report.get("original_write_observations", {}).get("passed", False)
     if args.kernel_read_facts:
         result["original_kernel_read_observations_passed"] = report.get("original_kernel_read_observations", {}).get("passed", False)
+    if args.room_revocation:
+        result["room_revocation_observations_passed"] = revoke_contract.kernel_evidence_passed(report, room_revocation=True)
     print(json.dumps(result))
-    return int(not report["passed"] or (args.write_facts and not
-               report.get("original_write_observations", {}).get("passed", False)) or (args.kernel_read_facts and not
-               (report.get("original_kernel_read_observations", {}).get("passed", False)
-                and report.get("kernel_control_cleanup", {}).get("complete", False))))
+    return revoke_contract.exit_status(report, write_facts=args.write_facts,
+                                       kernel_read_facts=args.kernel_read_facts,
+                                       room_revocation=args.room_revocation)
 
 
 if __name__ == "__main__":

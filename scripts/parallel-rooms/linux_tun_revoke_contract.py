@@ -8,6 +8,30 @@ import linux_tun_native_transaction as native
 SCOPE = "linux_same_host_kernel_tun_original_room_revocation"
 
 
+def kernel_evidence_passed(report, *, room_revocation):
+    """One report/exit rule; a negative scope grants no all-positive credit."""
+    if room_revocation:
+        negative = report.get("room_revocation")
+        return (report.get("scope") == SCOPE and isinstance(negative, dict)
+                and negative.get("scope") == "actual_survivor_original_room_refusal"
+                and negative.get("passed") is True)
+    original = report.get("original_kernel_read_observations")
+    return (isinstance(original, dict) and original.get("passed") is True
+            and original.get("full128_owner_evidence_complete") is True)
+
+
+def exit_status(report, *, write_facts, kernel_read_facts, room_revocation):
+    if room_revocation and not (write_facts and kernel_read_facts):
+        return 1
+    writes = report.get("original_write_observations") or {}
+    control = report.get("kernel_control_cleanup") or {}
+    write_ok = not write_facts or writes.get("passed") is True
+    kernel_ok = not kernel_read_facts or (
+        kernel_evidence_passed(report, room_revocation=room_revocation)
+        and control.get("complete") is True)
+    return int(report.get("passed") is not True or not write_ok or not kernel_ok)
+
+
 def require(value, reason):
     if not value:
         raise ValueError(reason)

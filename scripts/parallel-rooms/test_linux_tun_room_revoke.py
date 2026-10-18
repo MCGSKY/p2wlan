@@ -1,6 +1,7 @@
 """Actual socket metadata and serialized negative controls; no native-owner facts."""
 from copy import deepcopy
 import json
+import itertools
 import socket
 from types import SimpleNamespace
 import unittest
@@ -8,6 +9,7 @@ import unittest
 from linux_tun_contract import manifest as original_manifest
 from linux_tun_kernel_capture import Endpoint
 from linux_tun_revoke_contract import (DeferredLastWindow, historical_last_sources,
+                                       SCOPE, exit_status, kernel_evidence_passed,
                                        manifest, refused_credit, summarize)
 
 
@@ -176,6 +178,52 @@ class SerializedControls(unittest.TestCase):
         self.assertFalse(result["all_responses_observed"])
         entries[0]["count"] = 7
         with self.assertRaises(ValueError):summarize(entries)
+
+    def exit_model(self):
+        return dict(scope=SCOPE, passed=True, original_write_observations=dict(passed=True),
+                    kernel_control_cleanup=dict(complete=True),
+                    original_kernel_read_observations=dict(passed=False, full128_owner_evidence_complete=False),
+                    room_revocation=dict(scope="actual_survivor_original_room_refusal", passed=True))
+
+    def test_expected_negative_report_exits_zero_without_claiming_all_positive_native_credit(self):
+        report = self.exit_model()
+        self.assertTrue(kernel_evidence_passed(report, room_revocation=True))
+        self.assertEqual(exit_status(report, write_facts=True, kernel_read_facts=True, room_revocation=True), 0)
+        self.assertFalse(report["original_kernel_read_observations"]["passed"])
+        self.assertEqual(exit_status(report, write_facts=True, kernel_read_facts=True, room_revocation=False), 1)
+
+    def test_negative_exit_still_requires_writes_cleanup_report_and_exact_explicit_scope(self):
+        for change in ["write", "cleanup", "report", "negative", "scope", "negative_scope", "missing"]:
+            report = self.exit_model()
+            if change == "write":report["original_write_observations"]["passed"] = False
+            elif change == "cleanup":report["kernel_control_cleanup"]["complete"] = False
+            elif change == "report":report["passed"] = False
+            elif change == "negative":report["room_revocation"]["passed"] = False
+            elif change == "scope":report["scope"] = "linux_same_host_kernel_tun_application"
+            elif change == "negative_scope":report["room_revocation"]["scope"] = "label_only"
+            else:report.pop("room_revocation")
+            with self.subTest(change=change):
+                self.assertEqual(exit_status(report, write_facts=True, kernel_read_facts=True, room_revocation=True), 1)
+        for writes, kernel in [(False,True),(True,False),(False,False)]:
+            self.assertEqual(exit_status(self.exit_model(), write_facts=writes, kernel_read_facts=kernel, room_revocation=True), 1)
+
+    def test_positive_exit_boolean_models_preserve_original_constructor_and_cleanup_rule(self):
+        for scope in ["normal", "blackhole", "stall", "relay"]:
+            for healthy, native_passed, complete, writes, cleanup in itertools.product([False,True], repeat=5):
+                passed = healthy and native_passed and complete
+                report = dict(scope=scope, passed=passed, original_write_observations=dict(passed=writes),
+                    kernel_control_cleanup=dict(complete=cleanup),
+                    original_kernel_read_observations=dict(passed=native_passed,full128_owner_evidence_complete=complete),
+                    room_revocation=dict(scope="actual_survivor_original_room_refusal",passed=True))
+                expected = int(not passed or not writes or not(native_passed and cleanup))
+                self.assertEqual(exit_status(report,write_facts=True,kernel_read_facts=True,room_revocation=False),expected)
+
+    def test_positive_scope_never_accepts_missing_or_incomplete_native_sources(self):
+        for value in [None, {}, dict(passed=True), dict(passed=True,full128_owner_evidence_complete=False),
+                      dict(passed="true",full128_owner_evidence_complete=True)]:
+            report = self.exit_model();report["original_kernel_read_observations"] = value
+            self.assertFalse(kernel_evidence_passed(report,room_revocation=False))
+            self.assertEqual(exit_status(report,write_facts=True,kernel_read_facts=True,room_revocation=False),1)
 
 
 if __name__ == "__main__":
