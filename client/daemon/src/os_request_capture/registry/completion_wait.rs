@@ -6,6 +6,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod failure;
+
 #[derive(Serialize)]
 pub(in crate::os_request_capture) struct TerminalMetadataReceipt {
     scope: &'static str,

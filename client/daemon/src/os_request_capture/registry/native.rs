@@ -13,6 +13,8 @@ type Check<T> = Result<T, Outcome>;
 mod epoch_guard_tests;
 mod selection;
 #[cfg(all(unix, test))]
+mod terminal_failure_tests;
+#[cfg(all(unix, test))]
 mod terminal_wait_tests;
 
 pub(crate) struct OriginalKernelExchange {

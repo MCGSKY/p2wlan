@@ -355,7 +355,10 @@ impl ControlChannel {
                     let end = self
                         .session
                         .metadata_command_deadline(original_deadline_ns)?;
-                    let value = self.session.wait_original_outcomes(producer, end).await?;
+                    let value = self
+                        .session
+                        .wait_original_outcomes_observed(producer, end, original_deadline_ns)
+                        .await?;
                     (serde_json::to_vec(&value), end)
                 }
             };
