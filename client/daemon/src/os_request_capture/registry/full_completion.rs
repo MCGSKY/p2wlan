@@ -1,6 +1,6 @@
 //! Resume metadata work on the existing descriptor actor after a real Full.
 //! No task, packet retry, fresh deadline or replacement native fact is created.
-use super::{CaptureSession, FullRetentionLossReason, KernelReadBinding};
+use super::{CaptureSession, FullRetentionLossReason, KernelReadBinding, RegistryState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, TryLockError};
 use tokio::sync::Notify;
@@ -67,6 +67,13 @@ impl CaptureSession {
                 return;
             }
         };
+        self.complete_pending_fulls_in(&mut state);
+    }
+
+    pub(super) fn complete_pending_fulls_in(self: &Arc<Self>, state: &mut RegistryState) {
+        if !self.full_completion_pending() || !self.is_live(std::time::Instant::now()) {
+            return;
+        }
         // Clear only after acquisition. A contended attempt keeps its marker
         // and waits for an unlock, rather than polling or losing the event.
         self.pending_full.pending.store(false, Ordering::Release);
@@ -78,7 +85,7 @@ impl CaptureSession {
             let read = read.clone();
             // The original transaction still checks its original window and
             // current owners try-only. Existing terminal outcomes are skipped.
-            self.try_complete_original_frames(&mut state, read.flow, &read.slots);
+            self.try_complete_original_frames(state, read.flow, &read.slots);
         }
     }
 }

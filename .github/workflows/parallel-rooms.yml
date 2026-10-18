@@ -68,6 +68,7 @@ jobs:
             python scripts/parallel-rooms/test_linux_tun_relay.py -v
             python scripts/parallel-rooms/test_linux_tun_room_revoke.py -v
             python scripts/parallel-rooms/test_linux_tun_cleanup_gate.py -v
+            python scripts/dual-end/test_probe_completion_barrier.py -v
           else
             python3 scripts/parallel-rooms/test_linux_tun_kernel_capture.py -v
             python3 scripts/parallel-rooms/test_linux_tun_live_window.py -v
@@ -75,6 +76,7 @@ jobs:
             python3 scripts/parallel-rooms/test_linux_tun_relay.py -v
             python3 scripts/parallel-rooms/test_linux_tun_room_revoke.py -v
             python3 scripts/parallel-rooms/test_linux_tun_cleanup_gate.py -v
+            python3 scripts/dual-end/test_probe_completion_barrier.py -v
           fi
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
         with:

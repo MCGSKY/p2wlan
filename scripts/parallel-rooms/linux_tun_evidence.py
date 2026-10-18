@@ -215,8 +215,11 @@ def measure(lab: EvidenceLab, groups: OwnedGroups, entry: dict, out: Path, snaps
     echo_log, probe_log = out / (stem + "-echo.log"), out / (stem + "-probe.log")
     echo_report, probe_report = out / (stem + "-echo.json"), out / (stem + "-probe.json")
     clean = {k: v for k, v in os.environ.items() if not k.startswith("P2WLAN_")}
+    echo_argv = tool_argv(tool, "echo", destination, bind, entry, echo_report)
+    if protocol == "tcp" and getattr(lab.args, "kernel_read_facts", False):
+        echo_argv.extend(["--completion-barrier", str(out / (stem + "-window-handoff.json"))])
     echo = groups.spawn(stem + "-echo", ["ip", "netns", "exec", lab.ns(lab.daemons[target]["namespace"]),
-                                       *tool_argv(tool, "echo", destination, bind, entry, echo_report)],
+                                       *echo_argv],
                         echo_log, env=clean, socket_tool=True)
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
@@ -426,6 +429,7 @@ def main() -> int:
                                  Path(__file__).with_name("linux_tun_room_revoke.py"),
                                  Path(__file__).with_name("udp_stall_echo.py"),
                                  DUAL / "udp_business_probe.py", DUAL / "udp_business_summary.py", DUAL / "tcp_business_probe.py",
+                                 DUAL / "probe_completion_barrier.py",
                                  ROOT / ".github/workflows/parallel-rooms.yml")},
               "binary_sha256": {"daemon": None, "control": None}}
     plan = None
@@ -467,6 +471,8 @@ def main() -> int:
                                     kernel_control_bytes_per_stream=4 * 1024 * 1024,
                                     kernel_registered_requests_per_daemon=1000, kernel_capture_TTL_seconds=120,
                                     kernel_capture_additional_process_groups=0)
+            report["limits"].update(tcp_terminal_handoff_files=4,
+                                    tcp_terminal_handoff_bytes=1024, tcp_terminal_handoff_reads_per_child=128)
             for name in ["linux_tun_kernel_capture.py", "linux_tun_live_window.py", "linux_tun_native_transaction.py"]:
                 path = Path(__file__).with_name(name)
                 report["source_sha256"][str(path.relative_to(ROOT))] = digest(path)

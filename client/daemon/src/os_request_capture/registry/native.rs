@@ -10,6 +10,8 @@ use crate::rooms::RoomSendPermit;
 
 type Check<T> = Result<T, Outcome>;
 mod selection;
+#[cfg(all(unix, test))]
+mod terminal_wait_tests;
 
 pub(crate) struct OriginalKernelExchange {
     scope: Weak<CaptureSession>,
@@ -393,6 +395,7 @@ impl CaptureSession {
         flow: usize,
         slots: &[usize],
     ) {
+        let mut completed = false;
         for &slot in slots {
             if state.flows[flow].requests[slot].native_credit.is_some() {
                 continue;
@@ -403,6 +406,7 @@ impl CaptureSession {
                 Err(reason) => {
                     state.flows[flow].requests[slot].native_credit =
                         Some(NativeFrameOutcome::failure(reason));
+                    completed = true;
                     continue;
                 }
             };
@@ -421,6 +425,7 @@ impl CaptureSession {
                     .is_err()
             {
                 state.flows[flow].requests[slot].native_credit = Some(result);
+                completed = true;
                 continue;
             }
             result
@@ -457,6 +462,10 @@ impl CaptureSession {
                 );
             }
             state.flows[flow].requests[slot].native_credit = Some(result);
+            completed = true;
+        }
+        if completed {
+            self.record_native_terminal_progress();
         }
     }
 }

@@ -54,6 +54,8 @@ class Endpoint:
         self.owner = None
         self.raw_snapshots = []
         self.receipts = []
+        self.completion_receipts = []
+        self.completion_producers = set()
 
     def send(self, value, end):
         require(self.connection is not None, "kernel_control_connection_closed")
@@ -79,12 +81,15 @@ class Endpoint:
             self.close()  # A partial JSON record must never be refilled.
             raise
 
-    def exchange(self, value, *, deadline=None):
+    def exchange(self, value, *, deadline=None, original_end_ns=None):
         end_ns = time.monotonic_ns() + 1_000_000_000
         if deadline is not None:
             end_ns = min(end_ns, int(deadline * 1_000_000_000))
+        if original_end_ns is not None:
+            require(integer(original_end_ns, 1), "kernel_control_original_end_invalid")
+            end_ns = min(end_ns, original_end_ns)
         end = end_ns / 1_000_000_000
-        if value.get("op") in {"snapshot", "register"}:
+        if value.get("op") in {"snapshot", "register", "wait_original_outcomes"}:
             value = dict(value, original_deadline_ns=end_ns)
         self.send(value, end)
         while b"\n" not in self.pending:
@@ -143,6 +148,23 @@ class Endpoint:
                 and all(isinstance(row, dict) for row in value["requests"])
                 and all(type(value.get(k)) is bool for k in ["daemon_registration_verified", "physical_send_verified", "canonical_current_owner_verified"]),
                 "kernel_read_snapshot_scope_or_capacity")
+        return value
+
+    def wait_original_outcomes(self, producer_scope, original_deadline_ns):
+        require(len(self.completion_producers) < MAX_ENTRIES
+                and producer_scope not in self.completion_producers
+                and any(row["receipt"]["producer_scope"] == producer_scope for row in self.receipts),
+                "original_terminal_handoff_scope_or_capacity")
+        self.completion_producers.add(producer_scope)  # A failed first wait never rearms.
+        value, raw = self.exchange(dict(op="wait_original_outcomes", producer_scope=producer_scope),
+                                   original_end_ns=original_deadline_ns)
+        require(value.get("scope") == "original_window_terminal_metadata_only"
+                and value.get("producer_scope") == producer_scope
+                and type(value.get("completed_requests")) is int and value["completed_requests"] == 8
+                and all(value.get(k) is False for k in
+                        ["native_os_write_verified", "physical_send_verified", "canonical_current_owner_verified"]),
+                "original_terminal_handoff_receipt_invalid")
+        self.completion_receipts.append(dict(receipt=value, sha256=hashlib.sha256(raw).hexdigest()))
         return value
 
     def close(self):
@@ -343,7 +365,8 @@ class KernelCaptures:
         for index, endpoint in enumerate(self.endpoints.values()):
             udp.write_report(self.output / f"kernel-daemon-{index}-binding.json",
                 dict(original_child=asdict(endpoint.original), capture_id=self.capture_id,
-                     daemon_scope=endpoint.producer_scope, owner=endpoint.owner, registration_receipts=endpoint.receipts))
+                     daemon_scope=endpoint.producer_scope, owner=endpoint.owner, registration_receipts=endpoint.receipts,
+                     terminal_handoff_receipts=endpoint.completion_receipts))
             raw = b"".join(endpoint.raw_snapshots)
             path = self.output / f"kernel-daemon-{index}-snapshots.jsonl"
             descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)

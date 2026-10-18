@@ -33,6 +33,8 @@ pub(crate) use full_loss::FullRetentionLossReason;
 #[cfg(not(unix))]
 use std::sync::Mutex as RegistryMutex;
 #[cfg(any(target_os = "linux", all(unix, test)))]
+mod completion_wait;
+#[cfg(any(target_os = "linux", all(unix, test)))]
 mod native;
 mod owners;
 pub(crate) use full::OriginalFullObservation;
@@ -60,6 +62,8 @@ pub(crate) struct CaptureSession {
     full_loss: FullRetentionLoss,
     #[cfg(any(target_os = "linux", all(unix, test)))]
     pending_full: full_completion::CompletionSignal,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    native_terminal_revision: AtomicU64,
     expires: Instant,
     peers: Weak<PeerManager>,
     #[cfg(unix)]
@@ -230,6 +234,7 @@ impl CaptureSession {
             full_complete: AtomicBool::new(true),
             full_loss: FullRetentionLoss::new(),
             pending_full: full_completion::CompletionSignal::new(),
+            native_terminal_revision: AtomicU64::new(0),
             expires,
             peers: Arc::downgrade(peers),
             capture_id: plan.capture_id,

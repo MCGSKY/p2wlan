@@ -18,6 +18,7 @@ import time
 from typing import Callable
 
 from udp_business_probe import Config, NS_PER_MS, UNVERIFIED, prepare_request_plan, prepare_write_facts, validate_output_path, write_report
+import probe_completion_barrier as handoff
 
 SCOPE = "os_tcp_echo"
 MAGIC = b"P2WTCE1\x00"
@@ -119,7 +120,8 @@ def wait_scheduled(planned: int, end: int) -> None:
 
 
 def run_probe(config: Config, supplied_socket: socket.socket | None = None,
-              request_plan: Path | None = None, write_facts_fd: int | None = None) -> dict:
+              request_plan: Path | None = None, write_facts_fd: int | None = None,
+              completion_barrier: Path | None = None) -> dict:
     config.validate()
     report = base_report(config, "probe")
     prepared = prepare_request_plan(config, request_plan, "tcp", report["tool_sha256"])
@@ -206,6 +208,14 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None,
         report["socket_error_errno"] = error.errno
         termination = "bind_failed" if sock is None else "connect_failed"
     finally:
+        if (completion_barrier is not None and sock is not None
+                and all(record["status"] == "success" for record in records)):
+            # Keep the actual connection until original windows were delivered,
+            # without waiting for native success or starting a fresh deadline.
+            last_sent = started + records[-1]["sent_offset_ns"]
+            report["connection_handoff"] = handoff.wait(
+                completion_barrier, config.run_nonce, config.round_nonce,
+                min(end, last_sent + config.timeout_ms * NS_PER_MS))
         elapsed = time.monotonic_ns() - started
         for record in records:
             if record["status"] in ("not_sent", "pending"):
@@ -222,7 +232,8 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None,
 
 
 def run_echo(config: Config, supplied_listener: socket.socket | None = None,
-             on_ready: Callable[[], None] | None = None) -> dict:
+             on_ready: Callable[[], None] | None = None,
+             completion_barrier: Path | None = None) -> dict:
     config.validate()
     report = base_report(config, "echo")
     report.update(responses_sent=0, send_errors=0)
@@ -259,6 +270,9 @@ def run_echo(config: Config, supplied_listener: socket.socket | None = None,
                 report["responses_sent"] += 1
                 if len(seen) == config.count:
                     termination = "request_budget_exhausted"
+                    if completion_barrier is not None:
+                        report["connection_handoff"] = handoff.wait(
+                            completion_barrier, config.run_nonce, config.round_nonce, deadline)
                     break
             else:
                 termination = "receive_budget_exhausted"
@@ -342,6 +356,8 @@ def main() -> int:
                         help="probe only: exact prepared input plan before the original measurement clock")
     parser.add_argument("--write-facts-fd", type=int,
                         help="probe only: already nonblocking writable POSIX pipe; requires request plan")
+    parser.add_argument("--completion-barrier", type=Path,
+                        help="optional controller window-delivery handoff before TCP close; no native credit")
     args = parser.parse_args()
     config = Config((args.bind_ip, args.bind_port), (args.target_ip, args.target_port),
                     args.run_nonce, args.round_nonce, args.count, args.interval_ms,
@@ -354,13 +370,17 @@ def main() -> int:
         if args.role == "echo" and args.write_facts_fd is not None:
             raise ValueError("write facts apply only to the probe role")
         if args.role == "probe":
-            report = run_probe(config, request_plan=args.request_plan, write_facts_fd=args.write_facts_fd)
+            report = run_probe(config, request_plan=args.request_plan, write_facts_fd=args.write_facts_fd,
+                               completion_barrier=args.completion_barrier)
             validate_probe(report)
         else:
-            report = run_echo(config, on_ready=lambda: print('{"event":"echo_ready","scope":"os_tcp_echo"}', flush=True))
+            report = run_echo(config, on_ready=lambda: print('{"event":"echo_ready","scope":"os_tcp_echo"}', flush=True),
+                              completion_barrier=args.completion_barrier)
         write_report(args.output, report)
     except (OSError, ValueError) as error:
         parser.exit(2, f"tcp-business-probe: {error}\n")
+    if report.get("connection_handoff", {}).get("acknowledged") is False:
+        return 1
     if args.role == "probe":
         return int(any(r["status"] != "success" for r in report["requests"]))
     return int(report["termination_reason"] != "request_budget_exhausted" or report["send_errors"] != 0)
