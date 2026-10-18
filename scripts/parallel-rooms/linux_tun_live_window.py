@@ -56,19 +56,22 @@ class OriginalWriteWindows:
                           boot_id=self.original.boot_id, original_started_ns=stream.started,
                           original_sent_ns=row["original_sent_ns"], original_deadline_ns=row["original_deadline_ns"],
                           complete_returned_ns=row["last_returned_ns"], frame_bytes=size, frame_sha256=digest)
-            delivered = 0
-            try:
-                for endpoint in self.endpoints:
-                    endpoint.observe_original_write_window(window)
-                    delivered += 1
-            except (OSError, ValueError):
-                self.gap = "original_window_nonblocking_delivery_failed"
-            self.requests[i] = dict(sequence=i, delivered=delivered == 2,
-                                    delivered_endpoints=delivered, window=window,
-                                    controller_observed_ns=observed_ns,
-                                    reason=None if delivered == 2 else self.gap)
+            self.requests[i] = self.deliver(window, observed_ns)
             if self.gap is not None:
                 return
+
+    def deliver(self, window, observed_ns):
+        delivered = 0
+        try:
+            for endpoint in self.endpoints:
+                endpoint.observe_original_write_window(window)
+                delivered += 1
+        except (OSError, ValueError):
+            self.gap = "original_window_nonblocking_delivery_failed"
+        return dict(sequence=window["sequence"], delivered=delivered == 2,
+                    delivered_endpoints=delivered, window=window,
+                    controller_observed_ns=observed_ns,
+                    reason=None if delivered == 2 else self.gap)
 
     def seal(self):
         # No final drain, control I/O, wait, retry or PID lookup after sealing.
