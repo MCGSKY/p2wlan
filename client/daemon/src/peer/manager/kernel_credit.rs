@@ -70,7 +70,10 @@ impl PeerManager {
             }
         };
         *owner_check = "epoch";
-        let Ok(_epoch) = self.network_epoch_gate.try_lock() else {
+        let Ok(_epoch) = self
+            .network_epoch_gate
+            .try_lock_original(request.epoch_try_context())
+        else {
             return Contended(CreditLock::Epoch);
         };
         *owner_check = "session";

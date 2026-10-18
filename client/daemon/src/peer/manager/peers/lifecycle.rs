@@ -63,7 +63,7 @@ impl PeerManager {
         &'a self,
         trace: &mut PeerUpdateLockTrace<'_>,
     ) -> (
-        tokio::sync::MutexGuard<'a, ()>,
+        crate::peer::NetworkEpochGuard<'a>,
         tokio::sync::RwLockWriteGuard<'a, HashMap<String, PeerConnection>>,
     ) {
         loop {

@@ -1,0 +1,269 @@
+//! The same exclusive epoch mutex, with optional first-refusal metadata.
+//! No diagnostic can authorize a read, Full, current owner or once commit.
+use std::future::Future;
+use std::ops::{Deref, DerefMut};
+#[cfg(any(target_os = "linux", all(unix, test)))]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+use std::sync::{OnceLock, Weak};
+#[cfg(any(target_os = "linux", all(unix, test)))]
+use std::time::Instant;
+use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, TryLockError};
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+mod trace;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+use trace::Site;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) use trace::{EpochRefusalSnapshot, EpochTryContext};
+#[cfg(not(any(target_os = "linux", all(unix, test))))]
+#[derive(Clone, Copy)]
+struct Site;
+
+pub(crate) struct NetworkEpochGate {
+    inner: Arc<Mutex<()>>,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    trace_claimed: AtomicBool,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    trace: OnceLock<trace::Trace>,
+}
+
+pub(crate) struct NetworkEpochGuard<'a> {
+    inner: Option<MutexGuard<'a, ()>>,
+    owner: &'a NetworkEpochGate,
+    token: Option<u64>,
+}
+
+pub(crate) struct OwnedNetworkEpochGuard {
+    inner: Option<OwnedMutexGuard<()>>,
+    owner: Arc<NetworkEpochGate>,
+    token: Option<u64>,
+}
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) struct EpochTraceLease {
+    gate: Weak<NetworkEpochGate>,
+    owner: u64,
+}
+
+impl NetworkEpochGate {
+    pub(crate) fn new(_: ()) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(())),
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            trace_claimed: AtomicBool::new(false),
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            trace: OnceLock::new(),
+        }
+    }
+
+    // A synchronous entry captures the real caller before constructing the
+    // original lock future; track_caller on an async fn would lose this site.
+    #[track_caller]
+    pub(crate) fn lock(&self) -> impl Future<Output = NetworkEpochGuard<'_>> {
+        let site = caller_site();
+        async move { self.wrap(self.inner.lock().await, site) }
+    }
+
+    #[track_caller]
+    pub(crate) fn try_lock(&self) -> Result<NetworkEpochGuard<'_>, TryLockError> {
+        let site = caller_site();
+        self.inner.try_lock().map(|guard| self.wrap(guard, site))
+    }
+
+    #[track_caller]
+    pub(crate) fn try_lock_owned(self: Arc<Self>) -> Result<OwnedNetworkEpochGuard, TryLockError> {
+        let site = caller_site();
+        let inner = self.inner.clone().try_lock_owned()?;
+        Ok(self.wrap_owned(inner, site))
+    }
+
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    #[track_caller]
+    pub(crate) fn try_lock_original(
+        &self,
+        context: Option<EpochTryContext>,
+    ) -> Result<NetworkEpochGuard<'_>, TryLockError> {
+        let site = caller_site();
+        let observed = context.and_then(|context| {
+            self.trace
+                .get()
+                .filter(|trace| trace.accepts(&context))
+                .map(|trace| (trace, context))
+        });
+        let started = observed.and_then(|_| trace::now_ns());
+        let result = self.inner.try_lock(); // The one original actual try.
+        let returned = observed.and_then(|_| trace::now_ns());
+        match result {
+            Ok(guard) => Ok(self.wrap(guard, site)),
+            Err(error) => {
+                if let Some((trace, context)) = observed {
+                    trace.refused(context, started, returned);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn wrap<'a>(&'a self, inner: MutexGuard<'a, ()>, site: Site) -> NetworkEpochGuard<'a> {
+        NetworkEpochGuard {
+            inner: Some(inner),
+            owner: self,
+            token: self.acquired(site),
+        }
+    }
+
+    fn wrap_owned(
+        self: Arc<Self>,
+        inner: OwnedMutexGuard<()>,
+        site: Site,
+    ) -> OwnedNetworkEpochGuard {
+        let token = self.acquired(site);
+        OwnedNetworkEpochGuard {
+            inner: Some(inner),
+            owner: self,
+            token,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(crate) fn capture_diagnostics(
+        self: &Arc<Self>,
+        owner: u64,
+        capture_id: [u8; 16],
+        expires: Instant,
+    ) -> EpochTraceLease {
+        let enabled = owner != 0
+            && Instant::now() < expires
+            && self
+                .trace_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+        if enabled {
+            // Only the single claimant can set: no competing initializer can
+            // make a packet or control actor wait on diagnostic initialization.
+            let _ = self
+                .trace
+                .set(trace::Trace::new(owner, capture_id, expires));
+        }
+        EpochTraceLease {
+            gate: if enabled {
+                Arc::downgrade(self)
+            } else {
+                Weak::new()
+            },
+            owner,
+        }
+    }
+
+    fn acquired(&self, site: Site) -> Option<u64> {
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        {
+            self.trace.get().and_then(|trace| trace.acquired(site))
+        }
+        #[cfg(not(any(target_os = "linux", all(unix, test))))]
+        {
+            let _ = site;
+            None
+        }
+    }
+
+    fn released(&self, token: Option<u64>, ended: Option<u64>) {
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        if let (Some(token), Some(trace)) = (token, self.trace.get()) {
+            trace.released(token, ended);
+        }
+        #[cfg(not(any(target_os = "linux", all(unix, test))))]
+        let _ = (token, ended);
+    }
+
+    #[cfg(all(unix, test))]
+    pub(crate) fn exhaust_diagnostic_tokens(&self) {
+        if let Some(trace) = self.trace.get() {
+            trace.exhaust_tokens();
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+impl EpochTraceLease {
+    pub(crate) fn snapshot(&self) -> Option<EpochRefusalSnapshot> {
+        self.gate.upgrade()?.trace.get()?.snapshot(self.owner)
+    }
+    pub(crate) fn deactivate(&self) {
+        if let Some(gate) = self.gate.upgrade() {
+            if let Some(trace) = gate.trace.get() {
+                trace.deactivate(self.owner);
+            }
+        }
+    }
+}
+#[cfg(any(target_os = "linux", all(unix, test)))]
+impl Drop for EpochTraceLease {
+    fn drop(&mut self) {
+        self.deactivate();
+    }
+}
+
+// Borrow the same actual guard for existing epoch-fenced APIs. Ownership
+// and real unlock stay in this wrapper, including every returned guard.
+impl<'a> Deref for NetworkEpochGuard<'a> {
+    type Target = MutexGuard<'a, ()>;
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref().expect("epoch guard exists until drop")
+    }
+}
+impl Deref for OwnedNetworkEpochGuard {
+    type Target = ();
+    fn deref(&self) -> &() {
+        self.inner
+            .as_deref()
+            .expect("owned epoch guard exists until drop")
+    }
+}
+impl DerefMut for OwnedNetworkEpochGuard {
+    fn deref_mut(&mut self) -> &mut () {
+        self.inner
+            .as_deref_mut()
+            .expect("owned epoch guard exists until drop")
+    }
+}
+
+impl Drop for NetworkEpochGuard<'_> {
+    fn drop(&mut self) {
+        let ended = observed_end(self.token);
+        drop(self.inner.take());
+        self.owner.released(self.token, ended);
+    }
+}
+impl Drop for OwnedNetworkEpochGuard {
+    fn drop(&mut self) {
+        let ended = observed_end(self.token);
+        drop(self.inner.take());
+        self.owner.released(self.token, ended);
+    }
+}
+
+#[track_caller]
+fn caller_site() -> Site {
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    {
+        Site::caller()
+    }
+    #[cfg(not(any(target_os = "linux", all(unix, test))))]
+    {
+        Site
+    }
+}
+fn observed_end(token: Option<u64>) -> Option<u64> {
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    {
+        token.and_then(|_| trace::now_ns())
+    }
+    #[cfg(not(any(target_os = "linux", all(unix, test))))]
+    {
+        let _ = token;
+        None
+    }
+}

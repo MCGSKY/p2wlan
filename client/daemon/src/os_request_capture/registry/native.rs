@@ -9,6 +9,8 @@ use crate::overlay_requests::{
 use crate::rooms::RoomSendPermit;
 
 type Check<T> = Result<T, Outcome>;
+#[cfg(all(unix, test))]
+mod epoch_guard_tests;
 mod selection;
 #[cfg(all(unix, test))]
 mod terminal_wait_tests;
@@ -134,6 +136,28 @@ fn unknown() -> Outcome {
 }
 
 impl OriginalKernelExchange {
+    pub(crate) fn epoch_try_context(&self) -> Option<crate::peer::EpochTryContext> {
+        let scope = self.scope.upgrade()?;
+        let key = self.plan.requests.get(self.slot)?;
+        Some(crate::peer::EpochTryContext {
+            capture_owner: scope.owner,
+            capture_id: scope.capture_id,
+            run: key.run,
+            round: key.round,
+            request_nonce: key.request_nonce,
+            sequence: key.sequence,
+            protocol: match self.plan.protocol {
+                Protocol::Udp => "udp",
+                Protocol::Tcp => "tcp",
+            },
+            kind: match key.kind {
+                RequestKind::Request => "request",
+                RequestKind::Response => "response",
+            },
+            first_read_ordinal: self.reads.first()?.read.ordinal(),
+        })
+    }
+
     fn capture(
         scope: &Arc<CaptureSession>,
         state: &RegistryState,

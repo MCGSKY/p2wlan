@@ -64,6 +64,8 @@ pub(crate) struct CaptureSession {
     pending_full: full_completion::CompletionSignal,
     #[cfg(any(target_os = "linux", all(unix, test)))]
     native_terminal_revision: AtomicU64,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    epoch_trace: crate::peer::EpochTraceLease,
     expires: Instant,
     peers: Weak<PeerManager>,
     #[cfg(unix)]
@@ -167,6 +169,9 @@ pub(super) struct ReadSnapshot {
     retained_original_reads: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     original_input_registry_refusal: Option<control_lock::InputRefusalSnapshot>,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_kernel_epoch_refusal: Option<crate::peer::EpochRefusalSnapshot>,
 }
 #[cfg(unix)]
 #[derive(Serialize)]
@@ -235,6 +240,11 @@ impl CaptureSession {
             full_loss: FullRetentionLoss::new(),
             pending_full: full_completion::CompletionSignal::new(),
             native_terminal_revision: AtomicU64::new(0),
+            epoch_trace: peers.network_epoch_gate().capture_diagnostics(
+                owner,
+                plan.capture_id,
+                expires,
+            ),
             expires,
             peers: Arc::downgrade(peers),
             capture_id: plan.capture_id,
@@ -368,6 +378,8 @@ impl CaptureSession {
 
     pub(crate) fn retire(&self) {
         self.active.store(false, Ordering::Release);
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        self.epoch_trace.deactivate();
     }
 
     pub(super) fn bind_system_device(&self, device: &Arc<DeviceLease>) -> bool {
@@ -728,6 +740,8 @@ impl CaptureSession {
             first_original_full_retention_loss: self.full_loss.snapshot(),
             retained_original_reads: state.read_history.len(),
             original_input_registry_refusal: self.state.input_refusal_snapshot(),
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            original_kernel_epoch_refusal: self.epoch_trace.snapshot(),
         })
     }
 }

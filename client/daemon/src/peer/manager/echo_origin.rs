@@ -47,7 +47,7 @@ pub(crate) struct OriginalEchoPeerWriteGuard<'a> {
     pub(crate) current: OriginalEchoPeerReadGuard<'a>,
     _owner: Arc<PeerManager>,
     _emit: Arc<tokio::sync::OwnedMutexGuard<()>>,
-    _epoch: tokio::sync::OwnedMutexGuard<()>,
+    _epoch: OwnedNetworkEpochGuard,
 }
 
 impl PeerManager {
