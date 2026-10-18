@@ -161,6 +161,8 @@ pub(super) struct ReadSnapshot {
     original_full_retention_complete: bool,
     first_original_full_retention_loss: Option<FullRetentionLossReason>,
     retained_original_reads: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_input_registry_refusal: Option<control_lock::InputRefusalSnapshot>,
 }
 #[cfg(unix)]
 #[derive(Serialize)]
@@ -720,6 +722,7 @@ impl CaptureSession {
             original_full_retention_complete: self.full_complete.load(Ordering::Acquire),
             first_original_full_retention_loss: self.full_loss.snapshot(),
             retained_original_reads: state.read_history.len(),
+            original_input_registry_refusal: self.state.input_refusal_snapshot(),
         })
     }
 }
@@ -751,7 +754,11 @@ impl KernelReadBinding {
         if self.read.at() > observed_at {
             return Some(Reason::InputClockBeforeRead);
         }
-        let state = match scope.state.try_lock() {
+        #[cfg(unix)]
+        let input = scope.state.try_input_lock(self.read.ordinal());
+        #[cfg(not(unix))]
+        let input = scope.state.try_lock();
+        let state = match input {
             Ok(state) => state,
             Err(std::sync::TryLockError::WouldBlock) => {
                 return Some(Reason::InputRegistryContended)
