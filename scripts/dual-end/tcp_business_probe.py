@@ -18,7 +18,6 @@ import time
 from typing import Callable
 
 from udp_business_probe import Config, NS_PER_MS, UNVERIFIED, prepare_request_plan, prepare_write_facts, validate_output_path, write_report
-import probe_completion_barrier as handoff
 
 SCOPE = "os_tcp_echo"
 MAGIC = b"P2WTCE1\x00"
@@ -210,6 +209,8 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None,
     finally:
         if (completion_barrier is not None and sock is not None
                 and all(record["status"] == "success" for record in records)):
+            import probe_completion_barrier as handoff
+
             # Keep the actual connection until original windows were delivered,
             # without waiting for native success or starting a fresh deadline.
             last_sent = started + records[-1]["sent_offset_ns"]
@@ -271,6 +272,8 @@ def run_echo(config: Config, supplied_listener: socket.socket | None = None,
                 if len(seen) == config.count:
                     termination = "request_budget_exhausted"
                     if completion_barrier is not None:
+                        import probe_completion_barrier as handoff
+
                         report["connection_handoff"] = handoff.wait(
                             completion_barrier, config.run_nonce, config.round_nonce, deadline)
                     break
