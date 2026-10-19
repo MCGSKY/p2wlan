@@ -145,6 +145,13 @@ pub(super) async fn encrypt_then_send_with_deadline(
             physical_preparation,
             serialized_buffer_lease,
         ) = {
+            // These are resource snapshots, never a path or generation fence.
+            // A slot replacement must not make original read observation wait
+            // behind an epoch guard held by this pre-encryption preparation.
+            // The unchanged epoch transaction below validates generation/path;
+            // actual budget, socket and native handoff fences remain authoritative.
+            let relay_available = relay_transport.read().await.is_some();
+            let udp = udp_transport.read().await.clone();
             let epoch_gate = peers.network_epoch_gate();
             let epoch_gate_wait_started = Instant::now();
             // Declare before the real guard: success, early return and future
@@ -178,8 +185,6 @@ pub(super) async fn encrypt_then_send_with_deadline(
             });
             }
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Path);
-            let relay_available = relay_transport.read().await.is_some();
-            let udp = udp_transport.read().await.clone();
             let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
             let selection = peers
                 .select_path_for_data_with_local_endpoint_in_epoch(

@@ -93,6 +93,81 @@ async fn receive_original(
     n
 }
 
+async fn preparation_slot_wait_control(hold_relay: bool, advance_generation: bool) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (f, transport, udp, receiver, mut remote) = direct_fixture(false).await;
+        let udps = RwLock::new(Some(udp));
+        let relays = RwLock::new(None);
+        let relay_writer = if hold_relay { Some(relays.write().await) } else { None };
+        let udp_writer = if hold_relay { None } else { Some(udps.write().await) };
+        tokio::task::yield_now().await;
+        let mut send = Box::pin(encrypt_then_send_with_deadline(
+            f.delivery.clone(), &transport, &f.peers, f.record.generation, true,
+            &udps, &relays, false, Some(Instant::now() + Duration::from_secs(1)), None,
+        ));
+        assert!(matches!(futures_util::poll!(send.as_mut()), std::task::Poll::Pending));
+        // The real preparation owns emit but has not encrypted or sent.
+        // Physical publication remains Idle until crypto actually succeeds.
+        assert!(transport.try_acquire_outbound_emit_guard(PEER).is_none());
+        assert!(f.peers.network_epoch_gate().try_lock_owned().is_ok());
+        assert_eq!(f.record.physical_publication.state(), PhysicalPublicationState::Idle);
+        let mut wire = [0u8; 2048];
+        assert!(matches!(receiver.try_recv_from(&mut wire), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        if advance_generation {
+            let next = f.peers.advance_network_generation("slot-wait-control").await;
+            assert!(next > f.record.generation);
+        }
+        drop(udp_writer);
+        drop(relay_writer);
+        let outcome = send.await;
+        if advance_generation {
+            assert!(matches!(outcome, EncryptSendOutcome::Retryable {
+                reason_code: REASON_OUTBOUND_GENERATION_CHANGED, ..
+            }));
+            assert_eq!(f.record.physical_publication.state(), PhysicalPublicationState::Idle);
+            assert!(f.record.physical_publication.record().is_none());
+            assert!(matches!(receiver.try_recv_from(&mut wire), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+            // A separate real encryption still receives counter0: the stale
+            // preparation did not consume one while waiting for its slot.
+            let encrypted = transport.encrypt_outbound(OutboundPacket {
+                peer_id: PEER.to_string(), packet: f.record.original_packet().to_vec(),
+                dst_ip: f.delivery.dst_ip.clone(), trace: None, room_authorization: None,
+            }).await.unwrap().unwrap();
+            assert_eq!(crate::transport::wire_counter(&encrypted.wire_bytes), Some(0));
+            assert_eq!(remote.decrypt_from_bytes(&encrypted.wire_bytes).unwrap(), f.record.original_packet());
+        } else {
+            assert!(matches!(outcome, EncryptSendOutcome::Sent));
+            let (n, _) = receiver.recv_from(&mut wire).await.unwrap();
+            assert_eq!(crate::transport::wire_counter(&wire[..n]), Some(0));
+            assert_eq!(remote.decrypt_from_bytes(&wire[..n]).unwrap(), f.record.original_packet());
+            assert!(matches!(receiver.try_recv_from(&mut wire), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+            assert_eq!(f.record.physical_publication.record().unwrap().qualify(&f.record, Instant::now()), PhysicalInputQualification::UnknownUdpPublication);
+        }
+        assert!(transport.try_acquire_outbound_emit_guard(PEER).is_some());
+        assert!(f.peers.network_epoch_gate().try_lock_owned().is_ok());
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn preparation_relay_slot_wait_releases_epoch_before_actual_udp() {
+    preparation_slot_wait_control(true, false).await;
+}
+
+#[tokio::test]
+async fn preparation_udp_slot_wait_releases_epoch_before_actual_udp() {
+    preparation_slot_wait_control(false, false).await;
+}
+
+#[tokio::test]
+async fn preparation_relay_slot_wait_rechecks_generation_before_counter() {
+    preparation_slot_wait_control(true, true).await;
+}
+
+#[tokio::test]
+async fn preparation_udp_slot_wait_rechecks_generation_before_counter() {
+    preparation_slot_wait_control(false, true).await;
+}
+
 struct OutboundCompletionProbe {
     transport: WireGuardTransport,
     record: Arc<crate::overlay_requests::CanonicalOverlayRequest>,
