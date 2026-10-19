@@ -48,3 +48,6 @@ mod b28_direct_commit_sequence;
 
 #[path = "tests/relay_only_diagnostics.rs"]
 mod relay_only_diagnostics;
+
+#[path = "tests/peer_update_resources.rs"]
+mod peer_update_resources;

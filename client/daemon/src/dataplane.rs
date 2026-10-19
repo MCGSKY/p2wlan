@@ -28,6 +28,10 @@ include!("dataplane/normalization.rs");
 include!("dataplane/logging.rs");
 include!("dataplane/profiling.rs");
 
+#[path = "dataplane/crypto_profile.rs"]
+mod crypto_profile;
+pub(crate) use crypto_profile::{record_crypto_profile, CryptoProfileStage, DeferredCryptoProfile};
+
 #[cfg(test)]
 mod tests {
     include!("dataplane/tests.rs");

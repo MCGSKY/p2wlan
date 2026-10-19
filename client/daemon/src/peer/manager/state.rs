@@ -559,7 +559,7 @@ pub struct PeerManager {
     /// Both the advances and the UDP mutation sites hold this gate first
     /// (gate -> socket_state -> pending probes), so a generation update is
     /// atomic with respect to every generation-sensitive socket transition.
-    network_epoch_gate: Arc<tokio::sync::Mutex<()>>,
+    network_epoch_gate: Arc<crate::peer::NetworkEpochGate>,
     /// The currently published UDP direct-validation registry.  The UDP
     /// transport registers this handle when it binds; generation advances use
     /// it while holding `network_epoch_gate` to revoke old validation owners

@@ -64,7 +64,7 @@ impl PeerManager {
             network_generation: Arc::new(RwLock::new(0)),
             network_generation_sync: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             network_generation_handshake_cancel_hook: Arc::new(std::sync::Mutex::new(None)),
-            network_epoch_gate: Arc::new(tokio::sync::Mutex::new(())),
+            network_epoch_gate: Arc::new(NetworkEpochGate::new(())),
             direct_validation_registry: Arc::new(RwLock::new(None)),
             dplpmtud_runtime: Arc::new(RwLock::new(None)),
             local_nat_profile: Arc::new(RwLock::new(None)),
@@ -789,7 +789,7 @@ impl PeerManager {
     /// advance can never bump the generation between the mutation's read and
     /// its write; the advances hold the same gate for their whole critical
     /// section.
-    pub(crate) fn network_epoch_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn network_epoch_gate(&self) -> Arc<NetworkEpochGate> {
         self.network_epoch_gate.clone()
     }
 
@@ -964,7 +964,7 @@ impl PeerManager {
     pub(crate) async fn lock_epoch_and_connections_write<'a>(
         &'a self,
     ) -> (
-        tokio::sync::MutexGuard<'a, ()>,
+        crate::peer::NetworkEpochGuard<'a>,
         tokio::sync::RwLockWriteGuard<'a, HashMap<String, PeerConnection>>,
     ) {
         loop {
@@ -993,7 +993,7 @@ impl PeerManager {
     pub(crate) async fn lock_epoch_and_connections_read<'a>(
         &'a self,
     ) -> (
-        tokio::sync::MutexGuard<'a, ()>,
+        crate::peer::NetworkEpochGuard<'a>,
         tokio::sync::RwLockReadGuard<'a, HashMap<String, PeerConnection>>,
     ) {
         loop {

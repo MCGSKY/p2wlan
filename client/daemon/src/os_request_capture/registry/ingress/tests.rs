@@ -22,7 +22,7 @@ async fn actual_reader_ingress_peer_metadata_cannot_borrow_new_network_identity(
     let before = Instant::now();
     let original = harness
         .peers
-        .try_capture_original_kernel_read_peer(PEER, REMOTE.parse().unwrap())
+        .try_capture_original_kernel_read_peer(PEER, REMOTE.parse().unwrap(), None)
         .unwrap();
     assert!(original.matches_original_ingress(&binding.source, before));
     let generation = harness
@@ -32,7 +32,7 @@ async fn actual_reader_ingress_peer_metadata_cannot_borrow_new_network_identity(
     let later_time = Instant::now();
     let later = harness
         .peers
-        .try_capture_original_kernel_read_peer(PEER, REMOTE.parse().unwrap())
+        .try_capture_original_kernel_read_peer(PEER, REMOTE.parse().unwrap(), None)
         .unwrap();
     assert_eq!(later.generation(), generation);
     assert!(!later.matches_original_ingress(&binding.source, later_time));
@@ -300,6 +300,27 @@ async fn contended_original_ingress_cannot_rearm_on_duplicate_after_room_renewal
     let snapshot = serde_json::to_value(scope.snapshot().unwrap()).unwrap();
     assert_eq!(snapshot["incoming_provenance_complete"], false);
     assert_eq!(snapshot["system_tun_full_writes"], json!([]));
+    let loss = &snapshot["first_original_inbound_loss"];
+    assert_eq!(loss["site"], "authenticated_input");
+    assert_eq!(loss["original_failure"], "contended");
+    assert_eq!(loss["native_os_write_verified"], false);
+    assert_eq!(loss["physical_send_verified"], false);
+    assert_eq!(loss["canonical_current_owner_verified"], false);
+    let refusal = &snapshot["original_authenticated_input_registry_refusal"];
+    assert_eq!(
+        refusal["scope"],
+        "actual_authenticated_input_registry_try_lock_refusal_only"
+    );
+    assert!(refusal.get("read_ordinal").is_none());
+    assert_eq!(refusal["holder"]["release_completion_observed"], true);
+    for key in [
+        "native_os_write_verified",
+        "physical_send_verified",
+        "canonical_current_owner_verified",
+    ] {
+        assert_eq!(refusal[key], false);
+    }
+    assert!(snapshot.get("original_input_registry_refusal").is_none());
 }
 
 impl Drop for Harness {

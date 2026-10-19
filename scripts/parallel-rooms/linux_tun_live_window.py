@@ -1,11 +1,19 @@
-"""One-shot live delivery from the original owned pipe, without new I/O waits.
+"""One-shot live delivery from the original owned pipe.
 
 These are controller observations. Neither delivery nor their JSON creates a
 native OS-write fact, TUN read, physical Full, current peer, or once authority.
+After TCP's final window, one bounded terminal-metadata handoff precedes close.
 """
 from __future__ import annotations
 
+from pathlib import Path
+import sys
 import weakref
+
+DUAL = Path(__file__).resolve().parents[1] / "dual-end"
+if str(DUAL) not in sys.path:
+    sys.path.insert(0, str(DUAL))
+import probe_completion_barrier as handoff
 
 
 class OriginalWriteWindows:
@@ -20,6 +28,7 @@ class OriginalWriteWindows:
         self.requests = [dict(sequence=i, delivered=False, reason="original_complete_write_not_observed")
                          for i in range(8)]
         self.seen = set()
+        self.handoff_published = False
 
     def bind(self, capture, child):
         if self.closed or self.child is not None or self.capture() is not capture or capture.stream is None:
@@ -56,19 +65,35 @@ class OriginalWriteWindows:
                           boot_id=self.original.boot_id, original_started_ns=stream.started,
                           original_sent_ns=row["original_sent_ns"], original_deadline_ns=row["original_deadline_ns"],
                           complete_returned_ns=row["last_returned_ns"], frame_bytes=size, frame_sha256=digest)
-            delivered = 0
-            try:
-                for endpoint in self.endpoints:
-                    endpoint.observe_original_write_window(window)
-                    delivered += 1
-            except (OSError, ValueError):
-                self.gap = "original_window_nonblocking_delivery_failed"
-            self.requests[i] = dict(sequence=i, delivered=delivered == 2,
-                                    delivered_endpoints=delivered, window=window,
-                                    controller_observed_ns=observed_ns,
-                                    reason=None if delivered == 2 else self.gap)
+            self.requests[i] = self.deliver(window, observed_ns)
             if self.gap is not None:
                 return
+        path = getattr(capture, "completion_barrier_path", None)
+        if (path is not None and len(self.seen) == 8 and not self.handoff_published
+                and all(row["delivered"] is True for row in self.requests)):
+            self.handoff_published = True  # First publication failure cannot rearm.
+            try:
+                deadline = self.requests[-1]["window"]["original_deadline_ns"]
+                for endpoint in self.endpoints:
+                    # Any recorded terminal, including refusal, releases close.
+                    # No success flag is tested and no owner check is retried.
+                    endpoint.wait_original_outcomes(capture.prepared.producer_scope, deadline)
+                handoff.publish(path, capture.config.run_nonce, capture.config.round_nonce)
+            except (OSError, ValueError):
+                self.gap = "original_tcp_handoff_publication_failed"
+
+    def deliver(self, window, observed_ns):
+        delivered = 0
+        try:
+            for endpoint in self.endpoints:
+                endpoint.observe_original_write_window(window)
+                delivered += 1
+        except (OSError, ValueError):
+            self.gap = "original_window_nonblocking_delivery_failed"
+        return dict(sequence=window["sequence"], delivered=delivered == 2,
+                    delivered_endpoints=delivered, window=window,
+                    controller_observed_ns=observed_ns,
+                    reason=None if delivered == 2 else self.gap)
 
     def seal(self):
         # No final drain, control I/O, wait, retry or PID lookup after sealing.

@@ -1,4 +1,4 @@
-//! Interleave only pending original Full metadata with the same control read.
+//! Interleave bounded completion metadata with the same original control read.
 use super::{read_line, CaptureFailure, CaptureSession};
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ pub(super) async fn next_line(
                 biased;
                 _ = session.full_completion_ready() => session.complete_pending_fulls(),
                 result = &mut read => return result,
-                _ = session.full_metadata_released(), if session.full_completion_pending() => {
+                _ = session.full_metadata_released(), if session.metadata_completion_pending() => {
                     session.complete_pending_fulls();
                 }
             }

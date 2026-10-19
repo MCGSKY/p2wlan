@@ -26,12 +26,17 @@ mod full;
 #[cfg(any(target_os = "linux", all(unix, test)))]
 mod full_completion;
 mod full_loss;
+mod inbound_loss;
+#[cfg(unix)]
+mod snapshot_hex;
 #[cfg(unix)]
 use control_lock::ControlState as RegistryMutex;
 use full_loss::FullRetentionLoss;
 pub(crate) use full_loss::FullRetentionLossReason;
 #[cfg(not(unix))]
 use std::sync::Mutex as RegistryMutex;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+mod completion_wait;
 #[cfg(any(target_os = "linux", all(unix, test)))]
 mod native;
 mod owners;
@@ -41,6 +46,8 @@ pub(crate) use native::{OriginalKernelExchange, OriginalKernelOnce};
 #[cfg(any(target_os = "linux", all(unix, test)))]
 pub(crate) use owners::OriginalKernelCurrentOwners;
 mod ingress;
+#[cfg(unix)]
+mod read_loss;
 mod read_peer;
 mod read_room;
 #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -56,10 +63,19 @@ pub(crate) struct CaptureSession {
     active: AtomicBool,
     inbound_complete: AtomicBool,
     read_complete: AtomicBool,
+    #[cfg(unix)]
+    read_loss: read_loss::ReadLoss,
     full_complete: AtomicBool,
     full_loss: FullRetentionLoss,
+    inbound_loss: inbound_loss::InboundLoss,
     #[cfg(any(target_os = "linux", all(unix, test)))]
     pending_full: full_completion::CompletionSignal,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    native_terminal_revision: AtomicU64,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    epoch_trace: crate::peer::EpochTraceLease,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    emit_trace: Arc<crate::transport::EmitTrace>,
     expires: Instant,
     peers: Weak<PeerManager>,
     #[cfg(unix)]
@@ -141,8 +157,10 @@ pub(super) struct ReadSnapshot {
     pub(super) schema_version: u8,
     scope: &'static str,
     owner: u64,
-    capture_id: String,
-    producer_scope: String,
+    #[serde(serialize_with = "snapshot_hex::serialize")]
+    capture_id: [u8; 16],
+    #[serde(serialize_with = "snapshot_hex::serialize")]
+    producer_scope: [u8; 16],
     clock_scope: Option<NativeClockScope>,
     observed_monotonic_ns: Option<u64>,
     registration_revision: u64,
@@ -158,9 +176,31 @@ pub(super) struct ReadSnapshot {
     canonical_current_owner_verified: bool,
     incoming_provenance_complete: bool,
     original_read_observation_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_original_read_loss: Option<read_loss::ReadLossSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_read_registry_refusal: Option<control_lock::OriginalReadRefusalSnapshot>,
     original_full_retention_complete: bool,
     first_original_full_retention_loss: Option<FullRetentionLossReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_original_inbound_loss: Option<inbound_loss::InboundLossSnapshot>,
     retained_original_reads: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_input_registry_refusal: Option<control_lock::InputRefusalSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_authenticated_input_registry_refusal:
+        Option<control_lock::AuthenticatedRefusalSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_system_write_registry_refusal: Option<control_lock::SystemWriteRefusalSnapshot>,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_kernel_epoch_refusal: Option<crate::peer::EpochRefusalSnapshot>,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_read_peer_epoch_refusal: Option<crate::peer::EpochRefusalSnapshot>,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_kernel_emit_refusal: Option<crate::transport::EmitRefusalSnapshot>,
 }
 #[cfg(unix)]
 #[derive(Serialize)]
@@ -168,11 +208,15 @@ struct RequestSnapshot {
     #[cfg(any(target_os = "linux", all(unix, test)))]
     native_credit: Option<native::NativeFrameSnapshot>,
     flow: usize,
-    producer_scope: String,
+    #[serde(serialize_with = "snapshot_hex::serialize")]
+    producer_scope: [u8; 16],
     sequence: u32,
-    run_nonce: String,
-    round_nonce: String,
-    request_nonce: String,
+    #[serde(serialize_with = "snapshot_hex::serialize")]
+    run_nonce: [u8; 16],
+    #[serde(serialize_with = "snapshot_hex::serialize")]
+    round_nonce: [u8; 16],
+    #[serde(serialize_with = "snapshot_hex::serialize")]
+    request_nonce: [u8; 16],
     kind: &'static str,
     protocol: &'static str,
     read_events: u64,
@@ -225,9 +269,19 @@ impl CaptureSession {
             active: AtomicBool::new(true),
             inbound_complete: AtomicBool::new(true),
             read_complete: AtomicBool::new(true),
+            #[cfg(unix)]
+            read_loss: read_loss::ReadLoss::new(),
             full_complete: AtomicBool::new(true),
             full_loss: FullRetentionLoss::new(),
+            inbound_loss: inbound_loss::InboundLoss::new(),
             pending_full: full_completion::CompletionSignal::new(),
+            native_terminal_revision: AtomicU64::new(0),
+            epoch_trace: peers.network_epoch_gate().capture_diagnostics(
+                owner,
+                plan.capture_id,
+                expires,
+            ),
+            emit_trace: crate::transport::EmitTrace::new(owner, plan.capture_id, expires),
             expires,
             peers: Arc::downgrade(peers),
             capture_id: plan.capture_id,
@@ -361,6 +415,10 @@ impl CaptureSession {
 
     pub(crate) fn retire(&self) {
         self.active.store(false, Ordering::Release);
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        self.epoch_trace.deactivate();
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        self.emit_trace.deactivate();
     }
 
     pub(super) fn bind_system_device(&self, device: &Arc<DeviceLease>) -> bool {
@@ -401,15 +459,32 @@ impl CaptureSession {
         {
             return None;
         }
+        #[cfg(unix)]
+        let ordinal = original.ordinal();
         match self.capture_read(original, packet) {
             Ok(binding) => binding,
-            Err(_) => {
+            Err(_error) => {
+                #[cfg(unix)]
+                self.read_loss.record(ordinal, _error);
                 // A lost original read cannot be replaced by a later copy
                 // sampled under a newer peer lifecycle or network generation.
-                self.read_complete.store(false, Ordering::Release);
-                self.gap();
+                self.original_observation_lost(&self.read_complete);
                 None
             }
+        }
+    }
+
+    pub(super) fn original_observation_lost(&self, complete: &AtomicBool) {
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        let first_loss = complete.swap(false, Ordering::AcqRel);
+        #[cfg(not(any(target_os = "linux", all(unix, test))))]
+        complete.store(false, Ordering::Release);
+        self.gap();
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        if first_loss {
+            // Only the first irreversible transition of each sole provenance
+            // flag wakes the existing actor. No Full marker/fact is invented.
+            self.wake_original_terminal_loss();
         }
     }
 
@@ -420,10 +495,11 @@ impl CaptureSession {
     ) -> Result<Option<Arc<KernelReadBinding>>, CaptureFailure> {
         let udp = parse_os_udp(packet).ok();
         let tcp = parse_tcp_segment(packet).ok();
-        let mut state = self
-            .state
-            .try_lock()
-            .map_err(|_| CaptureFailure::Contended)?;
+        #[cfg(unix)]
+        let state = self.state.try_original_read_lock(original.ordinal());
+        #[cfg(not(unix))]
+        let state = self.state.try_lock();
+        let mut state = state.map_err(|_| CaptureFailure::Contended)?;
         if state
             .system_device
             .as_ref()
@@ -544,7 +620,12 @@ impl CaptureSession {
         if slots.is_empty() {
             return Ok(None);
         }
-        let original_peers = self.first_read_peers(flow, &slots);
+        let original_peers = self.first_read_peers(
+            flow,
+            &slots,
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            Some(&original),
+        );
         let original_request_rooms = self.first_read_request_rooms(flow, &slots, room.as_ref());
         for slot in &slots {
             let read = &mut flow.requests[*slot];
@@ -618,11 +699,11 @@ impl CaptureSession {
                         .as_ref()
                         .map(native::NativeFrameOutcome::snapshot),
                     flow: flow_index,
-                    producer_scope: hex::encode(flow.producer_scope),
+                    producer_scope: flow.producer_scope,
                     sequence: key.sequence,
-                    run_nonce: hex::encode(key.run),
-                    round_nonce: hex::encode(key.round),
-                    request_nonce: hex::encode(key.request_nonce),
+                    run_nonce: key.run,
+                    round_nonce: key.round,
+                    request_nonce: key.request_nonce,
                     kind: match key.kind {
                         crate::business_evidence::RequestKind::Request => "request",
                         crate::business_evidence::RequestKind::Response => "response",
@@ -697,8 +778,8 @@ impl CaptureSession {
             schema_version: 2,
             scope: "registered_native_frame_capture",
             owner: self.owner,
-            capture_id: hex::encode(self.capture_id),
-            producer_scope: hex::encode(self.producer_scope),
+            capture_id: self.capture_id,
+            producer_scope: self.producer_scope,
             clock_scope: self.clock_scope.clone(),
             observed_monotonic_ns: monotonic_ns(),
             registration_revision: state.revision,
@@ -717,9 +798,23 @@ impl CaptureSession {
             canonical_current_owner_verified: native_verified,
             incoming_provenance_complete: self.inbound_complete.load(Ordering::Acquire),
             original_read_observation_complete: self.read_complete.load(Ordering::Acquire),
+            first_original_read_loss: self.read_loss.snapshot(),
+            original_read_registry_refusal: self.state.original_read_refusal_snapshot(),
             original_full_retention_complete: self.full_complete.load(Ordering::Acquire),
             first_original_full_retention_loss: self.full_loss.snapshot(),
+            first_original_inbound_loss: self.inbound_loss.snapshot(),
             retained_original_reads: state.read_history.len(),
+            original_input_registry_refusal: self.state.input_refusal_snapshot(),
+            original_authenticated_input_registry_refusal: self
+                .state
+                .authenticated_refusal_snapshot(),
+            original_system_write_registry_refusal: self.state.system_write_refusal_snapshot(),
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            original_kernel_epoch_refusal: self.epoch_trace.snapshot(),
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            original_read_peer_epoch_refusal: self.epoch_trace.read_peer_snapshot(),
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            original_kernel_emit_refusal: self.emit_trace.snapshot(),
         })
     }
 }
@@ -751,7 +846,11 @@ impl KernelReadBinding {
         if self.read.at() > observed_at {
             return Some(Reason::InputClockBeforeRead);
         }
-        let state = match scope.state.try_lock() {
+        #[cfg(unix)]
+        let input = scope.state.try_input_lock(self.read.ordinal());
+        #[cfg(not(unix))]
+        let input = scope.state.try_lock();
+        let state = match input {
             Ok(state) => state,
             Err(std::sync::TryLockError::WouldBlock) => {
                 return Some(Reason::InputRegistryContended)

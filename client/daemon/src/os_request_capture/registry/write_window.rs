@@ -113,7 +113,63 @@ impl WireWriteWindow {
     }
 }
 
+// This is a fenced reference to the sole immutable registration input, not a
+// second mutable flow state. The exact Arc is rechecked under the real owner.
+struct OriginalWindowPlan {
+    producer: [u8; 16],
+    flow: usize,
+    plan: Arc<RegisteredFlowPlan>,
+}
+
+impl OriginalWindowPlan {
+    fn validate_registered_wire(
+        &self,
+        wire: &WireWriteWindow,
+        received: u64,
+    ) -> Result<[u8; 16], CaptureFailure> {
+        let frame_bytes = 63 + 128 + usize::from(self.plan.protocol == Protocol::Tcp) * 4;
+        let nonce = self
+            .plan
+            .requests
+            .get(wire.sequence as usize)
+            .ok_or(CaptureFailure::InvalidPlan)?
+            .request_nonce;
+        wire.validate(received, frame_bytes, &nonce)
+    }
+
+    fn is_current(&self, index: usize, flow: &FlowState) -> bool {
+        self.flow == index
+            && self.producer == flow.producer_scope
+            && Arc::ptr_eq(&self.plan, &flow.plan)
+    }
+}
+
 impl CaptureSession {
+    async fn original_window_plan(
+        &self,
+        producer: [u8; 16],
+        end: tokio::time::Instant,
+    ) -> Result<OriginalWindowPlan, CaptureFailure> {
+        let state = self.state.lock_until(end).await?;
+        if !self.is_live(Instant::now()) {
+            return Err(CaptureFailure::Expired);
+        }
+        let mut flows = state
+            .flows
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.producer_scope == producer);
+        let (index, flow) = flows.next().ok_or(CaptureFailure::InvalidPlan)?;
+        if flows.next().is_some() || flow.requests.len() != 8 || flow.plan.payload_bytes != 128 {
+            return Err(CaptureFailure::InvalidPlan);
+        }
+        Ok(OriginalWindowPlan {
+            producer,
+            flow: index,
+            plan: flow.plan.clone(),
+        })
+    }
+
     /// Only an already-owned control channel can deliver this observation.
     /// Receipt before the existing deadline is mandatory; no fresh clock starts.
     pub(in crate::os_request_capture) async fn observe_original_write_window(
@@ -132,14 +188,19 @@ impl CaptureSession {
         // Reject impossible receipt times before waiting. The registered
         // plan/frame/nonce are still checked under the sole metadata owner.
         let supplied_nonce = super::super::plan::nonce(&wire.request_nonce)?;
-        wire.validate(received, wire.frame_bytes, &supplied_nonce)?;
+        let supplied_producer = wire.validate(received, wire.frame_bytes, &supplied_nonce)?;
         let end = self.metadata_command_deadline(wire.original_deadline_ns)?;
+        let prepared = self.original_window_plan(supplied_producer, end).await?;
+        // The first guard has already been dropped. Hash the unchanged full
+        // request bytes without excluding the real input's single try-lock.
+        let frame_matches = wire.matches_registered_request_frame(&prepared.plan);
+        let registered_validation = prepared.validate_registered_wire(&wire, received);
         let mut state = self.state.lock_until(end).await?;
         let now = monotonic_ns().ok_or(CaptureFailure::InvalidPlan)?;
         if !self.is_live(Instant::now()) {
             return Err(CaptureFailure::Expired);
         }
-        let producer = super::super::plan::nonce(&wire.producer_scope)?;
+        let producer = prepared.producer;
         let mut flows = state
             .flows
             .iter_mut()
@@ -147,6 +208,9 @@ impl CaptureSession {
             .filter(|(_, f)| f.producer_scope == producer);
         let (flow_index, flow) = flows.next().ok_or(CaptureFailure::InvalidPlan)?;
         if flows.next().is_some() || flow.requests.len() != 8 || flow.plan.payload_bytes != 128 {
+            return Err(CaptureFailure::InvalidPlan);
+        }
+        if !prepared.is_current(flow_index, flow) {
             return Err(CaptureFailure::InvalidPlan);
         }
         if flow.requests.iter().any(|request| {
@@ -157,15 +221,14 @@ impl CaptureSession {
         }) {
             return Err(CaptureFailure::FrameConflict);
         }
-        let frame_bytes = 63 + 128 + usize::from(flow.plan.protocol == Protocol::Tcp) * 4;
-        let expected_nonce = flow
-            .plan
-            .requests
-            .get(wire.sequence as usize)
-            .ok_or(CaptureFailure::InvalidPlan)?
-            .request_nonce;
-        wire.validate(now, frame_bytes, &expected_nonce)?;
-        if !wire.matches_registered_request_frame(&flow.plan) {
+        // Consume the same pure validation only after the original live,
+        // flow, exact Arc and cross-window checks, preserving error order.
+        // The clock sampled after this actual acquisition remains decisive.
+        registered_validation?;
+        if now < wire.complete_returned_ns || now >= wire.original_deadline_ns {
+            return Err(CaptureFailure::InvalidPlan);
+        }
+        if !frame_matches {
             return Err(CaptureFailure::FrameConflict);
         }
         let request = flow
@@ -188,8 +251,11 @@ impl CaptureSession {
             native_os_write_verified: false,
             canonical_current_owner_verified: false,
         });
-        let slot = wire.sequence as usize;
-        self.try_complete_original_frames(&mut state, flow_index, &[slot]);
+        // The descriptor actor owns completion work. Release this registration
+        // guard before waking it so real input/SystemTun retention keeps its
+        // original single try while this command only installs its metadata.
+        drop(state);
+        self.pending_full.request_window();
         Ok(())
     }
 }

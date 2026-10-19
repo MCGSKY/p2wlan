@@ -236,7 +236,7 @@ pub struct UdpTransport {
     /// mutation: commit, finalize, attach, affinity adoption and pending-probe
     /// registration.  Lock order everywhere: network-epoch gate -> adoption
     /// lock -> socket_state -> pending probes.
-    network_epoch_gate: Arc<tokio::sync::Mutex<()>>,
+    network_epoch_gate: Arc<crate::peer::NetworkEpochGate>,
     /// Per-peer adoption locks serializing every pending-probe ACK adoption
     /// against `clear_pending_probes_for_peer`.
     ///

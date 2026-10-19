@@ -15,6 +15,7 @@ android {
     namespace = "com.p2wlan.client"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
+    // CI binds the checked NDK through local.properties before plugin setup.
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

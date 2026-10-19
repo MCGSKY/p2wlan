@@ -39,6 +39,15 @@ impl PeerManager {
             .gate
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        // The same publication gate fences this immutable input. Preparing a
+        // private copy grants no membership or current-owner permission.
+        // Keep allocation out of the mutex used by native single-try readers.
+        let current = self.dplpmtud_capability.sender.borrow().clone();
+        let prepared = (current.get(peer_id) != Some(&peer_session_generation)).then(|| {
+            let mut next = (*current).clone();
+            next.reserve(1);
+            (next, peer_id.to_string())
+        });
         let membership = self
             .peer_membership
             .lock()
@@ -46,11 +55,9 @@ impl PeerManager {
         if membership.active_generation(peer_id) != Some(peer_session_generation) {
             return;
         }
-        let current = self.dplpmtud_capability.sender.borrow().clone();
-        if current.get(peer_id) == Some(&peer_session_generation) {
+        let Some((mut next, peer_id)) = prepared else {
             return;
-        }
-        let mut next = (*current).clone();
+        };
         next.retain(|candidate, generation| {
             membership.active_generation(candidate) == Some(*generation)
         });
@@ -58,7 +65,7 @@ impl PeerManager {
         // not by the smaller DPLPMTUD worker/publication cap. Evicting a live
         // negotiated capability would incorrectly turn that modern peer into
         // a legacy bypass while its old runtime entry still existed.
-        next.insert(peer_id.to_string(), peer_session_generation);
+        next.insert(peer_id, peer_session_generation);
         self.dplpmtud_capability.sender.send_replace(Arc::new(next));
         drop(membership);
         drop(gate);

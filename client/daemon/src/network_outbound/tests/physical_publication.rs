@@ -93,6 +93,328 @@ async fn receive_original(
     n
 }
 
+async fn preparation_slot_wait_control(hold_relay: bool, advance_generation: bool) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (f, transport, udp, receiver, mut remote) = direct_fixture(false).await;
+        let udps = RwLock::new(Some(udp));
+        let relays = RwLock::new(None);
+        let relay_writer = if hold_relay { Some(relays.write().await) } else { None };
+        let udp_writer = if hold_relay { None } else { Some(udps.write().await) };
+        tokio::task::yield_now().await;
+        let mut send = Box::pin(encrypt_then_send_with_deadline(
+            f.delivery.clone(), &transport, &f.peers, f.record.generation, true,
+            &udps, &relays, false, Some(Instant::now() + Duration::from_secs(1)), None,
+        ));
+        assert!(matches!(futures_util::poll!(send.as_mut()), std::task::Poll::Pending));
+        // The real preparation owns emit but has not encrypted or sent.
+        // Physical publication remains Idle until crypto actually succeeds.
+        assert!(transport.try_acquire_outbound_emit_guard(PEER).is_none());
+        assert!(f.peers.network_epoch_gate().try_lock_owned().is_ok());
+        assert_eq!(f.record.physical_publication.state(), PhysicalPublicationState::Idle);
+        let mut wire = [0u8; 2048];
+        assert!(matches!(receiver.try_recv_from(&mut wire), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        if advance_generation {
+            let next = f.peers.advance_network_generation("slot-wait-control").await;
+            assert!(next > f.record.generation);
+        }
+        drop(udp_writer);
+        drop(relay_writer);
+        let outcome = send.await;
+        if advance_generation {
+            assert!(matches!(outcome, EncryptSendOutcome::Retryable {
+                reason_code: REASON_OUTBOUND_GENERATION_CHANGED, ..
+            }));
+            assert_eq!(f.record.physical_publication.state(), PhysicalPublicationState::Idle);
+            assert!(f.record.physical_publication.record().is_none());
+            assert!(matches!(receiver.try_recv_from(&mut wire), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+            // A separate real encryption still receives counter0: the stale
+            // preparation did not consume one while waiting for its slot.
+            let encrypted = transport.encrypt_outbound(OutboundPacket {
+                peer_id: PEER.to_string(), packet: f.record.original_packet().to_vec(),
+                dst_ip: f.delivery.dst_ip.clone(), trace: None, room_authorization: None,
+            }).await.unwrap().unwrap();
+            assert_eq!(crate::transport::wire_counter(&encrypted.wire_bytes), Some(0));
+            assert_eq!(remote.decrypt_from_bytes(&encrypted.wire_bytes).unwrap(), f.record.original_packet());
+        } else {
+            assert!(matches!(outcome, EncryptSendOutcome::Sent));
+            let (n, _) = receiver.recv_from(&mut wire).await.unwrap();
+            assert_eq!(crate::transport::wire_counter(&wire[..n]), Some(0));
+            assert_eq!(remote.decrypt_from_bytes(&wire[..n]).unwrap(), f.record.original_packet());
+            assert!(matches!(receiver.try_recv_from(&mut wire), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+            assert_eq!(f.record.physical_publication.record().unwrap().qualify(&f.record, Instant::now()), PhysicalInputQualification::UnknownUdpPublication);
+        }
+        assert!(transport.try_acquire_outbound_emit_guard(PEER).is_some());
+        assert!(f.peers.network_epoch_gate().try_lock_owned().is_ok());
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn preparation_relay_slot_wait_releases_epoch_before_actual_udp() {
+    preparation_slot_wait_control(true, false).await;
+}
+
+#[tokio::test]
+async fn preparation_udp_slot_wait_releases_epoch_before_actual_udp() {
+    preparation_slot_wait_control(false, false).await;
+}
+
+#[tokio::test]
+async fn preparation_relay_slot_wait_rechecks_generation_before_counter() {
+    preparation_slot_wait_control(true, true).await;
+}
+
+#[tokio::test]
+async fn preparation_udp_slot_wait_rechecks_generation_before_counter() {
+    preparation_slot_wait_control(false, true).await;
+}
+
+async fn assert_preparation_counter_unallocated(
+    transport: &WireGuardTransport,
+    f: &RoutedRequestFixture,
+    remote: &mut p2pnet_wireguard::TransportSession,
+) {
+    assert_eq!(
+        f.record.physical_publication.state(),
+        PhysicalPublicationState::Idle
+    );
+    assert!(f.record.physical_publication.record().is_none());
+    let encrypted = transport
+        .encrypt_outbound(OutboundPacket {
+            peer_id: PEER.to_string(),
+            dst_ip: f.delivery.dst_ip.clone(),
+            packet: f.record.original_packet().to_vec(),
+            trace: None,
+            room_authorization: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::transport::wire_counter(&encrypted.wire_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        remote.decrypt_from_bytes(&encrypted.wire_bytes).unwrap(),
+        f.record.original_packet()
+    );
+}
+
+async fn preparation_connection_writer_control(advance_generation: bool, cancel: bool) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (f, transport, udp, receiver, mut remote) = direct_fixture(false).await;
+        let udps = RwLock::new(Some(udp));
+        let relays = RwLock::new(None);
+        let writer = f.peers.hold_connections_writer_for_test().await;
+        tokio::task::yield_now().await;
+        let mut send = Box::pin(encrypt_then_send_with_deadline(
+            f.delivery.clone(), &transport, &f.peers, f.record.generation, true,
+            &udps, &relays, false, Some(Instant::now() + Duration::from_secs(1)), None,
+        ));
+        assert!(matches!(futures_util::poll!(send.as_mut()), std::task::Poll::Pending));
+        assert!(transport.try_acquire_outbound_emit_guard(PEER).is_none());
+        assert!(f.peers.network_epoch_gate().try_lock_owned().is_ok());
+        assert_eq!(f.record.physical_publication.state(), PhysicalPublicationState::Idle);
+        let mut wire = [0u8; 2048];
+        assert!(matches!(receiver.try_recv_from(&mut wire), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        if cancel {
+            drop(send);
+            drop(writer);
+            assert!(transport.try_acquire_outbound_emit_guard(PEER).is_some());
+            assert_preparation_counter_unallocated(&transport, &f, &mut remote).await;
+        } else if advance_generation {
+            // The real lifecycle owner acquires epoch and queues behind the
+            // held writer. Preparation must yield its granted writer when it
+            // cannot reacquire epoch, letting this original update complete.
+            let mut advance = Box::pin(f.peers.advance_network_generation("connection-wait-control"));
+            assert!(matches!(futures_util::poll!(advance.as_mut()), std::task::Poll::Pending));
+            assert!(f.peers.network_epoch_gate().try_lock_owned().is_err());
+            drop(writer);
+            let (outcome, next) = tokio::join!(send, advance);
+            assert!(next > f.record.generation);
+            assert!(matches!(outcome, EncryptSendOutcome::Retryable {
+                reason_code: REASON_OUTBOUND_GENERATION_CHANGED, ..
+            }));
+            assert_preparation_counter_unallocated(&transport, &f, &mut remote).await;
+        } else {
+            drop(writer);
+            assert!(matches!(send.await, EncryptSendOutcome::Sent));
+            let (n, _) = receiver.recv_from(&mut wire).await.unwrap();
+            assert_eq!(crate::transport::wire_counter(&wire[..n]), Some(0));
+            assert_eq!(remote.decrypt_from_bytes(&wire[..n]).unwrap(), f.record.original_packet());
+            assert_eq!(f.record.physical_publication.record().unwrap().qualify(&f.record, Instant::now()), PhysicalInputQualification::UnknownUdpPublication);
+        }
+        assert!(matches!(receiver.try_recv_from(&mut wire), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        assert!(transport.try_acquire_outbound_emit_guard(PEER).is_some());
+        assert!(f.peers.network_epoch_gate().try_lock_owned().is_ok());
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn preparation_connection_writer_wait_releases_epoch_before_actual_udp() {
+    preparation_connection_writer_control(false, false).await;
+}
+
+#[tokio::test]
+async fn preparation_connection_writer_wait_rechecks_generation_before_counter() {
+    preparation_connection_writer_control(true, false).await;
+}
+
+#[tokio::test]
+async fn preparation_connection_writer_wait_cancel_releases_emit_without_counter() {
+    preparation_connection_writer_control(false, true).await;
+}
+
+struct OutboundCompletionProbe {
+    transport: WireGuardTransport,
+    record: Arc<crate::overlay_requests::CanonicalOverlayRequest>,
+    observed: Arc<std::sync::atomic::AtomicUsize>,
+    released: Arc<std::sync::atomic::AtomicUsize>,
+    recorded: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for OutboundCompletionProbe {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct EventName(bool);
+        impl tracing::field::Visit for EventName {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "event" && value == "outbound_overlay_transport_result" {
+                    self.0 = true;
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        let mut name = EventName(false);
+        event.record(&mut name);
+        if name.0 {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.observed.fetch_add(1, SeqCst);
+            if self
+                .transport
+                .try_acquire_outbound_emit_guard(PEER)
+                .is_some()
+            {
+                self.released.fetch_add(1, SeqCst);
+            }
+            if self.record.physical_publication.state() == PhysicalPublicationState::Recorded {
+                self.recorded.fetch_add(1, SeqCst);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn outbound_completion_logger_reenters_emit_after_actual_udp_and_original_publication() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (f, transport, udp, receiver, mut remote) = direct_fixture(false).await;
+        assert!(overlay_packet_identity(&f.delivery.packet).is_some());
+        let observed = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(OutboundCompletionProbe {
+            transport: transport.clone(),
+            record: f.record.clone(),
+            observed: observed.clone(),
+            released: released.clone(),
+            recorded: recorded.clone(),
+        });
+        let udps = RwLock::new(Some(udp));
+        let relays = RwLock::new(None);
+        assert!(matches!(
+            encrypt_then_send_with_deadline(
+                f.delivery.clone(),
+                &transport,
+                &f.peers,
+                f.record.generation,
+                true,
+                &udps,
+                &relays,
+                false,
+                Some(Instant::now() + Duration::from_secs(1)),
+                None,
+            )
+            .with_subscriber(subscriber)
+            .await,
+            EncryptSendOutcome::Sent
+        ));
+        receive_original(&receiver, &mut remote, &f).await;
+        assert_eq!(observed.load(SeqCst), 1);
+        assert_eq!(released.load(SeqCst), 1);
+        assert_eq!(recorded.load(SeqCst), 1);
+        // A real local send and logger reentry grant no current-owner credit.
+        let record = f.record.physical_publication.record().unwrap();
+        assert_eq!(
+            record.qualify(&f.record, Instant::now()),
+            PhysicalInputQualification::UnknownUdpPublication
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn fast_completion_logger_reenters_emit_after_actual_udp_and_original_publication() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use tracing_subscriber::prelude::*;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (f, transport, udp, receiver, mut remote) = direct_fixture(true).await;
+        let (_, socket) = udp
+            .socket_for_peer_endpoint(Some(PEER), Some(receiver.local_addr().unwrap()))
+            .await
+            .unwrap();
+        socket.writable().await.unwrap();
+        let observed = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(OutboundCompletionProbe {
+            transport: transport.clone(),
+            record: f.record.clone(),
+            observed: observed.clone(),
+            released: released.clone(),
+            recorded: recorded.clone(),
+        });
+        let udps = RwLock::new(Some(udp));
+        let mut paths = HashMap::new();
+        let mut ineligible = HashMap::new();
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            super::super::fast_path::try_lan_direct_fast_path(
+                f.delivery.clone(),
+                &transport,
+                &f.peers,
+                true,
+                &udps,
+                &mut paths,
+                &mut ineligible,
+            )
+        });
+        assert!(matches!(
+            outcome,
+            super::super::fast_path::FastPathAttempt::Sent
+        ));
+        receive_original(&receiver, &mut remote, &f).await;
+        assert_eq!(observed.load(SeqCst), 1);
+        assert_eq!(released.load(SeqCst), 1);
+        assert_eq!(recorded.load(SeqCst), 1);
+        assert!(f.peers.network_epoch_gate().try_lock_owned().is_ok());
+        assert!(udps.try_write().is_ok());
+        // Local UDP completion and callback reentry grant no final owner credit.
+        assert_eq!(
+            f.record
+                .physical_publication
+                .record()
+                .unwrap()
+                .qualify(&f.record, Instant::now()),
+            PhysicalInputQualification::UnknownUdpPublication
+        );
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn b17_slow_actual_udp_success_fixed_b_g_and_legacy_unknown() {
     tokio::time::timeout(Duration::from_secs(1), async {

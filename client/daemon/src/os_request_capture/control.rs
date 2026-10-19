@@ -61,6 +61,11 @@ enum Command {
     ObserveOriginalWriteWindow {
         window: super::registry::write_window::WireWriteWindow,
     },
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    WaitOriginalOutcomes {
+        producer_scope: String,
+        original_deadline_ns: u64,
+    },
 }
 
 impl CaptureSetup {
@@ -340,6 +345,21 @@ impl ControlChannel {
                 Command::ObserveOriginalWriteWindow { window } => {
                     self.session.observe_original_write_window(window).await?;
                     continue;
+                }
+                #[cfg(any(target_os = "linux", all(unix, test)))]
+                Command::WaitOriginalOutcomes {
+                    producer_scope,
+                    original_deadline_ns,
+                } => {
+                    let producer = super::plan::nonce(&producer_scope)?;
+                    let end = self
+                        .session
+                        .metadata_command_deadline(original_deadline_ns)?;
+                    let value = self
+                        .session
+                        .wait_original_outcomes_observed(producer, end, original_deadline_ns)
+                        .await?;
+                    (serde_json::to_vec(&value), end)
                 }
             };
             let encoded = encoded.map_err(|_| CaptureFailure::ControlProtocol)?;

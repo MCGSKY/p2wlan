@@ -70,11 +70,14 @@ impl CaptureSession {
                 true
             }
         });
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        if bound {
+            wireguard.bind_original_emit_diagnostics(&self.emit_trace);
+        }
         if !bound {
             self.read_complete.store(false, Ordering::Release);
             self.inbound_complete.store(false, Ordering::Release);
-            self.full_complete.store(false, Ordering::Release);
-            self.gap();
+            self.original_observation_lost(&self.full_complete);
         }
     }
 }

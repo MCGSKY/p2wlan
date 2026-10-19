@@ -2,12 +2,13 @@
 //! Metadata holds only Weak owners; qualification is repeated at actual send.
 use super::{OriginalOverlayAck, OverlayCreditOutcome};
 use crate::peer::PeerManager;
+use crate::transport::OwnedEmitGuard;
 use crate::transport::{
     OriginalEncryptionSource, OriginalOverlayIngressSource, OriginalSessionRole, WireGuardTransport,
 };
 use std::sync::{Arc, Weak};
 use std::time::Instant;
-use tokio::sync::{OwnedMutexGuard, RwLock};
+use tokio::sync::RwLock;
 
 pub(crate) struct OriginalEchoInput {
     source: OriginalOverlayIngressSource,
@@ -209,7 +210,7 @@ impl OriginalEchoInput {
     pub(crate) fn prewrite(
         self: &Arc<Self>,
         tx: &OriginalEncryptionSource,
-        emit: Weak<OwnedMutexGuard<()>>,
+        emit: Weak<OwnedEmitGuard>,
         packet: &crate::transport::EncryptedPeerPacket,
     ) -> Option<Arc<OriginalEchoPrewrite>> {
         if packet.peer_id != self.peer_id
@@ -234,7 +235,7 @@ impl OriginalEchoInput {
 pub(crate) struct OriginalEchoPrewrite {
     input: Arc<OriginalEchoInput>,
     tx: OriginalEncryptionSource,
-    emit: Weak<OwnedMutexGuard<()>>,
+    emit: Weak<OwnedEmitGuard>,
     wire: (usize, Option<u64>, u64),
 }
 

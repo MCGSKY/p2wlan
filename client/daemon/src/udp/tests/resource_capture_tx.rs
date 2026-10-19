@@ -14,7 +14,7 @@ use p2pnet_wireguard::MessageTransport;
 use std::any::Any;
 use std::future::Future;
 use std::sync::Weak;
-use tokio::sync::{oneshot, watch, OwnedMutexGuard, RwLock};
+use tokio::sync::{oneshot, watch, RwLock};
 use tokio::time::{timeout_at, Instant as TokioInstant};
 
 const PEER: &str = "resource-tx-peer";
@@ -115,7 +115,7 @@ async fn native_workflow(
     normalized: bool,
     resources: Arc<ResourceCapture>,
     children: &mut Children,
-    held_emit: &mut Option<OwnedMutexGuard<()>>,
+    held_emit: &mut Option<crate::transport::OwnedEmitGuard>,
     sockets_to_release: &mut Vec<Weak<UdpSocket>>,
     deadline: TokioInstant,
 ) -> CaseLengths {

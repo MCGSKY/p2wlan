@@ -347,13 +347,13 @@ pub(crate) struct EncryptedRequestDelivery {
     packet: EncryptedPeerPacket,
     metadata: DeliveryMetadata,
     source: Option<OriginalEncryptionSource>,
-    echo_emit: Option<std::sync::Weak<tokio::sync::OwnedMutexGuard<()>>>,
+    echo_emit: Option<std::sync::Weak<crate::transport::OwnedEmitGuard>>,
 }
 
 impl EncryptedRequestDelivery {
     pub(crate) fn bind_original_echo_emit(
         &mut self,
-        guard: &Arc<tokio::sync::OwnedMutexGuard<()>>,
+        guard: &Arc<crate::transport::OwnedEmitGuard>,
     ) {
         if self
             .binding()

@@ -453,6 +453,16 @@ pub(super) fn try_lan_direct_fast_path(
     let emit_guard_hold_us = transport_handoff_completed
         .duration_since(emit_guard_acquired)
         .as_micros() as u64;
+    let definitely_not_handed = matches!(
+        &send_result,
+        Err(DirectBusinessUdpSendError::StaleToken
+            | DirectBusinessUdpSendError::WouldBlock
+            | DirectBusinessUdpSendError::LocalPacketTooLarge
+            | DirectBusinessUdpSendError::CiphertextTooLarge)
+    );
+    // The original UDP call and its slot/epoch guards have ended. Seal that
+    // result and release emit before profiler locks or diagnostic callbacks.
+    physical_attempt.finish(definitely_not_handed);
     if let Some(trace) = sampled_trace.as_ref() {
         profiler.record(
             trace.sampled,
@@ -532,13 +542,6 @@ pub(super) fn try_lan_direct_fast_path(
         }
     }
 
-    let definitely_not_handed = matches!(
-        &send_result,
-        Err(DirectBusinessUdpSendError::StaleToken
-            | DirectBusinessUdpSendError::WouldBlock
-            | DirectBusinessUdpSendError::LocalPacketTooLarge
-            | DirectBusinessUdpSendError::CiphertextTooLarge)
-    );
     let outcome = match send_result {
         Ok(_) => {
             profiler.record_fast_path_hit();
@@ -606,7 +609,6 @@ pub(super) fn try_lan_direct_fast_path(
             "encrypted overlay packet reached the LAN Direct fast-path outcome"
         );
     }
-    physical_attempt.finish(definitely_not_handed);
     outcome
 }
 

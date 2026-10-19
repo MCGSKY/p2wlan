@@ -2,7 +2,7 @@
 //! capture must not keep the WireGuard worker or its outbound sink alive.
 use super::*;
 
-type EmitRegistry = Mutex<HashMap<String, Weak<Mutex<()>>>>;
+use crate::transport::emit_gate::EmitRegistry;
 
 pub(crate) struct OriginalKernelTransportOwners {
     sessions: Weak<Mutex<HashMap<String, PeerTransportSessions>>>,
@@ -31,6 +31,13 @@ impl WireGuardTransport {
     }
 }
 
+impl WireGuardTransport {
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(crate) fn bind_original_emit_diagnostics(&self, trace: &Arc<EmitTrace>) {
+        self.outbound_emit_locks.bind(trace);
+    }
+}
+
 impl OriginalKernelTransportOwners {
     pub(crate) fn same_owner(&self, other: &Self) -> bool {
         self.sessions.ptr_eq(&other.sessions) && self.emit.ptr_eq(&other.emit)
@@ -47,13 +54,15 @@ impl OriginalKernelTransportOwners {
 
 #[cfg(any(target_os = "linux", all(unix, test)))]
 impl OriginalKernelTransportCurrent {
+    #[track_caller]
     pub(crate) fn try_emit_guard(
         &self,
         peer: &str,
-    ) -> std::result::Result<OwnedMutexGuard<()>, OriginalKernelEmitFailure> {
+        context: Option<EmitTryContext>,
+    ) -> std::result::Result<OwnedEmitGuard, OriginalKernelEmitFailure> {
         WireGuardTransport::try_outbound_emit_lock_in(&self.emit, peer)
             .ok_or(OriginalKernelEmitFailure::Registry)?
-            .try_lock_owned()
+            .try_lock_original(context)
             .map_err(|_| OriginalKernelEmitFailure::Emit)
     }
 

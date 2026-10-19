@@ -564,8 +564,8 @@ impl PhysicalRequestPublisher {
             packed(self.id, PhysicalPublicationState::Recorded),
             Ordering::Release,
         );
-        // PhysicalAttempt already destroyed the inner send future and released
-        // emit. Fast caller also dropped epoch/slot; no current owner is leased.
+        // Native handoff guards ended and PhysicalAttempt released emit. Relay's
+        // bounded future may retain policy snapshots; no current owner is leased.
         #[cfg(test)]
         {
             let hook = publication.recorded_observation_hook.lock().unwrap().take();

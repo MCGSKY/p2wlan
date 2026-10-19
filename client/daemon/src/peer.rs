@@ -647,6 +647,13 @@ pub use types::{
     PathSelectionDiagnostics, PathSelectionEvent, HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION,
 };
 
+mod epoch_gate;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) use epoch_gate::{EpochRefusalSnapshot, EpochTraceLease, EpochTryContext};
+pub(crate) use epoch_gate::{
+    NetworkEpochGate, NetworkEpochGuard, OutboundEpochPhase, OwnedNetworkEpochGuard,
+};
+
 mod path_observability;
 use path_observability::PathObservabilityState;
 pub use path_observability::{

@@ -135,6 +135,9 @@ pub(super) async fn encrypt_then_send_with_deadline(
             lock_wait_ms = emit_lock_wait_ms,
             "business packet acquired its per-peer WireGuard counter-ordering lock"
         );
+        // Histogram publication belongs to this future, outside the real
+        // epoch/session guards on success, early return and cancellation.
+        let mut crypto_profile = crate::dataplane::DeferredCryptoProfile::new(profiler);
         let (
             encrypted,
             direct_business_plan,
@@ -142,19 +145,30 @@ pub(super) async fn encrypt_then_send_with_deadline(
             physical_preparation,
             serialized_buffer_lease,
         ) = {
-            let epoch_gate = peers.network_epoch_gate();
+            // These are resource snapshots, never a path or generation fence.
+            // A slot replacement must not make original read observation wait
+            // behind an epoch guard held by this pre-encryption preparation.
+            // The unchanged epoch transaction below validates generation/path;
+            // actual budget, socket and native handoff fences remain authoritative.
+            let relay_available = relay_transport.read().await.is_some();
+            let udp = udp_transport.read().await.clone();
             let epoch_gate_wait_started = Instant::now();
-            let _epoch_guard = epoch_gate.lock().await;
+            // Declare before the real guard: success, early return and future
+            // cancellation release epoch before histogram locks/log callbacks.
+            let mut epoch_profile = crate::dataplane::DeferredEpochProfile::new(
+                profiler,
+                sampled_trace.as_ref().is_some_and(|trace| trace.sampled),
+            );
+            let (_epoch_guard, mut path_connections) =
+                peers.lock_epoch_and_connections_write().await;
             let epoch_gate_acquired = Instant::now();
-            if let Some(trace) = sampled_trace.as_ref() {
-                profiler.record(
-                    trace.sampled,
-                    "tx_epoch_gate_wait_us",
-                    epoch_gate_acquired.duration_since(epoch_gate_wait_started),
-                );
+            if sampled_trace.is_some() {
+                epoch_profile.waited(epoch_gate_acquired.duration_since(epoch_gate_wait_started));
             }
+            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Generation);
             let current_generation = peers.current_network_generation_sync();
             if current_generation != expected_generation {
+                drop(path_connections);
                 debug!(
                     event = "outbound_counter_allocation_rejected",
                     peer_id = %preparation_retry.peer_id,
@@ -171,19 +185,19 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 ),
             });
             }
-            let relay_available = relay_transport.read().await.is_some();
-            let udp = udp_transport.read().await.clone();
+            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Path);
             let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
-            let selection = peers
-                .select_path_for_data_with_local_endpoint_in_epoch(
-                    &preparation_retry.peer_id,
-                    prefer_direct,
-                    relay_available || relay_expected,
-                    udp_local_endpoint,
-                    current_generation,
-                    false,
-                )
-                .await;
+            let selection = peers.select_path_for_data_with_local_endpoint_in_epoch_with_conns(
+                &mut path_connections,
+                &preparation_retry.peer_id,
+                prefer_direct,
+                relay_available || relay_expected,
+                udp_local_endpoint,
+                current_generation,
+                false,
+            );
+            drop(path_connections);
+            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::DirectBudget);
             let mut force_relay = false;
             // A sealed Relay REQUEST echo must use its original Relay writer.
             // Direct may have won since ingress, but cannot validate a Relay
@@ -303,6 +317,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
             } else {
                 None
             };
+            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::OriginalEcho);
             if let Some(echo) = packet.original_echo() {
                 if packet.binding().is_none_or(|binding| {
                     binding.state() != crate::request_carriage::RequestBindingState::RoutedExact
@@ -340,7 +355,11 @@ pub(super) async fn encrypt_then_send_with_deadline(
                     });
                 }
             }
-            let mut result = match transport.encrypt_request_with_emit_guard(packet).await {
+            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Encryption);
+            let mut result = match transport
+                .encrypt_request_with_emit_guard_profiled(packet, Some(&mut crypto_profile))
+                .await
+            {
                 Ok(Some(value)) => value,
                 Ok(None) => {
                     debug!(
@@ -374,6 +393,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
                     });
                 }
             };
+            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::PhysicalMetadata);
             // The original plaintext has been consumed by the crypto call.
             // Bind the returned wire owner before any further awaited work.
             drop(original_buffer_lease);
@@ -385,17 +405,14 @@ pub(super) async fn encrypt_then_send_with_deadline(
             result.bind_original_echo_emit(&emit_guard);
             let physical_preparation =
                 result.prepare_physical_publication(peers, transport, current_generation);
-            if let Some(trace) = sampled_trace.as_ref() {
-                profiler.record(
-                    trace.sampled,
-                    "tx_epoch_gate_hold_us",
-                    epoch_gate_acquired.elapsed(),
-                );
+            if sampled_trace.is_some() {
+                epoch_profile.held(epoch_gate_acquired.elapsed());
             }
             if selection.path == Some(NetworkPath::Direct)
                 && selection.direct_confirmed
                 && !force_relay
             {
+                _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::DirectFirst);
                 if let Some(endpoint) = selection.direct_endpoint {
                     peers
                         .satisfy_direct_first_in_epoch(
@@ -415,6 +432,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 serialized_buffer_lease,
             )
         };
+        drop(crypto_profile);
         Ok((
             emit_guard,
             encrypted,
@@ -529,10 +547,19 @@ pub(super) async fn encrypt_then_send_with_deadline(
         complete_inner_ip_packet_len(&retry_packet.packet).unwrap_or(retry_packet.packet.len()),
         force_relay,
         window,
-        physical_attempt.slow_capture(),
+        Some(&mut physical_attempt),
     )
     .await;
     let transport_handoff_completed = Instant::now();
+    // The inner send future has ended. Seal any remaining original result;
+    // Relay already sealed before its post-send policy waits. Finish is idempotent.
+    // Retain the original completion timestamp for every duration below.
+    physical_attempt.finish(matches!(
+        &outcome,
+        SendOutcome::DirectBudgetStale { .. }
+            | SendOutcome::RetryableLocalBackpressure { .. }
+            | SendOutcome::LocalMtuFailure { .. }
+    ));
     if let Some(trace) = retry_packet.trace.as_ref() {
         let total_userspace_tx =
             transport_handoff_completed.duration_since(trace.tun_read_completed);
@@ -610,15 +637,6 @@ pub(super) async fn encrypt_then_send_with_deadline(
             "encrypted overlay packet reached a classified transport outcome"
         );
     }
-    // The guard is deliberately released before any asynchronous retry is
-    // queued. A retry is always the original plaintext and receives a fresh
-    // WireGuard counter.
-    physical_attempt.finish(matches!(
-        &outcome,
-        SendOutcome::DirectBudgetStale { .. }
-            | SendOutcome::RetryableLocalBackpressure { .. }
-            | SendOutcome::LocalMtuFailure { .. }
-    ));
     match outcome {
         SendOutcome::Sent => EncryptSendOutcome::Sent,
         SendOutcome::Retryable(failure) => EncryptSendOutcome::Retryable {
@@ -777,7 +795,7 @@ async fn send_encrypted_packet_bounded_with_origin(
     inner_ip_packet_len: usize,
     force_relay: bool,
     window: SendAdmissionWindow<'_>,
-    origin: Option<&mut super::physical_attempt::PhysicalSendCapture>,
+    origin: Option<&mut super::physical_attempt::OutboundPhysicalAttempt>,
 ) -> SendOutcome {
     // Capture the exact shared connection before entering the bounded send.
     // The same snapshot is passed into the send operation, so a supervisor
@@ -912,7 +930,7 @@ async fn send_encrypted_packet_once_with_origin(
     inner_ip_packet_len: usize,
     force_relay: bool,
     window: SendAdmissionWindow<'_>,
-    mut origin: Option<&mut super::physical_attempt::PhysicalSendCapture>,
+    mut origin: Option<&mut super::physical_attempt::OutboundPhysicalAttempt>,
 ) -> SendOutcome {
     let profiler = global_dataplane_profiler();
     // Take one path/generation snapshot atomically. Managed Direct keeps this
@@ -1049,11 +1067,11 @@ async fn send_encrypted_packet_once_with_origin(
                         )
                     })
             } else {
-                match origin.as_deref_mut() {
+                match origin.as_deref_mut().and_then(|owner| owner.capture()) {
                     Some(origin) => plan.udp.try_send_direct_business_packet_with_origin(
                         &plan.prepared,
                         packet,
-                        Some(origin.udp()),
+                        Some(origin),
                     ),
                     None => plan
                         .udp
@@ -1178,7 +1196,7 @@ async fn send_encrypted_packet_once_with_origin(
                 reason: "managed Direct became selected without a pre-encryption token".to_string(),
             };
         }
-        let direct_result = match origin.as_deref_mut() {
+        let direct_result = match origin.as_deref_mut().and_then(|owner| owner.capture()) {
             Some(origin) => {
                 send_direct_if_selected_with_origin(
                     packet,
@@ -1187,7 +1205,7 @@ async fn send_encrypted_packet_once_with_origin(
                     &selection,
                     udp_local_endpoint,
                     sampled,
-                    Some(origin.udp()),
+                    Some(origin),
                 )
                 .await
             }
@@ -1356,7 +1374,7 @@ async fn send_original_relay_with_capture(
     generation: u64,
     relay_send_started: &AtomicBool,
     sampled: Option<bool>,
-    origin: Option<&mut super::physical_attempt::PhysicalSendCapture>,
+    origin: Option<&mut super::physical_attempt::OutboundPhysicalAttempt>,
 ) -> SendOutcome {
     if packet.has_original_echo() {
         let Some(prewrite) = packet.original_echo_prewrite() else {
@@ -1364,27 +1382,50 @@ async fn send_original_relay_with_capture(
                 reason: "original echo encryption/emit source unavailable".into(),
             };
         };
-        return super::relay::send_via_relay_with_echo(
-            relay,
-            packet,
-            peers,
-            generation,
-            relay_send_started,
-            sampled,
-            prewrite,
-        )
-        .await;
+        return match origin {
+            Some(owner) => {
+                super::relay::send_via_relay_with_attempt(
+                    relay,
+                    packet,
+                    peers,
+                    generation,
+                    relay_send_started,
+                    sampled,
+                    None,
+                    Some(prewrite),
+                    owner,
+                )
+                .await
+            }
+            None => {
+                super::relay::send_via_relay_with_echo(
+                    relay,
+                    packet,
+                    peers,
+                    generation,
+                    relay_send_started,
+                    sampled,
+                    prewrite,
+                )
+                .await
+            }
+        };
     }
-    match origin.and_then(|origin| origin.relay(packet)) {
-        Some(origin) => {
-            super::relay::send_via_relay_with_origin(
+    match origin {
+        Some(owner) => {
+            let capture = owner
+                .slow_capture()
+                .and_then(|storage| storage.relay(packet));
+            super::relay::send_via_relay_with_attempt(
                 relay,
                 packet,
                 peers,
                 generation,
                 relay_send_started,
                 sampled,
-                Some(origin),
+                capture,
+                None,
+                owner,
             )
             .await
         }
