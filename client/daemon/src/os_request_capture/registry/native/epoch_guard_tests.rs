@@ -16,6 +16,7 @@ fn context() -> EpochTryContext {
         protocol: "tcp",
         kind: "response",
         first_read_ordinal: 9,
+        read_peer_input_ordinal: None,
     }
 }
 fn no_credit(value: &Value) {

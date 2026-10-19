@@ -191,6 +191,13 @@ impl EpochTraceLease {
     pub(crate) fn snapshot(&self) -> Option<EpochRefusalSnapshot> {
         self.gate.upgrade()?.trace.get()?.snapshot(self.owner)
     }
+    pub(crate) fn read_peer_snapshot(&self) -> Option<EpochRefusalSnapshot> {
+        self.gate
+            .upgrade()?
+            .trace
+            .get()?
+            .read_peer_snapshot(self.owner)
+    }
     pub(crate) fn deactivate(&self) {
         if let Some(gate) = self.gate.upgrade() {
             if let Some(trace) = gate.trace.get() {

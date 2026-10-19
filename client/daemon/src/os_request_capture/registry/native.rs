@@ -157,6 +157,7 @@ impl OriginalKernelExchange {
                 RequestKind::Response => "response",
             },
             first_read_ordinal: self.reads.first()?.read.ordinal(),
+            read_peer_input_ordinal: None,
         })
     }
 

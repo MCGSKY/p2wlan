@@ -11,6 +11,8 @@ const PEER: &str = "peer-read-boundary";
 const LOCAL: &str = "10.21.1.2";
 const TARGET: &str = "10.21.1.3";
 
+mod epoch_trace;
+
 fn info() -> PeerInfo {
     PeerInfo {
         node_id: PEER.into(),

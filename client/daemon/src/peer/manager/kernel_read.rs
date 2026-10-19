@@ -65,11 +65,45 @@ impl OriginalKernelReadPeer {
         peers: &PeerManager,
         at: Instant,
     ) -> std::result::Result<(), OverlayCreditOutcome> {
+        self.try_identity_at_inner(
+            peers,
+            at,
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            None,
+        )
+    }
+
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(crate) fn try_identity_at_observed(
+        &self,
+        peers: &PeerManager,
+        at: Instant,
+        context: Option<crate::peer::EpochTryContext>,
+    ) -> std::result::Result<(), OverlayCreditOutcome> {
+        if context.is_none() {
+            return self.try_identity_at(peers, at);
+        }
+        self.try_identity_at_inner(peers, at, context)
+    }
+
+    fn try_identity_at_inner(
+        &self,
+        peers: &PeerManager,
+        at: Instant,
+        #[cfg(any(target_os = "linux", all(unix, test)))] context: Option<
+            crate::peer::EpochTryContext,
+        >,
+    ) -> std::result::Result<(), OverlayCreditOutcome> {
         use OverlayCreditOutcome::Stale;
         if !std::ptr::eq(self.owner.as_ptr(), peers) || at < self.observed_at {
             return Err(Stale(CreditStale::Identity));
         }
-        let (generation, lifecycle) = peers.try_kernel_read_peer_values(&self.peer, self.target)?;
+        let (generation, lifecycle) = peers.try_kernel_read_peer_values(
+            &self.peer,
+            self.target,
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            context,
+        )?;
         if generation != self.generation {
             return Err(Stale(CreditStale::Generation));
         }
@@ -104,7 +138,12 @@ impl PeerManager {
         peer: &str,
         target: std::net::Ipv4Addr,
     ) -> std::result::Result<OriginalKernelReadPeer, OverlayCreditOutcome> {
-        let (generation, lifecycle) = self.try_kernel_read_peer_values(peer, target)?;
+        let (generation, lifecycle) = self.try_kernel_read_peer_values(
+            peer,
+            target,
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            None,
+        )?;
         Ok(OriginalKernelReadPeer {
             owner: Arc::downgrade(self),
             peer: peer.to_owned(),
@@ -119,8 +158,17 @@ impl PeerManager {
         &self,
         peer: &str,
         target: std::net::Ipv4Addr,
+        #[cfg(any(target_os = "linux", all(unix, test)))] context: Option<
+            crate::peer::EpochTryContext,
+        >,
     ) -> std::result::Result<(u64, PeerSessionGeneration), OverlayCreditOutcome> {
         use OverlayCreditOutcome::{Contended, Stale};
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        let _epoch = self
+            .network_epoch_gate
+            .try_lock_original(context)
+            .map_err(|_| Contended(CreditLock::Epoch))?;
+        #[cfg(not(any(target_os = "linux", all(unix, test))))]
         let _epoch = self
             .network_epoch_gate
             .try_lock()

@@ -176,6 +176,9 @@ pub(super) struct ReadSnapshot {
     #[cfg(any(target_os = "linux", all(unix, test)))]
     #[serde(skip_serializing_if = "Option::is_none")]
     original_kernel_epoch_refusal: Option<crate::peer::EpochRefusalSnapshot>,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_read_peer_epoch_refusal: Option<crate::peer::EpochRefusalSnapshot>,
 }
 #[cfg(unix)]
 #[derive(Serialize)]
@@ -748,6 +751,8 @@ impl CaptureSession {
             original_input_registry_refusal: self.state.input_refusal_snapshot(),
             #[cfg(any(target_os = "linux", all(unix, test)))]
             original_kernel_epoch_refusal: self.epoch_trace.snapshot(),
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            original_read_peer_epoch_refusal: self.epoch_trace.read_peer_snapshot(),
         })
     }
 }

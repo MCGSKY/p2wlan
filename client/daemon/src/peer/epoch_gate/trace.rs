@@ -27,6 +27,7 @@ pub(crate) struct EpochTryContext {
     pub(crate) protocol: &'static str,
     pub(crate) kind: &'static str,
     pub(crate) first_read_ordinal: u64,
+    pub(crate) read_peer_input_ordinal: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -129,6 +130,8 @@ pub(super) struct Trace {
     started: AtomicU64,
     first_claimed: AtomicBool,
     first: OnceLock<Refusal>,
+    read_peer_claimed: AtomicBool,
+    read_peer_first: OnceLock<Refusal>,
 }
 
 impl Trace {
@@ -145,6 +148,8 @@ impl Trace {
             started: AtomicU64::new(0),
             first_claimed: AtomicBool::new(false),
             first: OnceLock::new(),
+            read_peer_claimed: AtomicBool::new(false),
+            read_peer_first: OnceLock::new(),
         }
     }
     fn live(&self) -> bool {
@@ -174,9 +179,16 @@ impl Trace {
         started: Option<u64>,
         returned: Option<u64>,
     ) {
+        let (claimed, first) = if let Some(ordinal) = context.read_peer_input_ordinal {
+            if ordinal == 0 || context.first_read_ordinal != 0 {
+                return;
+            }
+            (&self.read_peer_claimed, &self.read_peer_first)
+        } else {
+            (&self.first_claimed, &self.first)
+        };
         if !self.accepts(&context)
-            || self
-                .first_claimed
+            || claimed
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
         {
@@ -194,7 +206,7 @@ impl Trace {
         let stable = token != 0 && token == self.current.load(Ordering::SeqCst);
         // Only one claimant sets the first slot. An unstable/missing holder
         // remains unknown; no initializer wait or later replacement is allowed.
-        let _ = self.first.set(Refusal {
+        let _ = first.set(Refusal {
             context,
             started: started.filter(|n| *n != 0),
             returned: returned.filter(|n| *n != 0),
@@ -208,17 +220,19 @@ impl Trace {
         let _ = self
             .current
             .compare_exchange(token, 0, Ordering::SeqCst, Ordering::SeqCst);
-        let Some(first) = self.first.get() else {
-            return;
-        };
-        if first.holder.is_some_and(|holder| holder.token == token)
-            && first
-                .completion_claimed
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+        for first in [self.first.get(), self.read_peer_first.get()]
+            .into_iter()
+            .flatten()
         {
-            first.ended.store(ended.unwrap_or(0), Ordering::Release);
-            first.completion_observed.store(true, Ordering::Release);
+            if first.holder.is_some_and(|holder| holder.token == token)
+                && first
+                    .completion_claimed
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                first.ended.store(ended.unwrap_or(0), Ordering::Release);
+                first.completion_observed.store(true, Ordering::Release);
+            }
         }
     }
     pub(super) fn deactivate(&self, owner: u64) {
@@ -231,10 +245,29 @@ impl Trace {
         self.next.store(u64::MAX, Ordering::Relaxed);
     }
     pub(super) fn snapshot(&self, owner: u64) -> Option<EpochRefusalSnapshot> {
+        self.snapshot_slot(
+            owner,
+            self.first.get(),
+            "actual_final_kernel_epoch_try_refusal_only",
+        )
+    }
+    pub(super) fn read_peer_snapshot(&self, owner: u64) -> Option<EpochRefusalSnapshot> {
+        self.snapshot_slot(
+            owner,
+            self.read_peer_first.get(),
+            "actual_original_read_peer_epoch_try_refusal_only",
+        )
+    }
+    fn snapshot_slot(
+        &self,
+        owner: u64,
+        first: Option<&Refusal>,
+        scope: &'static str,
+    ) -> Option<EpochRefusalSnapshot> {
         if owner != self.owner {
             return None;
         }
-        let first = self.first.get()?;
+        let first = first?;
         let completed = first.completion_observed.load(Ordering::Acquire);
         let ended = completed
             .then(|| first.ended.load(Ordering::Acquire))
@@ -258,7 +291,7 @@ impl Trace {
         };
         let context = first.context;
         Some(EpochRefusalSnapshot {
-            scope: "actual_final_kernel_epoch_try_refusal_only",
+            scope,
             capture_owner: self.owner,
             capture_id: hex::encode(context.capture_id),
             run_nonce: hex::encode(context.run),
@@ -267,7 +300,11 @@ impl Trace {
             sequence: context.sequence,
             protocol: context.protocol,
             kind: context.kind,
-            first_read_ordinal: context.first_read_ordinal,
+            first_read_ordinal: context
+                .read_peer_input_ordinal
+                .is_none()
+                .then_some(context.first_read_ordinal),
+            original_input_read_ordinal: context.read_peer_input_ordinal,
             failed_try_started_monotonic_ns: first.started,
             failed_try_returned_monotonic_ns: first.returned,
             holder,
@@ -302,7 +339,10 @@ pub(crate) struct EpochRefusalSnapshot {
     sequence: u32,
     protocol: &'static str,
     kind: &'static str,
-    first_read_ordinal: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_read_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_input_read_ordinal: Option<u64>,
     failed_try_started_monotonic_ns: Option<u64>,
     failed_try_returned_monotonic_ns: Option<u64>,
     holder: Option<EpochHolderSnapshot>,

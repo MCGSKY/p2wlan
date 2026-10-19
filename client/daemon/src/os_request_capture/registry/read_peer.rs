@@ -53,6 +53,7 @@ impl FirstReadPeer {
         Self { original }
     }
 
+    #[cfg(any(test, not(target_os = "linux")))]
     fn current_rejection(
         &self,
         peers: &PeerManager,
@@ -62,6 +63,21 @@ impl FirstReadPeer {
             .as_ref()
             .map_err(|reason| *reason)
             .and_then(|original| original.try_identity_at(peers, at))
+            .err()
+            .map(FullRetentionLossReason::read_peer)
+    }
+
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    fn current_rejection_observed(
+        &self,
+        peers: &PeerManager,
+        at: Instant,
+        context: Option<crate::peer::EpochTryContext>,
+    ) -> Option<FullRetentionLossReason> {
+        self.original
+            .as_ref()
+            .map_err(|reason| *reason)
+            .and_then(|original| original.try_identity_at_observed(peers, at, context))
             .err()
             .map(FullRetentionLossReason::read_peer)
     }
@@ -121,7 +137,52 @@ impl KernelReadBinding {
         }
         self.original_peers
             .iter()
-            .find_map(|original| original.current_rejection(&peers, at))
+            .enumerate()
+            .find_map(|(index, original)| {
+                #[cfg(any(target_os = "linux", all(unix, test)))]
+                {
+                    original.current_rejection_observed(
+                        &peers,
+                        at,
+                        self.peer_epoch_context(scope, index),
+                    )
+                }
+                #[cfg(not(any(target_os = "linux", all(unix, test))))]
+                {
+                    let _ = index;
+                    original.current_rejection(&peers, at)
+                }
+            })
+    }
+
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    fn peer_epoch_context(
+        &self,
+        scope: &CaptureSession,
+        index: usize,
+    ) -> Option<crate::peer::EpochTryContext> {
+        if !std::ptr::eq(self.scope.as_ptr(), scope) {
+            return None;
+        }
+        let key = self.plan.requests.get(*self.slots.get(index)?)?;
+        Some(crate::peer::EpochTryContext {
+            capture_owner: scope.owner,
+            capture_id: scope.capture_id,
+            run: key.run,
+            round: key.round,
+            request_nonce: key.request_nonce,
+            sequence: key.sequence,
+            protocol: match self.plan.protocol {
+                Protocol::Udp => "udp",
+                Protocol::Tcp => "tcp",
+            },
+            kind: match key.kind {
+                crate::business_evidence::RequestKind::Request => "request",
+                crate::business_evidence::RequestKind::Response => "response",
+            },
+            first_read_ordinal: 0,
+            read_peer_input_ordinal: Some(self.read.ordinal()),
+        })
     }
 
     pub(crate) fn original_peer_matches_encryption(
