@@ -155,6 +155,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
             if sampled_trace.is_some() {
                 epoch_profile.waited(epoch_gate_acquired.duration_since(epoch_gate_wait_started));
             }
+            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Generation);
             let current_generation = peers.current_network_generation_sync();
             if current_generation != expected_generation {
                 debug!(
@@ -173,6 +174,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 ),
             });
             }
+            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Path);
             let relay_available = relay_transport.read().await.is_some();
             let udp = udp_transport.read().await.clone();
             let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
@@ -186,6 +188,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
                     false,
                 )
                 .await;
+            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::DirectBudget);
             let mut force_relay = false;
             // A sealed Relay REQUEST echo must use its original Relay writer.
             // Direct may have won since ingress, but cannot validate a Relay
@@ -305,6 +308,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
             } else {
                 None
             };
+            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::OriginalEcho);
             if let Some(echo) = packet.original_echo() {
                 if packet.binding().is_none_or(|binding| {
                     binding.state() != crate::request_carriage::RequestBindingState::RoutedExact
@@ -342,6 +346,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
                     });
                 }
             }
+            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Encryption);
             let mut result = match transport.encrypt_request_with_emit_guard(packet).await {
                 Ok(Some(value)) => value,
                 Ok(None) => {
@@ -376,6 +381,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
                     });
                 }
             };
+            _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::PhysicalMetadata);
             // The original plaintext has been consumed by the crypto call.
             // Bind the returned wire owner before any further awaited work.
             drop(original_buffer_lease);
@@ -394,6 +400,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 && selection.direct_confirmed
                 && !force_relay
             {
+                _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::DirectFirst);
                 if let Some(endpoint) = selection.direct_endpoint {
                     peers
                         .satisfy_direct_first_in_epoch(

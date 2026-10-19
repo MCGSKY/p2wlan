@@ -21,6 +21,18 @@ pub(crate) use trace::{EpochRefusalSnapshot, EpochTryContext};
 #[derive(Clone, Copy)]
 struct Site;
 
+// Bounded observation labels only; never an epoch fence or send permit.
+#[derive(Clone, Copy)]
+pub(crate) enum OutboundEpochPhase {
+    Generation = 1,
+    Path,
+    DirectBudget,
+    OriginalEcho,
+    Encryption,
+    PhysicalMetadata,
+    DirectFirst,
+}
+
 pub(crate) struct NetworkEpochGate {
     inner: Arc<Mutex<()>>,
     #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -210,6 +222,17 @@ impl EpochTraceLease {
 impl Drop for EpochTraceLease {
     fn drop(&mut self) {
         self.deactivate();
+    }
+}
+
+impl NetworkEpochGuard<'_> {
+    pub(crate) fn note_outbound_phase(&self, phase: OutboundEpochPhase) {
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        if let (Some(token), Some(trace)) = (self.token, self.owner.trace.get()) {
+            trace.phase(token, phase);
+        }
+        #[cfg(not(any(target_os = "linux", all(unix, test))))]
+        let _ = phase;
     }
 }
 

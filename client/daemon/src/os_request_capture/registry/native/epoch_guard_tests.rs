@@ -1,6 +1,6 @@
 //! Actual epoch-mutex and negative metadata only. No KernelRead, Full,
 //! SystemTun write, native owner permit or positive credit is constructed.
-use crate::peer::{EpochTryContext, NetworkEpochGate};
+use crate::peer::{EpochTryContext, NetworkEpochGate, OutboundEpochPhase};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,6 +27,68 @@ fn no_credit(value: &Value) {
     ] {
         assert_eq!(value[key], false);
     }
+}
+
+#[tokio::test]
+async fn epoch_phase_actual_guard_first_refusal_retains_phase_after_later_transitions() {
+    let gate = Arc::new(NetworkEpochGate::new(()));
+    let lease = gate.capture_diagnostics(7, [1; 16], Instant::now() + Duration::from_secs(1));
+    let held = gate.lock().await;
+    held.note_outbound_phase(OutboundEpochPhase::Encryption);
+    let mut input = context();
+    input.first_read_ordinal = 0;
+    input.read_peer_input_ordinal = Some(4);
+    assert!(gate.try_lock_original(Some(input)).is_err());
+    let before = serde_json::to_value(lease.read_peer_snapshot().unwrap()).unwrap();
+    assert_eq!(before["holder"]["phase"]["source"], "encryption");
+    assert_eq!(before["holder"]["phase"]["version"], 1);
+    assert_eq!(
+        before["holder"]["phase"]["interval_covers_failed_try"],
+        false
+    );
+    held.note_outbound_phase(OutboundEpochPhase::PhysicalMetadata);
+    drop(held);
+    let after = serde_json::to_value(lease.read_peer_snapshot().unwrap()).unwrap();
+    assert_eq!(after["holder"]["phase"]["source"], "encryption");
+    assert_eq!(after["holder"]["phase"]["version"], 1);
+    assert_eq!(after["holder"]["release_completion_observed"], true);
+    assert_eq!(after["original_input_read_ordinal"], 4);
+    let phase_start = after["holder"]["phase"]["started_observed_monotonic_ns"].as_u64();
+    let try_start = after["failed_try_started_monotonic_ns"].as_u64();
+    let covers = after["holder_interval_covers_failed_try"] == true
+        && matches!((phase_start, try_start), (Some(a), Some(b)) if a < b);
+    assert_eq!(
+        after["holder"]["phase"]["interval_covers_failed_try"],
+        covers
+    );
+    no_credit(&after);
+    let next = gate.try_lock().unwrap();
+    next.note_outbound_phase(OutboundEpochPhase::DirectFirst);
+    assert!(gate.try_lock_original(Some(input)).is_err());
+    drop(next);
+    assert_eq!(
+        serde_json::to_value(lease.read_peer_snapshot().unwrap()).unwrap(),
+        after
+    );
+    assert!(gate.try_lock().is_ok());
+}
+
+#[tokio::test]
+async fn epoch_phase_absent_at_refusal_is_never_backfilled_or_enabled_by_a_stamp() {
+    let disabled = Arc::new(NetworkEpochGate::new(()));
+    let held = disabled.lock().await;
+    held.note_outbound_phase(OutboundEpochPhase::Path);
+    assert!(disabled.try_lock_original(Some(context())).is_err());
+    drop(held);
+    let lease = disabled.capture_diagnostics(7, [1; 16], Instant::now() + Duration::from_secs(1));
+    assert!(lease.snapshot().is_none());
+    let held = disabled.lock().await;
+    assert!(disabled.try_lock_original(Some(context())).is_err());
+    held.note_outbound_phase(OutboundEpochPhase::OriginalEcho);
+    drop(held);
+    let value = serde_json::to_value(lease.snapshot().unwrap()).unwrap();
+    assert!(value["holder"].get("phase").is_none());
+    no_credit(&value);
 }
 
 #[tokio::test]

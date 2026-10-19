@@ -53,7 +53,7 @@ struct Holder {
 }
 
 struct Refusal {
-    read_ordinal: Option<u64>,
+    original_ordinal: Option<u64>,
     started: Option<u64>,
     returned: Option<u64>,
     holder: Option<Holder>,
@@ -72,6 +72,8 @@ pub(super) struct RefusalDiagnostics {
     first: OnceLock<Refusal>,
     authenticated_claimed: AtomicBool,
     authenticated_first: OnceLock<Refusal>,
+    system_write_claimed: AtomicBool,
+    system_write_first: OnceLock<Refusal>,
 }
 
 impl RefusalDiagnostics {
@@ -87,6 +89,8 @@ impl RefusalDiagnostics {
             first: OnceLock::new(),
             authenticated_claimed: AtomicBool::new(false),
             authenticated_first: OnceLock::new(),
+            system_write_claimed: AtomicBool::new(false),
+            system_write_first: OnceLock::new(),
         }
     }
 
@@ -137,11 +141,29 @@ impl RefusalDiagnostics {
         );
     }
 
+    pub(super) fn system_write_refused(
+        &self,
+        write_ordinal: u64,
+        started: Option<u64>,
+        returned: Option<u64>,
+    ) {
+        if write_ordinal == 0 {
+            return;
+        }
+        self.record(
+            &self.system_write_claimed,
+            &self.system_write_first,
+            Some(write_ordinal),
+            started,
+            returned,
+        );
+    }
+
     fn record(
         &self,
         claimed: &AtomicBool,
         first: &OnceLock<Refusal>,
-        read_ordinal: Option<u64>,
+        original_ordinal: Option<u64>,
         started: Option<u64>,
         returned: Option<u64>,
     ) {
@@ -164,7 +186,7 @@ impl RefusalDiagnostics {
         // Exactly one claimant can call set, so no competing initializer can
         // make this packet callback wait. Missing metadata never reopens it.
         let _ = first.set(Refusal {
-            read_ordinal,
+            original_ordinal,
             started: started.filter(|value| *value != 0),
             returned: returned.filter(|value| *value != 0),
             holder: stable.then_some(holder),
@@ -180,9 +202,13 @@ impl RefusalDiagnostics {
         let _ = self
             .current
             .compare_exchange(token, 0, Ordering::SeqCst, Ordering::SeqCst);
-        for first in [self.first.get(), self.authenticated_first.get()]
-            .into_iter()
-            .flatten()
+        for first in [
+            self.first.get(),
+            self.authenticated_first.get(),
+            self.system_write_first.get(),
+        ]
+        .into_iter()
+        .flatten()
         {
             if token == 0
                 || first.holder.is_none_or(|holder| holder.token != token)
@@ -205,7 +231,7 @@ impl RefusalDiagnostics {
         let observation = observation(first);
         Some(InputRefusalSnapshot {
             scope: "actual_input_registry_try_lock_refusal_only",
-            read_ordinal: first.read_ordinal?,
+            read_ordinal: first.original_ordinal?,
             failed_try_started_monotonic_ns: first.started,
             failed_try_returned_monotonic_ns: first.returned,
             holder: observation.holder,
@@ -218,6 +244,22 @@ impl RefusalDiagnostics {
         let observation = observation(first);
         Some(AuthenticatedRefusalSnapshot {
             scope: "actual_authenticated_input_registry_try_lock_refusal_only",
+            failed_try_started_monotonic_ns: first.started,
+            failed_try_returned_monotonic_ns: first.returned,
+            holder: observation.holder,
+            holder_interval_covers_failed_try: observation.covers,
+            native_os_write_verified: false,
+            physical_send_verified: false,
+            canonical_current_owner_verified: false,
+        })
+    }
+
+    pub(super) fn system_write_snapshot(&self) -> Option<SystemWriteRefusalSnapshot> {
+        let first = self.system_write_first.get()?;
+        let observation = observation(first);
+        Some(SystemWriteRefusalSnapshot {
+            scope: "actual_system_write_registry_try_lock_refusal_only",
+            system_write_ordinal: first.original_ordinal?,
             failed_try_started_monotonic_ns: first.started,
             failed_try_returned_monotonic_ns: first.returned,
             holder: observation.holder,
@@ -280,6 +322,21 @@ pub(in crate::os_request_capture) struct InputRefusalSnapshot {
 #[derive(Serialize)]
 pub(in crate::os_request_capture) struct AuthenticatedRefusalSnapshot {
     scope: &'static str,
+    failed_try_started_monotonic_ns: Option<u64>,
+    failed_try_returned_monotonic_ns: Option<u64>,
+    holder: Option<HolderSnapshot>,
+    holder_interval_covers_failed_try: bool,
+    native_os_write_verified: bool,
+    physical_send_verified: bool,
+    canonical_current_owner_verified: bool,
+}
+
+// This later callback has an actual concrete KernelWrite ordinal, not a read
+// ordinal. Its independent first slot never supplies native/current credit.
+#[derive(Serialize)]
+pub(in crate::os_request_capture) struct SystemWriteRefusalSnapshot {
+    scope: &'static str,
+    system_write_ordinal: u64,
     failed_try_started_monotonic_ns: Option<u64>,
     failed_try_returned_monotonic_ns: Option<u64>,
     holder: Option<HolderSnapshot>,

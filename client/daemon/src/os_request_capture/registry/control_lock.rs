@@ -9,11 +9,14 @@ use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError, TryLockResult};
 use tokio::sync::Notify;
 
 mod refusal;
-pub(super) use refusal::{AuthenticatedRefusalSnapshot, InputRefusalSnapshot};
+pub(super) use refusal::{
+    AuthenticatedRefusalSnapshot, InputRefusalSnapshot, SystemWriteRefusalSnapshot,
+};
 
 enum ObservedTry {
     KernelInput(u64),
     AuthenticatedInput,
+    SystemWrite(u64),
 }
 
 pub(super) struct ControlState<T> {
@@ -82,6 +85,17 @@ impl<T> ControlState<T> {
         )
     }
 
+    #[track_caller]
+    pub(super) fn try_system_write_lock(
+        &self,
+        write_ordinal: u64,
+    ) -> TryLockResult<StateGuard<'_, T>> {
+        self.try_lock_at(
+            refusal::Site::caller(),
+            Some(ObservedTry::SystemWrite(write_ordinal)),
+        )
+    }
+
     fn try_lock_at(
         &self,
         site: refusal::Site,
@@ -104,6 +118,9 @@ impl<T> ControlState<T> {
                     Some(ObservedTry::AuthenticatedInput) => {
                         self.refusals.authenticated_refused(started, returned)
                     }
+                    Some(ObservedTry::SystemWrite(write)) => {
+                        self.refusals.system_write_refused(write, started, returned)
+                    }
                     None => {}
                 }
                 Err(TryLockError::WouldBlock)
@@ -120,6 +137,10 @@ impl<T> ControlState<T> {
 
     pub(super) fn authenticated_refusal_snapshot(&self) -> Option<AuthenticatedRefusalSnapshot> {
         self.refusals.authenticated_snapshot()
+    }
+
+    pub(super) fn system_write_refusal_snapshot(&self) -> Option<SystemWriteRefusalSnapshot> {
+        self.refusals.system_write_snapshot()
     }
 
     #[cfg(any(target_os = "linux", all(unix, test)))]

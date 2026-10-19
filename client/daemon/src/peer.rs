@@ -650,7 +650,9 @@ pub use types::{
 mod epoch_gate;
 #[cfg(any(target_os = "linux", all(unix, test)))]
 pub(crate) use epoch_gate::{EpochRefusalSnapshot, EpochTraceLease, EpochTryContext};
-pub(crate) use epoch_gate::{NetworkEpochGate, NetworkEpochGuard, OwnedNetworkEpochGuard};
+pub(crate) use epoch_gate::{
+    NetworkEpochGate, NetworkEpochGuard, OutboundEpochPhase, OwnedNetworkEpochGuard,
+};
 
 mod path_observability;
 use path_observability::PathObservabilityState;

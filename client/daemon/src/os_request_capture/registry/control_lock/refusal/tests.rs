@@ -4,6 +4,127 @@ use super::*;
 use std::sync::{Arc, TryLockError};
 
 #[test]
+fn system_write_registry_actual_mutex_keeps_three_independent_first_refusals() {
+    let state = Arc::new(ControlState::new(7usize));
+    let held = state.try_lock().unwrap();
+    let other = state.clone();
+    std::thread::spawn(move || {
+        assert!(matches!(
+            other.try_system_write_lock(0),
+            Err(TryLockError::WouldBlock)
+        ));
+        assert!(other.system_write_refusal_snapshot().is_none());
+        assert!(matches!(
+            other.try_system_write_lock(41),
+            Err(TryLockError::WouldBlock)
+        ));
+        assert!(other.input_refusal_snapshot().is_none());
+        assert!(other.authenticated_refusal_snapshot().is_none());
+        assert!(matches!(
+            other.try_input_lock(17),
+            Err(TryLockError::WouldBlock)
+        ));
+        assert!(matches!(
+            other.try_authenticated_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        assert!(matches!(
+            other.try_system_write_lock(42),
+            Err(TryLockError::WouldBlock)
+        ));
+    })
+    .join()
+    .unwrap();
+    let before = state.system_write_refusal_snapshot().unwrap();
+    assert_eq!(before.system_write_ordinal, 41);
+    assert!(!before.holder.unwrap().release_completion_observed);
+    drop(held);
+    let after = state.system_write_refusal_snapshot().unwrap();
+    assert_eq!(after.system_write_ordinal, 41);
+    assert!(after.holder.as_ref().unwrap().release_completion_observed);
+    assert!(
+        state
+            .input_refusal_snapshot()
+            .unwrap()
+            .holder
+            .unwrap()
+            .release_completion_observed
+    );
+    assert!(
+        state
+            .authenticated_refusal_snapshot()
+            .unwrap()
+            .holder
+            .unwrap()
+            .release_completion_observed
+    );
+    #[cfg(target_os = "linux")]
+    assert!(after.holder_interval_covers_failed_try);
+    #[cfg(not(target_os = "linux"))]
+    assert!(!after.holder_interval_covers_failed_try);
+    let metadata = serde_json::to_value(after).unwrap();
+    assert!(metadata.get("read_ordinal").is_none());
+    assert_eq!(metadata["system_write_ordinal"], 41);
+    for flag in [
+        "native_os_write_verified",
+        "physical_send_verified",
+        "canonical_current_owner_verified",
+    ] {
+        assert_eq!(metadata[flag], false);
+    }
+    assert_eq!(*state.try_system_write_lock(43).unwrap(), 7);
+}
+
+#[test]
+fn system_write_registry_success_and_poison_preserve_actual_results_without_would_block() {
+    let state = Arc::new(ControlState::new(9usize));
+    assert_eq!(*state.try_system_write_lock(1).unwrap(), 9);
+    assert!(state.system_write_refusal_snapshot().is_none());
+    let other = state.clone();
+    assert!(std::thread::spawn(move || {
+        let _held = other.try_lock().unwrap();
+        panic!("metadata-only original mutex poison control");
+    })
+    .join()
+    .is_err());
+    assert!(matches!(
+        state.try_system_write_lock(2),
+        Err(TryLockError::Poisoned(_))
+    ));
+    assert!(state.system_write_refusal_snapshot().is_none());
+    assert!(state.input_refusal_snapshot().is_none());
+    assert!(state.authenticated_refusal_snapshot().is_none());
+}
+
+#[test]
+fn system_write_registry_missing_clocks_holder_and_release_never_refill_first_slot() {
+    let missing = RefusalDiagnostics::new();
+    missing.system_write_refused(0, Some(1), Some(2));
+    assert!(missing.system_write_snapshot().is_none());
+    missing.system_write_refused(5, None, Some(3));
+    let token = missing.acquired_at(Site { code: 1, line: 7 }, Some(4));
+    missing.system_write_refused(6, Some(5), Some(6));
+    missing.released(token, Some(7));
+    let first = missing.system_write_snapshot().unwrap();
+    assert_eq!(first.system_write_ordinal, 5);
+    assert!(first.holder.is_none() && first.failed_try_started_monotonic_ns.is_none());
+    assert!(!first.holder_interval_covers_failed_try);
+    let unclosed = RefusalDiagnostics::new();
+    let token = unclosed.acquired_at(Site { code: 3, line: 19 }, Some(10));
+    unclosed.system_write_refused(8, Some(11), Some(12));
+    unclosed.released(token, None);
+    unclosed.released(token, Some(14));
+    let first = unclosed.system_write_snapshot().unwrap();
+    assert!(first.holder.as_ref().unwrap().release_completion_observed);
+    assert!(first
+        .holder
+        .unwrap()
+        .ended_before_unlock_monotonic_ns
+        .is_none());
+    assert!(!first.holder_interval_covers_failed_try);
+}
+
+#[test]
 fn actual_input_try_refusal_keeps_first_read_and_original_mutex_unlocks() {
     let state = Arc::new(ControlState::new(7usize));
     let held = state.try_lock().unwrap();

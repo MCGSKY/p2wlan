@@ -152,6 +152,12 @@ impl CaptureSession {
             {
                 return Err(CaptureFailure::InvalidPlan);
             }
+            #[cfg(unix)]
+            let mut state = self
+                .state
+                .try_system_write_lock(original.ordinal())
+                .map_err(|_| CaptureFailure::Contended)?;
+            #[cfg(not(unix))]
             let mut state = self
                 .state
                 .try_lock()

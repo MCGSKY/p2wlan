@@ -1,4 +1,5 @@
 //! Fixed-size observation of the actual exclusive gate; never an owner permit.
+use super::OutboundEpochPhase;
 use serde::Serialize;
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -108,6 +109,13 @@ struct Holder {
     token: u64,
     site: Site,
     started: Option<u64>,
+    phase: Option<Phase>,
+}
+#[derive(Clone, Copy)]
+struct Phase {
+    version: u64,
+    code: u8,
+    started: Option<u64>,
 }
 struct Refusal {
     context: EpochTryContext,
@@ -128,6 +136,10 @@ pub(super) struct Trace {
     site: AtomicU8,
     line: AtomicU32,
     started: AtomicU64,
+    phase_next: AtomicU64,
+    phase_current: AtomicU64,
+    phase_code: AtomicU8,
+    phase_started: AtomicU64,
     first_claimed: AtomicBool,
     first: OnceLock<Refusal>,
     read_peer_claimed: AtomicBool,
@@ -146,6 +158,10 @@ impl Trace {
             site: AtomicU8::new(0),
             line: AtomicU32::new(0),
             started: AtomicU64::new(0),
+            phase_next: AtomicU64::new(1),
+            phase_current: AtomicU64::new(0),
+            phase_code: AtomicU8::new(0),
+            phase_started: AtomicU64::new(0),
             first_claimed: AtomicBool::new(false),
             first: OnceLock::new(),
             read_peer_claimed: AtomicBool::new(false),
@@ -163,6 +179,8 @@ impl Trace {
             return None;
         }
         self.current.store(0, Ordering::SeqCst);
+        self.phase_current.store(0, Ordering::SeqCst);
+        self.phase_next.store(1, Ordering::Relaxed);
         // The actual epoch mutex serializes acquisitions; no CAS loop or retry.
         let token = self.next.load(Ordering::Relaxed);
         let next = token.checked_add(1)?;
@@ -172,6 +190,32 @@ impl Trace {
         self.started.store(now_ns().unwrap_or(0), Ordering::SeqCst);
         self.current.store(token, Ordering::SeqCst);
         Some(token)
+    }
+    pub(super) fn phase(&self, token: u64, phase: OutboundEpochPhase) {
+        if !self.live() || token == 0 || self.current.load(Ordering::SeqCst) != token {
+            return;
+        }
+        self.phase_current.store(0, Ordering::SeqCst);
+        // Only the actual borrowed holder writes phases. No wait or retry;
+        // exhaustion stays unknown until a different actual holder acquires.
+        let version = self.phase_next.load(Ordering::Relaxed);
+        let Some(next) = version.checked_add(1) else {
+            return;
+        };
+        self.phase_next.store(next, Ordering::Relaxed);
+        self.phase_code.store(phase as u8, Ordering::SeqCst);
+        self.phase_started
+            .store(now_ns().unwrap_or(0), Ordering::SeqCst);
+        self.phase_current.store(version, Ordering::SeqCst);
+    }
+    fn observed_phase(&self) -> Option<Phase> {
+        let version = self.phase_current.load(Ordering::SeqCst);
+        let phase = Phase {
+            version,
+            code: self.phase_code.load(Ordering::SeqCst),
+            started: nonzero(self.phase_started.load(Ordering::SeqCst)),
+        };
+        (version != 0 && version == self.phase_current.load(Ordering::SeqCst)).then_some(phase)
     }
     pub(super) fn refused(
         &self,
@@ -202,6 +246,7 @@ impl Trace {
                 line: self.line.load(Ordering::SeqCst),
             },
             started: nonzero(self.started.load(Ordering::SeqCst)),
+            phase: self.observed_phase(),
         };
         let stable = token != 0 && token == self.current.load(Ordering::SeqCst);
         // Only one claimant sets the first slot. An unstable/missing holder
@@ -272,14 +317,6 @@ impl Trace {
         let ended = completed
             .then(|| first.ended.load(Ordering::Acquire))
             .and_then(nonzero);
-        let holder = first.holder.map(|holder| EpochHolderSnapshot {
-            token: holder.token,
-            source: holder.site.name(),
-            source_line: holder.site.line,
-            acquired_observed_monotonic_ns: holder.started,
-            ended_before_unlock_monotonic_ns: ended,
-            release_completion_observed: completed,
-        });
         let covers = match (
             first.holder.and_then(|h| h.started),
             first.started,
@@ -289,6 +326,22 @@ impl Trace {
             (Some(a), Some(b), Some(c), Some(d)) => a < b && b <= c && c < d,
             _ => false,
         };
+        let holder = first.holder.map(|holder| EpochHolderSnapshot {
+            token: holder.token,
+            source: holder.site.name(),
+            source_line: holder.site.line,
+            acquired_observed_monotonic_ns: holder.started,
+            ended_before_unlock_monotonic_ns: ended,
+            release_completion_observed: completed,
+            phase: holder.phase.map(|phase| EpochPhaseSnapshot {
+                version: phase.version,
+                source: phase_name(phase.code),
+                started_observed_monotonic_ns: phase.started,
+                // A phase is sampled after the actual try returned. A stable
+                // version alone cannot prove its mutex was still held then.
+                interval_covers_failed_try: phase_covers(covers, phase.started, first.started),
+            }),
+        });
         let context = first.context;
         Some(EpochRefusalSnapshot {
             scope,
@@ -318,6 +371,29 @@ impl Trace {
 fn nonzero(value: u64) -> Option<u64> {
     (value != 0).then_some(value)
 }
+fn phase_covers(holder_covers: bool, phase_started: Option<u64>, try_started: Option<u64>) -> bool {
+    holder_covers && matches!((phase_started, try_started), (Some(a), Some(b)) if a != 0 && a < b)
+}
+fn phase_name(code: u8) -> &'static str {
+    match code {
+        1 => "generation",
+        2 => "path_selection",
+        3 => "direct_budget",
+        4 => "original_echo",
+        5 => "encryption",
+        6 => "physical_metadata",
+        7 => "direct_first",
+        _ => "unclassified",
+    }
+}
+
+#[derive(Serialize)]
+struct EpochPhaseSnapshot {
+    version: u64,
+    source: &'static str,
+    started_observed_monotonic_ns: Option<u64>,
+    interval_covers_failed_try: bool,
+}
 
 #[derive(Serialize)]
 struct EpochHolderSnapshot {
@@ -327,6 +403,8 @@ struct EpochHolderSnapshot {
     acquired_observed_monotonic_ns: Option<u64>,
     ended_before_unlock_monotonic_ns: Option<u64>,
     release_completion_observed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<EpochPhaseSnapshot>,
 }
 #[derive(Serialize)]
 pub(crate) struct EpochRefusalSnapshot {
@@ -350,4 +428,40 @@ pub(crate) struct EpochRefusalSnapshot {
     native_os_write_verified: bool,
     physical_send_verified: bool,
     canonical_current_owner_verified: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn epoch_phase_strict_coverage_requires_actual_completed_holder_and_original_clocks() {
+        assert!(phase_covers(true, Some(10), Some(11)));
+        for (holder, phase, started) in [
+            (false, Some(10), Some(11)),
+            (true, None, Some(11)),
+            (true, Some(10), None),
+            (true, Some(0), Some(11)),
+            (true, Some(11), Some(11)),
+            (true, Some(12), Some(11)),
+        ] {
+            assert!(!phase_covers(holder, phase, started));
+        }
+        let trace = Trace::new(
+            7,
+            [1; 16],
+            Instant::now() + std::time::Duration::from_secs(1),
+        );
+        let token = trace.acquired(Site { code: 1, line: 10 }).unwrap();
+        assert!(trace.observed_phase().is_none());
+        trace.phase(token, OutboundEpochPhase::Encryption);
+        let first = trace.observed_phase().unwrap();
+        trace.phase(token, OutboundEpochPhase::PhysicalMetadata);
+        assert!(trace.observed_phase().unwrap().version > first.version);
+        trace.phase_next.store(u64::MAX, Ordering::Relaxed);
+        trace.phase(token, OutboundEpochPhase::DirectFirst);
+        assert!(trace.observed_phase().is_none());
+        trace.phase(token, OutboundEpochPhase::Path);
+        assert!(trace.observed_phase().is_none());
+    }
 }
