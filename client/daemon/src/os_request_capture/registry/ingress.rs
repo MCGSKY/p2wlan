@@ -79,7 +79,8 @@ pub(super) struct WriteSnapshot {
     write_observed_monotonic_ns: u64,
     authenticated_observed_monotonic_ns: Option<u64>,
     packet_len: usize,
-    packet_sha256: String,
+    #[serde(serialize_with = "super::snapshot_hex::serialize")]
+    packet_sha256: [u8; 32],
     network_generation: Option<u64>,
     session_instance: u64,
     peer_lifecycle: Option<u64>,
@@ -533,7 +534,7 @@ impl InboundHistory {
                     authenticated_observed_monotonic_ns: binding
                         .authenticated_observed_monotonic_ns,
                     packet_len: binding.packet_len,
-                    packet_sha256: hex::encode(binding.packet_sha256),
+                    packet_sha256: binding.packet_sha256,
                     network_generation: binding.source.network_generation(),
                     session_instance: binding.source.session().session_instance(),
                     peer_lifecycle: binding

@@ -28,6 +28,8 @@ mod full_completion;
 mod full_loss;
 mod inbound_loss;
 #[cfg(unix)]
+mod snapshot_hex;
+#[cfg(unix)]
 use control_lock::ControlState as RegistryMutex;
 use full_loss::FullRetentionLoss;
 pub(crate) use full_loss::FullRetentionLossReason;
@@ -151,8 +153,10 @@ pub(super) struct ReadSnapshot {
     pub(super) schema_version: u8,
     scope: &'static str,
     owner: u64,
-    capture_id: String,
-    producer_scope: String,
+    #[serde(serialize_with = "snapshot_hex::serialize")]
+    capture_id: [u8; 16],
+    #[serde(serialize_with = "snapshot_hex::serialize")]
+    producer_scope: [u8; 16],
     clock_scope: Option<NativeClockScope>,
     observed_monotonic_ns: Option<u64>,
     registration_revision: u64,
@@ -196,11 +200,15 @@ struct RequestSnapshot {
     #[cfg(any(target_os = "linux", all(unix, test)))]
     native_credit: Option<native::NativeFrameSnapshot>,
     flow: usize,
-    producer_scope: String,
+    #[serde(serialize_with = "snapshot_hex::serialize")]
+    producer_scope: [u8; 16],
     sequence: u32,
-    run_nonce: String,
-    round_nonce: String,
-    request_nonce: String,
+    #[serde(serialize_with = "snapshot_hex::serialize")]
+    run_nonce: [u8; 16],
+    #[serde(serialize_with = "snapshot_hex::serialize")]
+    round_nonce: [u8; 16],
+    #[serde(serialize_with = "snapshot_hex::serialize")]
+    request_nonce: [u8; 16],
     kind: &'static str,
     protocol: &'static str,
     read_events: u64,
@@ -676,11 +684,11 @@ impl CaptureSession {
                         .as_ref()
                         .map(native::NativeFrameOutcome::snapshot),
                     flow: flow_index,
-                    producer_scope: hex::encode(flow.producer_scope),
+                    producer_scope: flow.producer_scope,
                     sequence: key.sequence,
-                    run_nonce: hex::encode(key.run),
-                    round_nonce: hex::encode(key.round),
-                    request_nonce: hex::encode(key.request_nonce),
+                    run_nonce: key.run,
+                    round_nonce: key.round,
+                    request_nonce: key.request_nonce,
                     kind: match key.kind {
                         crate::business_evidence::RequestKind::Request => "request",
                         crate::business_evidence::RequestKind::Response => "response",
@@ -755,8 +763,8 @@ impl CaptureSession {
             schema_version: 2,
             scope: "registered_native_frame_capture",
             owner: self.owner,
-            capture_id: hex::encode(self.capture_id),
-            producer_scope: hex::encode(self.producer_scope),
+            capture_id: self.capture_id,
+            producer_scope: self.producer_scope,
             clock_scope: self.clock_scope.clone(),
             observed_monotonic_ns: monotonic_ns(),
             registration_revision: state.revision,

@@ -163,7 +163,8 @@ pub(super) struct FullPacketSnapshot {
     full_observed_monotonic_ns: u64,
     publication_observed_monotonic_ns: Option<u64>,
     packet_len: usize,
-    packet_sha256: String,
+    #[serde(serialize_with = "super::snapshot_hex::serialize")]
+    packet_sha256: [u8; 32],
     spans: Vec<ReadFrameSpan>,
     attempt_id: u64,
     encryption_generation: u64,
@@ -206,7 +207,7 @@ pub(super) fn snapshot(reads: &[Arc<KernelReadBinding>]) -> Vec<FullPacketSnapsh
                 full_observed_monotonic_ns: observed_monotonic_ns,
                 publication_observed_monotonic_ns: read.original_publication_ns.get().copied(),
                 packet_len: read.packet_len,
-                packet_sha256: hex::encode(read.packet_sha256),
+                packet_sha256: read.packet_sha256,
                 spans: read.spans.clone(),
                 attempt_id: record.attempt_id(),
                 encryption_generation: record.encryption_generation(),
