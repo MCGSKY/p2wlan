@@ -93,6 +93,97 @@ async fn receive_original(
     n
 }
 
+struct OutboundCompletionProbe {
+    transport: WireGuardTransport,
+    record: Arc<crate::overlay_requests::CanonicalOverlayRequest>,
+    observed: Arc<std::sync::atomic::AtomicUsize>,
+    released: Arc<std::sync::atomic::AtomicUsize>,
+    recorded: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for OutboundCompletionProbe {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct EventName(bool);
+        impl tracing::field::Visit for EventName {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "event" && value == "outbound_overlay_transport_result" {
+                    self.0 = true;
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        let mut name = EventName(false);
+        event.record(&mut name);
+        if name.0 {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.observed.fetch_add(1, SeqCst);
+            if self
+                .transport
+                .try_acquire_outbound_emit_guard(PEER)
+                .is_some()
+            {
+                self.released.fetch_add(1, SeqCst);
+            }
+            if self.record.physical_publication.state() == PhysicalPublicationState::Recorded {
+                self.recorded.fetch_add(1, SeqCst);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn outbound_completion_logger_reenters_emit_after_actual_udp_and_original_publication() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (f, transport, udp, receiver, mut remote) = direct_fixture(false).await;
+        assert!(overlay_packet_identity(&f.delivery.packet).is_some());
+        let observed = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(OutboundCompletionProbe {
+            transport: transport.clone(),
+            record: f.record.clone(),
+            observed: observed.clone(),
+            released: released.clone(),
+            recorded: recorded.clone(),
+        });
+        let udps = RwLock::new(Some(udp));
+        let relays = RwLock::new(None);
+        assert!(matches!(
+            encrypt_then_send_with_deadline(
+                f.delivery.clone(),
+                &transport,
+                &f.peers,
+                f.record.generation,
+                true,
+                &udps,
+                &relays,
+                false,
+                Some(Instant::now() + Duration::from_secs(1)),
+                None,
+            )
+            .with_subscriber(subscriber)
+            .await,
+            EncryptSendOutcome::Sent
+        ));
+        receive_original(&receiver, &mut remote, &f).await;
+        assert_eq!(observed.load(SeqCst), 1);
+        assert_eq!(released.load(SeqCst), 1);
+        assert_eq!(recorded.load(SeqCst), 1);
+        // A real local send and logger reentry grant no current-owner credit.
+        let record = f.record.physical_publication.record().unwrap();
+        assert_eq!(
+            record.qualify(&f.record, Instant::now()),
+            PhysicalInputQualification::UnknownUdpPublication
+        );
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn b17_slow_actual_udp_success_fixed_b_g_and_legacy_unknown() {
     tokio::time::timeout(Duration::from_secs(1), async {

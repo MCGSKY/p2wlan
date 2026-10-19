@@ -538,6 +538,15 @@ pub(super) async fn encrypt_then_send_with_deadline(
     )
     .await;
     let transport_handoff_completed = Instant::now();
+    // The inner send future has ended. Seal its original result and release
+    // the counter fence before histogram locks or diagnostic subscribers run.
+    // Retain the original completion timestamp for every duration below.
+    physical_attempt.finish(matches!(
+        &outcome,
+        SendOutcome::DirectBudgetStale { .. }
+            | SendOutcome::RetryableLocalBackpressure { .. }
+            | SendOutcome::LocalMtuFailure { .. }
+    ));
     if let Some(trace) = retry_packet.trace.as_ref() {
         let total_userspace_tx =
             transport_handoff_completed.duration_since(trace.tun_read_completed);
@@ -615,15 +624,6 @@ pub(super) async fn encrypt_then_send_with_deadline(
             "encrypted overlay packet reached a classified transport outcome"
         );
     }
-    // The guard is deliberately released before any asynchronous retry is
-    // queued. A retry is always the original plaintext and receives a fresh
-    // WireGuard counter.
-    physical_attempt.finish(matches!(
-        &outcome,
-        SendOutcome::DirectBudgetStale { .. }
-            | SendOutcome::RetryableLocalBackpressure { .. }
-            | SendOutcome::LocalMtuFailure { .. }
-    ));
     match outcome {
         SendOutcome::Sent => EncryptSendOutcome::Sent,
         SendOutcome::Retryable(failure) => EncryptSendOutcome::Retryable {
