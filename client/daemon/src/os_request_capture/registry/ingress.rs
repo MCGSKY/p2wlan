@@ -505,7 +505,7 @@ impl InboundHistory {
         Self { writes: Vec::new() }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", all(unix, test)))]
     pub(super) fn frame_complete(
         &self,
         flow: usize,
@@ -519,6 +519,17 @@ impl InboundHistory {
                 .flat_map(|binding| &binding.spans),
             slot,
             plan,
+        )
+    }
+
+    #[cfg(unix)]
+    pub(super) fn snapshot_coverage(&self) -> super::snapshot::SnapshotCoverage {
+        super::snapshot::SnapshotCoverage::from_rows(
+            self.writes
+                .iter()
+                .filter(|binding| binding.write.get().is_some())
+                .map(|binding| (binding.flow, binding.spans.clone()))
+                .collect(),
         )
     }
 

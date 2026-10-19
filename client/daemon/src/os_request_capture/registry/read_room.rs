@@ -11,7 +11,8 @@ use ingress::{merge_original_permits, OriginalIncomingRoom};
 pub(super) struct ReadRoomSnapshot {
     known: bool,
     restricted: bool,
-    capture_failure: Option<String>,
+    #[serde(serialize_with = "super::snapshot_hex::serialize_optional_debug")]
+    capture_failure: Option<OriginalRoomSendFailure>,
 }
 
 impl OriginalIncomingRoom {
@@ -45,7 +46,7 @@ impl OriginalIncomingRoom {
         ReadRoomSnapshot {
             known: self.permit.is_ok(),
             restricted: self.permit.as_ref().is_ok_and(Option::is_some),
-            capture_failure: self.permit.as_ref().err().map(|e| format!("{e:?}")),
+            capture_failure: self.permit.as_ref().err().copied(),
         }
     }
 }

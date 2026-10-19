@@ -68,7 +68,8 @@ impl OriginalKernelOnce<'_> {
 #[derive(Serialize)]
 pub(super) struct NativeFrameSnapshot {
     status: &'static str,
-    outcome: String,
+    #[serde(serialize_with = "super::snapshot_hex::serialize_debug")]
+    outcome: Outcome,
     owner_check: &'static str,
     once_committed: bool,
     commit_monotonic_ns: Option<u64>,
@@ -109,7 +110,7 @@ impl NativeFrameOutcome {
                 Outcome::Stale(_) => "stale",
                 Outcome::Contended(_) => "contended",
             },
-            outcome: format!("{:?}", self.outcome),
+            outcome: self.outcome,
             once_committed: self.committed,
             commit_monotonic_ns: self.commit_ns,
             original_kernel_read_ordinals: self.read_ordinals.clone(),
@@ -501,5 +502,43 @@ impl CaptureSession {
         if completed {
             self.record_native_terminal_progress();
         }
+    }
+}
+
+#[cfg(all(unix, test))]
+mod snapshot_projection_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_snapshot_projection_debug_is_copied_before_serialization() {
+        let (setup, _parent) = super::super::full::tests::descriptor_scope().await;
+        let original = Outcome::Unknown(Unknown::OriginalPublication);
+        let mut outcome = NativeFrameOutcome::failure(original);
+        let captured = outcome.snapshot();
+        outcome.outcome = Outcome::Unknown(Unknown::OriginalSource);
+        let held = setup.session.state.try_lock().unwrap();
+        let value = serde_json::to_value(captured).unwrap();
+        assert_eq!(value["outcome"], format!("{original:?}"));
+        assert_eq!(value["status"], "unknown");
+        assert_eq!(value["once_committed"], false);
+        assert_eq!(value["physical_send_verified"], false);
+        assert_eq!(value["canonical_current_owner_verified"], false);
+        #[derive(Serialize)]
+        struct ErrorText {
+            #[serde(serialize_with = "super::super::snapshot_hex::serialize_optional_debug")]
+            error: Option<Outcome>,
+        }
+        assert_eq!(
+            serde_json::to_value(ErrorText {
+                error: Some(original)
+            })
+            .unwrap()["error"],
+            format!("{original:?}")
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorText { error: None }).unwrap()["error"],
+            serde_json::Value::Null
+        );
+        drop(held);
     }
 }

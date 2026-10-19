@@ -41,7 +41,8 @@ pub(in crate::os_request_capture::registry) struct ResponseSnapshot {
     original_room_captured: bool,
     original_system_write_contributors: usize,
     original_room_restricted: bool,
-    capture_failure: Option<String>,
+    #[serde(serialize_with = "super::super::snapshot_hex::serialize_optional_debug")]
+    capture_failure: Option<OverlayCreditOutcome>,
 }
 
 impl KernelResponseInput {
@@ -350,11 +351,7 @@ impl ResponseCapture {
                 .room
                 .as_ref()
                 .is_some_and(|room| matches!(room.permit, Ok(Some(_)))),
-            capture_failure: self
-                .original
-                .as_ref()
-                .err()
-                .map(|reason| format!("{reason:?}")),
+            capture_failure: self.original.as_ref().err().copied(),
         }
     }
 }
