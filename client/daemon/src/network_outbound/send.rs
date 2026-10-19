@@ -144,14 +144,16 @@ pub(super) async fn encrypt_then_send_with_deadline(
         ) = {
             let epoch_gate = peers.network_epoch_gate();
             let epoch_gate_wait_started = Instant::now();
+            // Declare before the real guard: success, early return and future
+            // cancellation release epoch before histogram locks/log callbacks.
+            let mut epoch_profile = crate::dataplane::DeferredEpochProfile::new(
+                profiler,
+                sampled_trace.as_ref().is_some_and(|trace| trace.sampled),
+            );
             let _epoch_guard = epoch_gate.lock().await;
             let epoch_gate_acquired = Instant::now();
-            if let Some(trace) = sampled_trace.as_ref() {
-                profiler.record(
-                    trace.sampled,
-                    "tx_epoch_gate_wait_us",
-                    epoch_gate_acquired.duration_since(epoch_gate_wait_started),
-                );
+            if sampled_trace.is_some() {
+                epoch_profile.waited(epoch_gate_acquired.duration_since(epoch_gate_wait_started));
             }
             let current_generation = peers.current_network_generation_sync();
             if current_generation != expected_generation {
@@ -385,12 +387,8 @@ pub(super) async fn encrypt_then_send_with_deadline(
             result.bind_original_echo_emit(&emit_guard);
             let physical_preparation =
                 result.prepare_physical_publication(peers, transport, current_generation);
-            if let Some(trace) = sampled_trace.as_ref() {
-                profiler.record(
-                    trace.sampled,
-                    "tx_epoch_gate_hold_us",
-                    epoch_gate_acquired.elapsed(),
-                );
+            if sampled_trace.is_some() {
+                epoch_profile.held(epoch_gate_acquired.elapsed());
             }
             if selection.path == Some(NetworkPath::Direct)
                 && selection.direct_confirmed

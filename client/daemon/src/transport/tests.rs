@@ -32,6 +32,8 @@ mod tests {
     include!("tests/overlay_ingress_source.rs");
     include!("tests/encryption_origin.rs");
 
+    include!("tests/control_log_release.rs");
+
     mod resource_residency_tests {
         use super::*;
         include!("tests/resource_residency.rs");

@@ -105,7 +105,11 @@ impl WireGuardTransport {
             wire_fp = format_args!("{wire_fp:016x}"),
             "encrypted control packet entered its caller-provided transport handoff"
         );
-        emit(encrypted).await?;
+        let emitted = emit(encrypted).await;
+        // Counter order requires the fence through the real handoff. The
+        // completed diagnostic is not part of that transaction and may block.
+        drop(_emit_guard);
+        emitted?;
         debug!(
             event = "control_transport_handoff_completed",
             peer_id = %peer_id,
