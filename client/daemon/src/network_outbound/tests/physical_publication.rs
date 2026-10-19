@@ -185,6 +185,66 @@ async fn outbound_completion_logger_reenters_emit_after_actual_udp_and_original_
 }
 
 #[tokio::test]
+async fn fast_completion_logger_reenters_emit_after_actual_udp_and_original_publication() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use tracing_subscriber::prelude::*;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (f, transport, udp, receiver, mut remote) = direct_fixture(true).await;
+        let (_, socket) = udp
+            .socket_for_peer_endpoint(Some(PEER), Some(receiver.local_addr().unwrap()))
+            .await
+            .unwrap();
+        socket.writable().await.unwrap();
+        let observed = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(OutboundCompletionProbe {
+            transport: transport.clone(),
+            record: f.record.clone(),
+            observed: observed.clone(),
+            released: released.clone(),
+            recorded: recorded.clone(),
+        });
+        let udps = RwLock::new(Some(udp));
+        let mut paths = HashMap::new();
+        let mut ineligible = HashMap::new();
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            super::super::fast_path::try_lan_direct_fast_path(
+                f.delivery.clone(),
+                &transport,
+                &f.peers,
+                true,
+                &udps,
+                &mut paths,
+                &mut ineligible,
+            )
+        });
+        assert!(matches!(
+            outcome,
+            super::super::fast_path::FastPathAttempt::Sent
+        ));
+        receive_original(&receiver, &mut remote, &f).await;
+        assert_eq!(observed.load(SeqCst), 1);
+        assert_eq!(released.load(SeqCst), 1);
+        assert_eq!(recorded.load(SeqCst), 1);
+        assert!(f.peers.network_epoch_gate().try_lock_owned().is_ok());
+        assert!(udps.try_write().is_ok());
+        // Local UDP completion and callback reentry grant no final owner credit.
+        assert_eq!(
+            f.record
+                .physical_publication
+                .record()
+                .unwrap()
+                .qualify(&f.record, Instant::now()),
+            PhysicalInputQualification::UnknownUdpPublication
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn b17_slow_actual_udp_success_fixed_b_g_and_legacy_unknown() {
     tokio::time::timeout(Duration::from_secs(1), async {
         let (f, transport, udp, receiver, mut remote) = direct_fixture(false).await;
