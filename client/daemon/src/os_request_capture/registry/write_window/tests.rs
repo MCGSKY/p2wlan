@@ -168,3 +168,130 @@ fn original_write_window_matches_all_128_nonce_bits() {
         assert!(wire.validate(1_000_000_002, 191, &[0xab; 16]).is_err());
     }
 }
+
+// Real descriptor/metadata lock controls only. These expected input plans never
+// construct a KernelRead, Full, SystemTun write or current-owner permit.
+#[cfg(unix)]
+async fn digest_scope() -> (
+    crate::os_request_capture::control::CaptureSetup,
+    std::os::unix::net::UnixStream,
+) {
+    let (setup, parent) = super::super::full::tests::descriptor_scope().await;
+    setup
+        .session
+        .register(super::super::super::plan::RegistrationPlan {
+            capture_id: setup.session.capture_id,
+            producer_scope: [0x22; 16],
+            flows: vec![registered("udp", "response")],
+        })
+        .unwrap();
+    (setup, parent)
+}
+
+#[cfg(unix)]
+fn digest_no_credit(scope: &CaptureSession) {
+    let value = serde_json::to_value(scope.snapshot().unwrap()).unwrap();
+    assert_eq!(value["historical_full_packets"], serde_json::json!([]));
+    assert_eq!(value["system_tun_full_writes"], serde_json::json!([]));
+    assert_eq!(value["physical_send_verified"], false);
+    assert_eq!(value["canonical_current_owner_verified"], false);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn window_digest_unlocked_hash_uses_original_plan_while_real_metadata_mutex_is_held() {
+    let (setup, _parent) = digest_scope().await;
+    let end = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    let prepared = setup
+        .session
+        .original_window_plan([0x22; 16], end)
+        .await
+        .unwrap();
+    let mut wire = labels();
+    wire.frame_sha256 = UDP_REQUESTS[0].into();
+    {
+        let held = setup.session.state.try_lock().unwrap();
+        assert!(wire.matches_registered_request_frame(&prepared.plan));
+        assert!(prepared.is_current(0, &held.flows[0]));
+        wire.frame_sha256 = TCP_REQUESTS[0].into();
+        assert!(!wire.matches_registered_request_frame(&prepared.plan));
+    }
+    digest_no_credit(&setup.session);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn window_digest_unlocked_hash_rejects_equal_bytes_replacement_wrong_flow_and_producer() {
+    let (setup, _parent) = digest_scope().await;
+    let end = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    let prepared = setup
+        .session
+        .original_window_plan([0x22; 16], end)
+        .await
+        .unwrap();
+    {
+        let mut state = setup.session.state.try_lock().unwrap();
+        assert!(prepared.is_current(0, &state.flows[0]));
+        assert!(!prepared.is_current(1, &state.flows[0]));
+        state.flows[0].producer_scope = [0x23; 16];
+        assert!(!prepared.is_current(0, &state.flows[0]));
+        state.flows[0].producer_scope = [0x22; 16];
+        state.flows[0].plan = Arc::new(registered("udp", "response"));
+        assert!(!prepared.is_current(0, &state.flows[0]));
+        let mut wire = labels();
+        wire.frame_sha256 = UDP_REQUESTS[0].into();
+        assert!(wire.matches_registered_request_frame(&state.flows[0].plan));
+    }
+    digest_no_credit(&setup.session);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn window_digest_unlocked_hash_keeps_scope_fixed_eight_and_retirement_guards() {
+    let (setup, _parent) = digest_scope().await;
+    let end = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    assert!(matches!(
+        setup.session.original_window_plan([0x23; 16], end).await,
+        Err(CaptureFailure::InvalidPlan)
+    ));
+    setup.session.state.lock().unwrap().flows[0].requests.pop();
+    assert!(matches!(
+        setup.session.original_window_plan([0x22; 16], end).await,
+        Err(CaptureFailure::InvalidPlan)
+    ));
+    setup.session.retire();
+    assert!(matches!(
+        setup.session.original_window_plan([0x22; 16], end).await,
+        Err(CaptureFailure::Expired)
+    ));
+    digest_no_credit(&setup.session);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn window_digest_unlocked_hash_never_refills_end_while_actual_registry_is_contended() {
+    let (setup, _parent) = digest_scope().await;
+    let session = setup.session.clone();
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let owner = std::thread::spawn(move || {
+        let _guard = session.state.lock().unwrap();
+        acquired_tx.send(()).unwrap();
+        release_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+    });
+    acquired_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    let end = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+    let refused = setup.session.original_window_plan([0x22; 16], end).await;
+    release_tx.send(()).unwrap();
+    owner.join().unwrap();
+    assert!(matches!(refused, Err(CaptureFailure::ControlNotReady)));
+    assert!(matches!(
+        setup.session.original_window_plan([0x22; 16], end).await,
+        Err(CaptureFailure::ControlNotReady)
+    ));
+    digest_no_credit(&setup.session);
+}
