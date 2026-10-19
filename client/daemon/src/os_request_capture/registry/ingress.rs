@@ -1,6 +1,7 @@
 //! Original authenticated input and concrete system Full-write history.
 //! No current connection state or final once permission is maintained here.
 use super::full::ReadFrameSpan;
+use super::inbound_loss::InboundLossSite;
 use super::*;
 use crate::business_evidence::{OsUdpReqKey, RegisteredFlow, RequestKind};
 use crate::dataplane::InboundPacket;
@@ -123,6 +124,7 @@ impl CaptureSession {
             }
         });
         if !bound {
+            self.inbound_loss.record(InboundLossSite::RoomBinding, None);
             self.read_complete.store(false, Ordering::Release);
             self.inbound_complete.store(false, Ordering::Release);
             self.gap();
@@ -191,7 +193,9 @@ impl CaptureSession {
             self.try_complete_original_frames(&mut state, flow, &slots[..count]);
             Ok(())
         };
-        if retain().is_err() {
+        if let Err(error) = retain() {
+            self.inbound_loss
+                .record(InboundLossSite::SystemWriteRetention, Some(error));
             // A lost Full-write observation cannot be repaired by a later
             // duplicate sampled after a lifecycle change or room renewal.
             self.inbound_complete.store(false, Ordering::Release);
@@ -211,7 +215,10 @@ impl KernelCaptureRuntime {
         let captured = self.capture_inner(&scope, transport, source, packet);
         match captured {
             Ok(binding) => binding,
-            Err(_) => {
+            Err(error) => {
+                scope
+                    .inbound_loss
+                    .record(InboundLossSite::AuthenticatedInput, Some(error));
                 // A missing first input cannot be repaired by a later copy
                 // borrowing a renewed room permit. This scope never rearms.
                 scope.inbound_complete.store(false, Ordering::Release);

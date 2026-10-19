@@ -300,6 +300,12 @@ async fn contended_original_ingress_cannot_rearm_on_duplicate_after_room_renewal
     let snapshot = serde_json::to_value(scope.snapshot().unwrap()).unwrap();
     assert_eq!(snapshot["incoming_provenance_complete"], false);
     assert_eq!(snapshot["system_tun_full_writes"], json!([]));
+    let loss = &snapshot["first_original_inbound_loss"];
+    assert_eq!(loss["site"], "authenticated_input");
+    assert_eq!(loss["original_failure"], "contended");
+    assert_eq!(loss["native_os_write_verified"], false);
+    assert_eq!(loss["physical_send_verified"], false);
+    assert_eq!(loss["canonical_current_owner_verified"], false);
 }
 
 impl Drop for Harness {

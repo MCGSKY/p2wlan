@@ -26,6 +26,7 @@ mod full;
 #[cfg(any(target_os = "linux", all(unix, test)))]
 mod full_completion;
 mod full_loss;
+mod inbound_loss;
 #[cfg(unix)]
 use control_lock::ControlState as RegistryMutex;
 use full_loss::FullRetentionLoss;
@@ -60,6 +61,7 @@ pub(crate) struct CaptureSession {
     read_complete: AtomicBool,
     full_complete: AtomicBool,
     full_loss: FullRetentionLoss,
+    inbound_loss: inbound_loss::InboundLoss,
     #[cfg(any(target_os = "linux", all(unix, test)))]
     pending_full: full_completion::CompletionSignal,
     #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -166,6 +168,8 @@ pub(super) struct ReadSnapshot {
     original_read_observation_complete: bool,
     original_full_retention_complete: bool,
     first_original_full_retention_loss: Option<FullRetentionLossReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_original_inbound_loss: Option<inbound_loss::InboundLossSnapshot>,
     retained_original_reads: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     original_input_registry_refusal: Option<control_lock::InputRefusalSnapshot>,
@@ -238,6 +242,7 @@ impl CaptureSession {
             read_complete: AtomicBool::new(true),
             full_complete: AtomicBool::new(true),
             full_loss: FullRetentionLoss::new(),
+            inbound_loss: inbound_loss::InboundLoss::new(),
             pending_full: full_completion::CompletionSignal::new(),
             native_terminal_revision: AtomicU64::new(0),
             epoch_trace: peers.network_epoch_gate().capture_diagnostics(
@@ -738,6 +743,7 @@ impl CaptureSession {
             original_read_observation_complete: self.read_complete.load(Ordering::Acquire),
             original_full_retention_complete: self.full_complete.load(Ordering::Acquire),
             first_original_full_retention_loss: self.full_loss.snapshot(),
+            first_original_inbound_loss: self.inbound_loss.snapshot(),
             retained_original_reads: state.read_history.len(),
             original_input_registry_refusal: self.state.input_refusal_snapshot(),
             #[cfg(any(target_os = "linux", all(unix, test)))]
