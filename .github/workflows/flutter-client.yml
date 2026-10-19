@@ -147,11 +147,24 @@ jobs:
 
       - name: Configure Android NDK for Rust bridge
         shell: bash
+        working-directory: .
         run: |
           set -euo pipefail
-          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/.android/sdk}}"
-          ndk_root="$(find "$sdk_root/ndk" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
-          echo "ANDROID_NDK_HOME=$ndk_root" >> "$GITHUB_ENV"
+          python3 -B scripts/release/test_android_ndk.py -v
+          python3 -B scripts/release/prepare_android_ndk.py \
+            --flutter-sdk "$FLUTTER_ROOT" \
+            --work-dir "$RUNNER_TEMP/p2wlan-android-ndk" \
+            --github-env "$GITHUB_ENV" \
+            --source-commit "$(git rev-parse HEAD)"
+
+      - name: Upload Android NDK input evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: p2wlan-android-ndk-input-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/p2wlan-android-ndk/evidence/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Flutter pub get
         run: flutter pub get

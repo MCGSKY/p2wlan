@@ -15,6 +15,11 @@ android {
     namespace = "com.p2wlan.client"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
+    // CI supplies the same checked NDK to Gradle and the Rust bridge.
+    val ndkOverride = providers.environmentVariable("P2WLAN_ANDROID_NDK_PATH").orNull
+    if (ndkOverride != null) {
+        ndkPath = ndkOverride
+    }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
