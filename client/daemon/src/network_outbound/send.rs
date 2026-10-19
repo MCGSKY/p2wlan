@@ -135,6 +135,9 @@ pub(super) async fn encrypt_then_send_with_deadline(
             lock_wait_ms = emit_lock_wait_ms,
             "business packet acquired its per-peer WireGuard counter-ordering lock"
         );
+        // Histogram publication belongs to this future, outside the real
+        // epoch/session guards on success, early return and cancellation.
+        let mut crypto_profile = crate::dataplane::DeferredCryptoProfile::new(profiler);
         let (
             encrypted,
             direct_business_plan,
@@ -347,7 +350,10 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 }
             }
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Encryption);
-            let mut result = match transport.encrypt_request_with_emit_guard(packet).await {
+            let mut result = match transport
+                .encrypt_request_with_emit_guard_profiled(packet, Some(&mut crypto_profile))
+                .await
+            {
                 Ok(Some(value)) => value,
                 Ok(None) => {
                     debug!(
@@ -420,6 +426,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 serialized_buffer_lease,
             )
         };
+        drop(crypto_profile);
         Ok((
             emit_guard,
             encrypted,

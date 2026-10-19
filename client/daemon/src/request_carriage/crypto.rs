@@ -30,18 +30,29 @@ pub(crate) enum RequestEncryptionAttempt {
 }
 
 impl WireGuardTransport {
+    #[cfg(test)]
     pub(crate) async fn encrypt_request_with_emit_guard(
         &self,
+        packet: RawRequestDelivery,
+    ) -> Result<Option<EncryptedRequestDelivery>> {
+        self.encrypt_request_with_emit_guard_profiled(packet, None)
+            .await
+    }
+
+    pub(crate) async fn encrypt_request_with_emit_guard_profiled(
+        &self,
         mut packet: RawRequestDelivery,
+        profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
     ) -> Result<Option<EncryptedRequestDelivery>> {
         observe_crypto_input(self, &mut packet);
         let RawRequestDelivery { raw, metadata } = packet;
         let (binding, original_residency) = metadata.into_parts();
         let encrypted = if binding.is_some() {
-            self.encrypt_outbound_with_emit_guard_and_source(raw)
+            self.encrypt_outbound_with_emit_guard_and_source(raw, profile)
                 .await?
         } else {
-            self.encrypt_outbound_with_emit_guard_observed(raw).await?
+            self.encrypt_outbound_with_emit_guard_observed(raw, profile)
+                .await?
         };
         // The original input observation survives the original crypto future,
         // including cancellation, but does not retain or clone its Vec.

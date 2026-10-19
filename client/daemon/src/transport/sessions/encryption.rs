@@ -140,7 +140,7 @@ impl WireGuardTransport {
     ) -> Result<Option<EncryptedOutboundWithSource>> {
         let emit_lock = self.outbound_emit_lock(&packet.peer_id).await;
         let _emit_guard = emit_lock.lock().await;
-        self.encrypt_outbound_inner_with_capture(packet, false, false, true)
+        self.encrypt_outbound_inner_with_capture(packet, false, false, true, None)
             .await
     }
 
@@ -242,8 +242,9 @@ impl WireGuardTransport {
     pub(crate) async fn encrypt_outbound_with_emit_guard_and_source(
         &self,
         packet: OutboundPacket,
+        profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
     ) -> Result<Option<EncryptedOutboundWithSource>> {
-        self.encrypt_outbound_inner_with_capture(packet, false, true, true)
+        self.encrypt_outbound_inner_with_capture(packet, false, true, true, profile)
             .await
     }
 
@@ -252,8 +253,9 @@ impl WireGuardTransport {
     pub(crate) async fn encrypt_outbound_with_emit_guard_observed(
         &self,
         packet: OutboundPacket,
+        profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
     ) -> Result<Option<EncryptedOutboundWithSource>> {
-        self.encrypt_outbound_inner_with_capture(packet, false, true, false)
+        self.encrypt_outbound_inner_with_capture(packet, false, true, false, profile)
             .await
     }
 
@@ -477,9 +479,15 @@ impl WireGuardTransport {
         queue_if_unavailable: bool,
         is_business: bool,
     ) -> Result<Option<EncryptedPeerPacket>> {
-        self.encrypt_outbound_inner_with_capture(packet, queue_if_unavailable, is_business, false)
-            .await
-            .map(|encrypted| encrypted.map(EncryptedOutboundWithSource::into_packet))
+        self.encrypt_outbound_inner_with_capture(
+            packet,
+            queue_if_unavailable,
+            is_business,
+            false,
+            None,
+        )
+        .await
+        .map(|encrypted| encrypted.map(EncryptedOutboundWithSource::into_packet))
     }
 
     // One actual slow crypto path, shared by compatibility and sourced entries.
@@ -489,6 +497,7 @@ impl WireGuardTransport {
         queue_if_unavailable: bool,
         is_business: bool,
         capture_source: bool,
+        mut profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
     ) -> Result<Option<EncryptedOutboundWithSource>> {
         let profiler = global_dataplane_profiler();
         let sampled = packet.trace.as_ref().map(|trace| trace.sampled);
@@ -496,9 +505,11 @@ impl WireGuardTransport {
         let mut sessions = self.sessions.lock().await;
         let session_lock_acquired = Instant::now();
         if let Some(sampled) = sampled {
-            profiler.record(
+            crate::dataplane::record_crypto_profile(
+                profiler,
+                profile.as_deref_mut(),
                 sampled,
-                "tx_session_lock_wait_us",
+                crate::dataplane::CryptoProfileStage::SessionWait,
                 session_lock_acquired.duration_since(session_lock_started),
             );
         }
@@ -557,9 +568,11 @@ impl WireGuardTransport {
         };
         let crypto_us = crypto_started.elapsed().as_micros() as u64;
         if let Some(sampled) = sampled {
-            profiler.record(
+            crate::dataplane::record_crypto_profile(
+                profiler,
+                profile.as_deref_mut(),
                 sampled,
-                "tx_crypto_exec_us",
+                crate::dataplane::CryptoProfileStage::Crypto,
                 Duration::from_micros(crypto_us),
             );
         }
@@ -592,9 +605,11 @@ impl WireGuardTransport {
             "WireGuard counter allocated under the per-peer emit ordering lock"
         );
         if let Some(sampled) = sampled {
-            profiler.record(
+            crate::dataplane::record_crypto_profile(
+                profiler,
+                profile,
                 sampled,
-                "tx_session_lock_hold_us",
+                crate::dataplane::CryptoProfileStage::SessionHold,
                 session_lock_acquired.elapsed(),
             );
         }
