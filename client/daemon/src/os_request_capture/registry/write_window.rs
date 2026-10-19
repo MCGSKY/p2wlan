@@ -251,8 +251,11 @@ impl CaptureSession {
             native_os_write_verified: false,
             canonical_current_owner_verified: false,
         });
-        let slot = wire.sequence as usize;
-        self.try_complete_original_frames(&mut state, flow_index, &[slot]);
+        // The descriptor actor owns completion work. Release this registration
+        // guard before waking it so real input/SystemTun retention keeps its
+        // original single try while this command only installs its metadata.
+        drop(state);
+        self.pending_full.request_window();
         Ok(())
     }
 }
