@@ -10,10 +10,12 @@ use tokio::sync::Notify;
 
 mod refusal;
 pub(super) use refusal::{
-    AuthenticatedRefusalSnapshot, InputRefusalSnapshot, SystemWriteRefusalSnapshot,
+    AuthenticatedRefusalSnapshot, InputRefusalSnapshot, OriginalReadRefusalSnapshot,
+    SystemWriteRefusalSnapshot,
 };
 
 enum ObservedTry {
+    OriginalRead(u64),
     KernelInput(u64),
     AuthenticatedInput,
     SystemWrite(u64),
@@ -78,6 +80,17 @@ impl<T> ControlState<T> {
     }
 
     #[track_caller]
+    pub(super) fn try_original_read_lock(
+        &self,
+        read_ordinal: u64,
+    ) -> TryLockResult<StateGuard<'_, T>> {
+        self.try_lock_at(
+            refusal::Site::caller(),
+            Some(ObservedTry::OriginalRead(read_ordinal)),
+        )
+    }
+
+    #[track_caller]
     pub(super) fn try_authenticated_lock(&self) -> TryLockResult<StateGuard<'_, T>> {
         self.try_lock_at(
             refusal::Site::caller(),
@@ -112,6 +125,12 @@ impl<T> ControlState<T> {
             Ok(guard) => Ok(self.wrap(guard, site)),
             Err(TryLockError::WouldBlock) => {
                 match input {
+                    Some(ObservedTry::OriginalRead(read)) => self.refusals.original_read_refused(
+                        read,
+                        started,
+                        returned,
+                        refusal::OriginalReadMutexFailure::WouldBlock,
+                    ),
                     Some(ObservedTry::KernelInput(read)) => {
                         self.refusals.refused(read, started, returned)
                     }
@@ -125,14 +144,28 @@ impl<T> ControlState<T> {
                 }
                 Err(TryLockError::WouldBlock)
             }
-            Err(TryLockError::Poisoned(error)) => Err(TryLockError::Poisoned(PoisonError::new(
-                self.wrap(error.into_inner(), site),
-            ))),
+            Err(TryLockError::Poisoned(error)) => {
+                if let Some(ObservedTry::OriginalRead(read)) = input {
+                    self.refusals.original_read_refused(
+                        read,
+                        started,
+                        returned,
+                        refusal::OriginalReadMutexFailure::Poisoned,
+                    );
+                }
+                Err(TryLockError::Poisoned(PoisonError::new(
+                    self.wrap(error.into_inner(), site),
+                )))
+            }
         }
     }
 
     pub(super) fn input_refusal_snapshot(&self) -> Option<InputRefusalSnapshot> {
         self.refusals.snapshot()
+    }
+
+    pub(super) fn original_read_refusal_snapshot(&self) -> Option<OriginalReadRefusalSnapshot> {
+        self.refusals.original_read_snapshot()
     }
 
     pub(super) fn authenticated_refusal_snapshot(&self) -> Option<AuthenticatedRefusalSnapshot> {

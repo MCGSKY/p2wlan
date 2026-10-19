@@ -5,6 +5,10 @@ use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
 
+mod original_read;
+pub(super) use original_read::OriginalReadMutexFailure;
+pub(in crate::os_request_capture) use original_read::OriginalReadRefusalSnapshot;
+
 #[derive(Clone, Copy)]
 pub(super) struct Site {
     code: u8,
@@ -74,6 +78,7 @@ pub(super) struct RefusalDiagnostics {
     authenticated_first: OnceLock<Refusal>,
     system_write_claimed: AtomicBool,
     system_write_first: OnceLock<Refusal>,
+    original_read: original_read::FirstReadRefusal,
 }
 
 impl RefusalDiagnostics {
@@ -91,6 +96,7 @@ impl RefusalDiagnostics {
             authenticated_first: OnceLock::new(),
             system_write_claimed: AtomicBool::new(false),
             system_write_first: OnceLock::new(),
+            original_read: original_read::FirstReadRefusal::new(),
         }
     }
 
@@ -173,6 +179,15 @@ impl RefusalDiagnostics {
         {
             return;
         }
+        let _ = first.set(self.observed_refusal(original_ordinal, started, returned));
+    }
+
+    fn observed_refusal(
+        &self,
+        original_ordinal: Option<u64>,
+        started: Option<u64>,
+        returned: Option<u64>,
+    ) -> Refusal {
         let token = self.current.load(Ordering::SeqCst);
         let holder = Holder {
             token,
@@ -185,7 +200,7 @@ impl RefusalDiagnostics {
         let stable = token != 0 && self.current.load(Ordering::SeqCst) == token;
         // Exactly one claimant can call set, so no competing initializer can
         // make this packet callback wait. Missing metadata never reopens it.
-        let _ = first.set(Refusal {
+        Refusal {
             original_ordinal,
             started: started.filter(|value| *value != 0),
             returned: returned.filter(|value| *value != 0),
@@ -193,7 +208,7 @@ impl RefusalDiagnostics {
             completion_claimed: AtomicBool::new(false),
             completion_observed: AtomicBool::new(false),
             holder_ended: AtomicU64::new(0),
-        });
+        }
     }
 
     // The caller captures this upper endpoint while still holding the mutex,
@@ -206,6 +221,7 @@ impl RefusalDiagnostics {
             self.first.get(),
             self.authenticated_first.get(),
             self.system_write_first.get(),
+            self.original_read.observation(),
         ]
         .into_iter()
         .flatten()
@@ -237,6 +253,21 @@ impl RefusalDiagnostics {
             holder: observation.holder,
             holder_interval_covers_failed_try: observation.covers,
         })
+    }
+
+    pub(super) fn original_read_refused(
+        &self,
+        read: u64,
+        started: Option<u64>,
+        returned: Option<u64>,
+        failure: OriginalReadMutexFailure,
+    ) {
+        self.original_read
+            .record(self, read, started, returned, failure);
+    }
+
+    pub(super) fn original_read_snapshot(&self) -> Option<OriginalReadRefusalSnapshot> {
+        self.original_read.snapshot()
     }
 
     pub(super) fn authenticated_snapshot(&self) -> Option<AuthenticatedRefusalSnapshot> {

@@ -46,6 +46,8 @@ pub(crate) use native::{OriginalKernelExchange, OriginalKernelOnce};
 #[cfg(any(target_os = "linux", all(unix, test)))]
 pub(crate) use owners::OriginalKernelCurrentOwners;
 mod ingress;
+#[cfg(unix)]
+mod read_loss;
 mod read_peer;
 mod read_room;
 #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -61,6 +63,8 @@ pub(crate) struct CaptureSession {
     active: AtomicBool,
     inbound_complete: AtomicBool,
     read_complete: AtomicBool,
+    #[cfg(unix)]
+    read_loss: read_loss::ReadLoss,
     full_complete: AtomicBool,
     full_loss: FullRetentionLoss,
     inbound_loss: inbound_loss::InboundLoss,
@@ -172,6 +176,10 @@ pub(super) struct ReadSnapshot {
     canonical_current_owner_verified: bool,
     incoming_provenance_complete: bool,
     original_read_observation_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_original_read_loss: Option<read_loss::ReadLossSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_read_registry_refusal: Option<control_lock::OriginalReadRefusalSnapshot>,
     original_full_retention_complete: bool,
     first_original_full_retention_loss: Option<FullRetentionLossReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -261,6 +269,8 @@ impl CaptureSession {
             active: AtomicBool::new(true),
             inbound_complete: AtomicBool::new(true),
             read_complete: AtomicBool::new(true),
+            #[cfg(unix)]
+            read_loss: read_loss::ReadLoss::new(),
             full_complete: AtomicBool::new(true),
             full_loss: FullRetentionLoss::new(),
             inbound_loss: inbound_loss::InboundLoss::new(),
@@ -449,9 +459,13 @@ impl CaptureSession {
         {
             return None;
         }
+        #[cfg(unix)]
+        let ordinal = original.ordinal();
         match self.capture_read(original, packet) {
             Ok(binding) => binding,
-            Err(_) => {
+            Err(_error) => {
+                #[cfg(unix)]
+                self.read_loss.record(ordinal, _error);
                 // A lost original read cannot be replaced by a later copy
                 // sampled under a newer peer lifecycle or network generation.
                 self.original_observation_lost(&self.read_complete);
@@ -481,10 +495,11 @@ impl CaptureSession {
     ) -> Result<Option<Arc<KernelReadBinding>>, CaptureFailure> {
         let udp = parse_os_udp(packet).ok();
         let tcp = parse_tcp_segment(packet).ok();
-        let mut state = self
-            .state
-            .try_lock()
-            .map_err(|_| CaptureFailure::Contended)?;
+        #[cfg(unix)]
+        let state = self.state.try_original_read_lock(original.ordinal());
+        #[cfg(not(unix))]
+        let state = self.state.try_lock();
+        let mut state = state.map_err(|_| CaptureFailure::Contended)?;
         if state
             .system_device
             .as_ref()
@@ -783,6 +798,8 @@ impl CaptureSession {
             canonical_current_owner_verified: native_verified,
             incoming_provenance_complete: self.inbound_complete.load(Ordering::Acquire),
             original_read_observation_complete: self.read_complete.load(Ordering::Acquire),
+            first_original_read_loss: self.read_loss.snapshot(),
+            original_read_registry_refusal: self.state.original_read_refusal_snapshot(),
             original_full_retention_complete: self.full_complete.load(Ordering::Acquire),
             first_original_full_retention_loss: self.full_loss.snapshot(),
             first_original_inbound_loss: self.inbound_loss.snapshot(),
