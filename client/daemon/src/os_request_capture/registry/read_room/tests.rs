@@ -55,7 +55,7 @@ fn collect(scope: &CaptureSession) -> Arc<OriginalIncomingRoom> {
     let mut state = scope.state.lock().unwrap();
     let room = state.original_room_owner.clone();
     let flow = &mut state.flows[0];
-    scope.first_read_peers(flow, &[0]);
+    scope.first_read_peers(flow, &[0], None);
     scope
         .first_read_request_rooms(flow, &[0], room.as_ref())
         .remove(0)

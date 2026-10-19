@@ -345,7 +345,7 @@ impl WireGuardTransport {
             next_session_instance: Arc::new(AtomicU64::new(1)),
             pending_outbound: Arc::new(Mutex::new(HashMap::new())),
             outbound_ingress_locks: Arc::new(Mutex::new(HashMap::new())),
-            outbound_emit_locks: Arc::new(Mutex::new(HashMap::new())),
+            outbound_emit_locks: Arc::new(emit_gate::EmitRegistry::new()),
             promoted_responder_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hedge_replay_counters: Arc::new(std::sync::Mutex::new(HashMap::new())),
             outbound_tx,
@@ -499,7 +499,7 @@ impl WireGuardTransport {
         &self,
         peer_id: &str,
         session_instance: Option<u64>,
-    ) -> Option<OwnedMutexGuard<()>> {
+    ) -> Option<OwnedEmitGuard> {
         match self
             .acquire_current_session_evidence_guard_outcome(peer_id, session_instance)
             .await
@@ -1055,7 +1055,7 @@ impl WireGuardTransport {
         &self,
         peer_id: &str,
         token: &str,
-        _emit_guard: &OwnedMutexGuard<()>,
+        _emit_guard: &tokio::sync::OwnedMutexGuard<()>,
     ) -> ResponderSessionConfirmation {
         let now = Instant::now();
         let (result, flush_pending) = {

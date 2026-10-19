@@ -46,9 +46,36 @@ pub(crate) enum FullRetentionLossReason {
     RoutedPeerMismatch,
     RoutedDestinationMismatch,
     RoutedRoomPermitRejected,
+    ReadPeerOwnerUnavailable,
+    ReadPeerBindingsInvalid,
+    ReadPeerIdentityRejected,
+    ReadPeerEpochContended,
+    ReadPeerConnectionsContended,
+    ReadPeerMembershipContended,
+    ReadPeerGenerationChanged,
+    ReadPeerLifecycleChanged,
+    ReadPeerStateRejected,
 }
 
 impl FullRetentionLossReason {
+    // Carry the result of the original try-only observation, never retry it.
+    pub(super) fn read_peer(failure: crate::overlay_requests::OverlayCreditOutcome) -> Self {
+        use crate::overlay_requests::{
+            OverlayCreditLockSite as Lock, OverlayCreditOutcome as Outcome,
+            OverlayCreditStale as Stale,
+        };
+        match failure {
+            Outcome::Contended(Lock::Epoch) => Self::ReadPeerEpochContended,
+            Outcome::Contended(Lock::Connections) => Self::ReadPeerConnectionsContended,
+            Outcome::Contended(Lock::Membership) => Self::ReadPeerMembershipContended,
+            Outcome::Stale(Stale::Identity) => Self::ReadPeerIdentityRejected,
+            Outcome::Stale(Stale::Generation) => Self::ReadPeerGenerationChanged,
+            Outcome::Stale(Stale::Lifecycle) => Self::ReadPeerLifecycleChanged,
+            Outcome::Stale(Stale::PeerState) => Self::ReadPeerStateRejected,
+            _ => Self::InputReadPeerRejected,
+        }
+    }
+
     pub(super) fn history(error: CaptureFailure) -> Self {
         match error {
             CaptureFailure::Capacity => Self::HistoryCapacity,
@@ -112,6 +139,15 @@ impl FullRetentionLoss {
             34 => Some(RoutedPeerMismatch),
             35 => Some(RoutedDestinationMismatch),
             36 => Some(RoutedRoomPermitRejected),
+            37 => Some(ReadPeerOwnerUnavailable),
+            38 => Some(ReadPeerBindingsInvalid),
+            39 => Some(ReadPeerIdentityRejected),
+            40 => Some(ReadPeerEpochContended),
+            41 => Some(ReadPeerConnectionsContended),
+            42 => Some(ReadPeerMembershipContended),
+            43 => Some(ReadPeerGenerationChanged),
+            44 => Some(ReadPeerLifecycleChanged),
+            45 => Some(ReadPeerStateRejected),
             _ => None,
         }
     }

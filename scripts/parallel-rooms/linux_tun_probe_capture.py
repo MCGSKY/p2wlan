@@ -20,6 +20,7 @@ if str(DUAL) not in sys.path:
 import probe_request_plan as plans
 import probe_write_stream as streams
 import udp_business_probe as udp
+import probe_completion_barrier as handoff
 
 MAX_PROBES = 4
 MAX_FINAL_READS = streams.facts.MAX_BYTES // streams.MAX_CHUNK_BYTES + 2
@@ -50,6 +51,7 @@ class ProbeCapture:
         self.gap = None
         self.result = None
         self.live_window_bridge = None
+        self.completion_barrier_path = None
         self.config, self.transport, self.namespace = config, transport, namespace
         self.plan_path = root / (stem + "-request-plan.json")
         self.raw_path = root / (stem + "-write-stream.jsonl")
@@ -69,7 +71,10 @@ class ProbeCapture:
     def arguments(self) -> list[str]:
         if self.writer is None or self.stream is not None:
             raise ValueError("original_capture_not_prepared")
-        return ["--request-plan", str(self.plan_path), "--write-facts-fd", str(self.writer)]
+        arguments = ["--request-plan", str(self.plan_path), "--write-facts-fd", str(self.writer)]
+        if self.completion_barrier_path is not None:
+            arguments.extend(["--completion-barrier", str(self.completion_barrier_path)])
+        return arguments
 
     def _close(self, name: str) -> None:
         descriptor = getattr(self, name)
@@ -90,6 +95,10 @@ class ProbeCapture:
         from linux_tun_live_window import OriginalWriteWindows
         if self.live_window_bridge is not None or self.stream is not None:
             raise ValueError("original_window_bridge_already_bound")
+        if self.transport == "tcp":
+            self.completion_barrier_path = self.plan_path.with_name(
+                self.plan_path.name.replace("-request-plan.json", "-window-handoff.json"))
+            handoff.validate_destination(self.completion_barrier_path)
         self.live_window_bridge = OriginalWriteWindows(self, endpoints)
 
     def bind(self, groups, child) -> None:

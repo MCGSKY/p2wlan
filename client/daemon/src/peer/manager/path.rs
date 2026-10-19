@@ -97,7 +97,7 @@ impl PeerManager {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn select_path_for_data_with_local_endpoint_in_epoch_with_conns(
+    pub(crate) fn select_path_for_data_with_local_endpoint_in_epoch_with_conns(
         &self,
         conns: &mut HashMap<String, PeerConnection>,
         node_id: &str,

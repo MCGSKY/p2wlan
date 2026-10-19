@@ -37,7 +37,13 @@ impl FirstReadPeer {
             .as_ref()
             .is_ok_and(|peer| peer.matches_original_ingress(source, before))
     }
-    fn capture(scope: &CaptureSession, plan: &RegisteredFlowPlan) -> Self {
+    fn capture(
+        scope: &CaptureSession,
+        plan: &RegisteredFlowPlan,
+        #[cfg(any(target_os = "linux", all(unix, test)))] context: Option<
+            crate::peer::EpochTryContext,
+        >,
+    ) -> Self {
         let original = scope
             .peers
             .upgrade()
@@ -45,7 +51,12 @@ impl FirstReadPeer {
                 OverlayCreditUnknown::OriginalAuthorization,
             ))
             .and_then(|peers| {
-                peers.try_capture_original_kernel_read_peer(&plan.peer, plan.flow.dst_v4)
+                peers.try_capture_original_kernel_read_peer(
+                    &plan.peer,
+                    plan.flow.dst_v4,
+                    #[cfg(any(target_os = "linux", all(unix, test)))]
+                    context,
+                )
             });
         if original.is_err() {
             scope.gap();
@@ -53,10 +64,33 @@ impl FirstReadPeer {
         Self { original }
     }
 
-    fn is_current(&self, peers: &PeerManager, at: Instant) -> bool {
+    #[cfg(any(test, not(target_os = "linux")))]
+    fn current_rejection(
+        &self,
+        peers: &PeerManager,
+        at: Instant,
+    ) -> Option<FullRetentionLossReason> {
         self.original
             .as_ref()
-            .is_ok_and(|original| original.try_identity_at(peers, at).is_ok())
+            .map_err(|reason| *reason)
+            .and_then(|original| original.try_identity_at(peers, at))
+            .err()
+            .map(FullRetentionLossReason::read_peer)
+    }
+
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    fn current_rejection_observed(
+        &self,
+        peers: &PeerManager,
+        at: Instant,
+        context: Option<crate::peer::EpochTryContext>,
+    ) -> Option<FullRetentionLossReason> {
+        self.original
+            .as_ref()
+            .map_err(|reason| *reason)
+            .and_then(|original| original.try_identity_at_observed(peers, at, context))
+            .err()
+            .map(FullRetentionLossReason::read_peer)
     }
 
     #[cfg(unix)]
@@ -84,36 +118,109 @@ impl CaptureSession {
         &self,
         flow: &mut FlowState,
         slots: &[usize],
+        #[cfg(any(target_os = "linux", all(unix, test)))] original: Option<&KernelRead>,
     ) -> Vec<Arc<FirstReadPeer>> {
-        // One bounded, synchronous observation before the original read
-        // context is handed to any async forwarding/route/crypto consumer.
-        let observed = Arc::new(FirstReadPeer::capture(self, &flow.plan));
+        // Capture once for previously unobserved slots of this original read.
+        // Cached positive and negative expectations never perform another try.
+        let plan = flow.plan.clone();
+        let mut observed = None;
         slots
             .iter()
             .map(|slot| {
                 flow.requests[*slot]
                     .first_peer
-                    .get_or_insert_with(|| observed.clone())
+                    .get_or_insert_with(|| {
+                        observed
+                            .get_or_insert_with(|| {
+                                #[cfg(any(target_os = "linux", all(unix, test)))]
+                                let context = original.and_then(|read| {
+                                    self.read_peer_epoch_context(&plan, *slot, read.ordinal())
+                                });
+                                Arc::new(FirstReadPeer::capture(
+                                    self,
+                                    &plan,
+                                    #[cfg(any(target_os = "linux", all(unix, test)))]
+                                    context,
+                                ))
+                            })
+                            .clone()
+                    })
                     .clone()
             })
             .collect()
     }
+
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    fn read_peer_epoch_context(
+        &self,
+        plan: &RegisteredFlowPlan,
+        slot: usize,
+        read_ordinal: u64,
+    ) -> Option<crate::peer::EpochTryContext> {
+        let key = plan.requests.get(slot)?;
+        Some(crate::peer::EpochTryContext {
+            capture_owner: self.owner,
+            capture_id: self.capture_id,
+            run: key.run,
+            round: key.round,
+            request_nonce: key.request_nonce,
+            sequence: key.sequence,
+            protocol: match plan.protocol {
+                Protocol::Udp => "udp",
+                Protocol::Tcp => "tcp",
+            },
+            kind: match key.kind {
+                crate::business_evidence::RequestKind::Request => "request",
+                crate::business_evidence::RequestKind::Response => "response",
+            },
+            first_read_ordinal: 0,
+            read_peer_input_ordinal: Some(read_ordinal),
+        })
+    }
 }
 
 impl KernelReadBinding {
-    pub(super) fn original_peer_identity_is_current(
+    pub(super) fn original_peer_identity_rejection(
         &self,
         scope: &CaptureSession,
         at: Instant,
-    ) -> bool {
-        scope.peers.upgrade().is_some_and(|peers| {
-            !self.original_peers.is_empty()
-                && self.original_peers.len() == self.slots.len()
-                && self
-                    .original_peers
-                    .iter()
-                    .all(|original| original.is_current(&peers, at))
-        })
+    ) -> Option<FullRetentionLossReason> {
+        let Some(peers) = scope.peers.upgrade() else {
+            return Some(FullRetentionLossReason::ReadPeerOwnerUnavailable);
+        };
+        if self.original_peers.is_empty() || self.original_peers.len() != self.slots.len() {
+            return Some(FullRetentionLossReason::ReadPeerBindingsInvalid);
+        }
+        self.original_peers
+            .iter()
+            .enumerate()
+            .find_map(|(index, original)| {
+                #[cfg(any(target_os = "linux", all(unix, test)))]
+                {
+                    original.current_rejection_observed(
+                        &peers,
+                        at,
+                        self.peer_epoch_context(scope, index),
+                    )
+                }
+                #[cfg(not(any(target_os = "linux", all(unix, test))))]
+                {
+                    let _ = index;
+                    original.current_rejection(&peers, at)
+                }
+            })
+    }
+
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    fn peer_epoch_context(
+        &self,
+        scope: &CaptureSession,
+        index: usize,
+    ) -> Option<crate::peer::EpochTryContext> {
+        if !std::ptr::eq(self.scope.as_ptr(), scope) {
+            return None;
+        }
+        scope.read_peer_epoch_context(&self.plan, *self.slots.get(index)?, self.read.ordinal())
     }
 
     pub(crate) fn original_peer_matches_encryption(

@@ -1,6 +1,7 @@
 //! Original authenticated input and concrete system Full-write history.
 //! No current connection state or final once permission is maintained here.
 use super::full::ReadFrameSpan;
+use super::inbound_loss::InboundLossSite;
 use super::*;
 use crate::business_evidence::{OsUdpReqKey, RegisteredFlow, RequestKind};
 use crate::dataplane::InboundPacket;
@@ -78,7 +79,8 @@ pub(super) struct WriteSnapshot {
     write_observed_monotonic_ns: u64,
     authenticated_observed_monotonic_ns: Option<u64>,
     packet_len: usize,
-    packet_sha256: String,
+    #[serde(serialize_with = "super::snapshot_hex::serialize")]
+    packet_sha256: [u8; 32],
     network_generation: Option<u64>,
     session_instance: u64,
     peer_lifecycle: Option<u64>,
@@ -123,9 +125,9 @@ impl CaptureSession {
             }
         });
         if !bound {
+            self.inbound_loss.record(InboundLossSite::RoomBinding, None);
             self.read_complete.store(false, Ordering::Release);
-            self.inbound_complete.store(false, Ordering::Release);
-            self.gap();
+            self.original_observation_lost(&self.inbound_complete);
         }
         KernelCaptureRuntime {
             scope: Arc::downgrade(self),
@@ -150,6 +152,12 @@ impl CaptureSession {
             {
                 return Err(CaptureFailure::InvalidPlan);
             }
+            #[cfg(unix)]
+            let mut state = self
+                .state
+                .try_system_write_lock(original.ordinal())
+                .map_err(|_| CaptureFailure::Contended)?;
+            #[cfg(not(unix))]
             let mut state = self
                 .state
                 .try_lock()
@@ -191,11 +199,12 @@ impl CaptureSession {
             self.try_complete_original_frames(&mut state, flow, &slots[..count]);
             Ok(())
         };
-        if retain().is_err() {
+        if let Err(error) = retain() {
+            self.inbound_loss
+                .record(InboundLossSite::SystemWriteRetention, Some(error));
             // A lost Full-write observation cannot be repaired by a later
             // duplicate sampled after a lifecycle change or room renewal.
-            self.inbound_complete.store(false, Ordering::Release);
-            self.gap();
+            self.original_observation_lost(&self.inbound_complete);
         }
     }
 }
@@ -211,11 +220,13 @@ impl KernelCaptureRuntime {
         let captured = self.capture_inner(&scope, transport, source, packet);
         match captured {
             Ok(binding) => binding,
-            Err(_) => {
+            Err(error) => {
+                scope
+                    .inbound_loss
+                    .record(InboundLossSite::AuthenticatedInput, Some(error));
                 // A missing first input cannot be repaired by a later copy
                 // borrowing a renewed room permit. This scope never rearms.
-                scope.inbound_complete.store(false, Ordering::Release);
-                scope.gap();
+                scope.original_observation_lost(&scope.inbound_complete);
                 None
             }
         }
@@ -242,6 +253,12 @@ impl KernelCaptureRuntime {
         {
             return Ok(None);
         }
+        #[cfg(unix)]
+        let mut state = scope
+            .state
+            .try_authenticated_lock()
+            .map_err(|_| CaptureFailure::Contended)?;
+        #[cfg(not(unix))]
         let mut state = scope
             .state
             .try_lock()
@@ -404,6 +421,9 @@ impl KernelCaptureRuntime {
                 flow.inbound.original_room[span.slot()].get_or_insert_with(|| new_room.clone());
             original_rooms.push(saved.clone());
         }
+        // The original flow updates and first room-permit selection are done.
+        // Build the immutable binding without retaining the registry guard.
+        drop(state);
         Ok(Some(Arc::new(KernelIngressBinding {
             scope: Arc::downgrade(scope),
             source: Arc::new(source.clone()),
@@ -517,7 +537,7 @@ impl InboundHistory {
                     authenticated_observed_monotonic_ns: binding
                         .authenticated_observed_monotonic_ns,
                     packet_len: binding.packet_len,
-                    packet_sha256: hex::encode(binding.packet_sha256),
+                    packet_sha256: binding.packet_sha256,
                     network_generation: binding.source.network_generation(),
                     session_instance: binding.source.session().session_instance(),
                     peer_lifecycle: binding

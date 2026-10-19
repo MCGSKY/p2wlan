@@ -25,6 +25,7 @@ from linux_tun_fault import FaultOwner
 import linux_tun_stall
 import linux_tun_stall_contract as stall_contract
 import linux_tun_relay as relay_fixture
+import linux_tun_revoke_contract as revoke_contract
 
 ROOT = Path(__file__).resolve().parents[2]
 DUAL = ROOT / "scripts/dual-end"
@@ -200,7 +201,7 @@ def tool_argv(tool: Path, role: str, bind: tuple, target: tuple, entry: dict, ou
 
 
 def measure(lab: EvidenceLab, groups: OwnedGroups, entry: dict, out: Path, snapshots: dict,
-            *, expected_fault: bool = False) -> None:
+            *, expected_fault: bool = False, revocation=None) -> None:
     for name, peer in (("a1", "b1"), ("b1", "a1")):
         same_endpoint(snapshots[name], endpoint(lab, name, snapshots[peer]["virtual_ip"]))
     index = 0 if entry["direction"] == "a-to-b" else 1
@@ -214,8 +215,11 @@ def measure(lab: EvidenceLab, groups: OwnedGroups, entry: dict, out: Path, snaps
     echo_log, probe_log = out / (stem + "-echo.log"), out / (stem + "-probe.log")
     echo_report, probe_report = out / (stem + "-echo.json"), out / (stem + "-probe.json")
     clean = {k: v for k, v in os.environ.items() if not k.startswith("P2WLAN_")}
+    echo_argv = tool_argv(tool, "echo", destination, bind, entry, echo_report)
+    if protocol == "tcp" and getattr(lab.args, "kernel_read_facts", False):
+        echo_argv.extend(["--completion-barrier", str(out / (stem + "-window-handoff.json"))])
     echo = groups.spawn(stem + "-echo", ["ip", "netns", "exec", lab.ns(lab.daemons[target]["namespace"]),
-                                       *tool_argv(tool, "echo", destination, bind, entry, echo_report)],
+                                       *echo_argv],
                         echo_log, env=clean, socket_tool=True)
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
@@ -231,6 +235,8 @@ def measure(lab: EvidenceLab, groups: OwnedGroups, entry: dict, out: Path, snaps
     namespace = lab.ns(lab.daemons[source]["namespace"])
     capture = prepare_write_capture(groups, entry, protocol, bind, destination, stem, namespace)
     kernel = prepare_kernel_capture(lab, groups, entry, capture, source, target, snapshots)
+    if revocation is not None:
+        revocation.prepare(capture, kernel)
     probe_argv = tool_argv(tool, "probe", bind, destination, entry, probe_report)
     if capture is not None:
         probe_argv.extend(capture.arguments())
@@ -249,12 +255,14 @@ def measure(lab: EvidenceLab, groups: OwnedGroups, entry: dict, out: Path, snaps
     else:
         records = tcp.validate_probe(report)
     attach(entry, report, records, bind, destination, digest(tool))
+    if revocation is not None:
+        revocation.complete(entry, capture, kernel, report)
     if "phase" in entry:
         entry["probe_observed_complete_monotonic_ns"] = time.monotonic_ns()
     echo_exit = wait_child(echo, time.monotonic() + 12)
     if capture is not None:
         entry["original_write_stream"] = capture.finish(report)
-    if kernel is not None:
+    if kernel is not None and revocation is None:
         groups.kernel_captures.finish(kernel, deadline=original_probe_end)
     entry.update(probe_exit=probe_exit, echo_exit=echo_exit,
                  report_sha256=digest(probe_report), echo_report_sha256=digest(echo_report))
@@ -276,50 +284,24 @@ def measure(lab: EvidenceLab, groups: OwnedGroups, entry: dict, out: Path, snaps
             raise RuntimeError("actual application failure is not the frozen expected blackhole outcome")
     elif probe_exit != 0 or echo_exit != 0:
         raise RuntimeError("original application child failed; fixed denominator retained")
-    for name, peer in (("a1", "b1"), ("b1", "a1")):
-        after = endpoint(lab, name, snapshots[peer]["virtual_ip"])
-        same_endpoint(snapshots[name], after)
+    if revocation is None:
+        for name, peer in (("a1", "b1"), ("b1", "a1")):
+            after = endpoint(lab, name, snapshots[peer]["virtual_ip"])
+            same_endpoint(snapshots[name], after)
 
 
 def exercise(lab: EvidenceLab, groups: OwnedGroups, report: dict, out: Path,
              *, fault_slot: list | None = None, stall_slot: list | None = None) -> None:
-    info = json.loads(original.run([str(lab.args.daemon), "--build-info"]).stdout)
-    if info.get("git_commit") != lab.args.head or info.get("binary_sha256") != digest(lab.args.daemon):
-        raise RuntimeError("original daemon/source/binary identity mismatch")
-    lab.setup()
+    from linux_tun_fixture import prepare
+    initial, snapshots, users, room = prepare(sys.modules[__name__], lab, report)
     relay_mode = getattr(lab.args, "relay_application", None)
-    if relay_mode:
-        relay_fixture.start(lab, report)
-    else:
-        lab.spawn("control", "control", [str(lab.args.control)], env={"PORT": "8080", "DB_PATH": str(lab.root / "control.db"),
-                                                                  "JWT_SECRET": secrets.token_hex(32)})
-    lab.wait("control readiness", lambda: lab.http("control", "/health"), 20)
-    password = secrets.token_urlsafe(24)
-    users = {label: lab.http("control", "/api/v1/register", method="POST",
-                            body={"email": label + "@parallel.example", "password": password}) for label in ("a", "b")}
-    room = lab.http("control", "/api/v1/rooms", method="POST", token=users["b"]["token"],
-                    body={"name": "Linux TUN application evidence", "password": password})["room"]
-    lab.http("control", "/api/v1/rooms/join", method="POST", token=users["a"]["token"],
-             body={"room_code": room["room_code"], "password": password})
-    for name, label in (("a1", "a"), ("b1", "b")):
-        lab.daemon(name, label, room, users[label]["token"], 41001)
-    initial = {name: lab.wait(name + " readiness", lambda name=name: endpoint(lab, name)) for name in ("a1", "b1")}
-    if relay_mode:
-        relay_fixture.wait(lab, initial, report)
-    else:
-        for name, peer in (("a1", "b1"), ("b1", "a1")):
-            # Wait for the original committed encrypted Direct readiness; no
-            # probe request is sent/retried to turn a failed run into a pass.
-            lab.wait(name + " original Direct readiness", lambda name=name, peer=peer: any(
-                p.get("node_id") == initial[peer]["node_id"] and p.get("online") is True
-                and p.get("active_path") == "direct" for p in lab.status(name).get("peers", [])
-            ))
-    snapshots = {name: endpoint(lab, name, initial[peer]["virtual_ip"]) for name, peer in (("a1", "b1"), ("b1", "a1"))}
-    if snapshots["a1"]["node_id"] == snapshots["b1"]["node_id"]:
-        raise RuntimeError("two original endpoint identities collapsed")
-    report["endpoint_routes_before"] = snapshots
-    report["kernel_environment_verified"] = True
-    lab.capture_stage("kernel_tun_routes_ready", successful=True)
+    if getattr(lab.args, "room_revocation", False):
+        from linux_tun_room_revoke import Revocation
+        measure(lab, groups, report["manifest"][0], out, snapshots)
+        revoke = Revocation(sys.modules[__name__], lab, report, snapshots, users, room)
+        measure(lab, groups, report["manifest"][1], out, snapshots, revocation=revoke)
+        report["application"] = revoke_contract.summarize(report["manifest"])
+        return  # The guest has actually left; do not query its former diagnostics.
     if stall_slot is not None:
         report["daemon_fixture_inputs"] = lab.stall_daemon_inputs
         linux_tun_stall.measure(sys.modules[__name__], lab, groups, report, out, snapshots, stall_slot)
@@ -403,9 +385,13 @@ def main() -> int:
                       help="independent UDP fixed16 original echo STOP/CONT; explicit keepalive interval1")
     mode.add_argument("--relay-application", choices=["udp", "tcp"],
                       help="independent bidirectional Relay16; original normal32/fault32/stall16 unchanged")
+    mode.add_argument("--room-revocation", action="store_true",
+                      help="supplementary UDP16: production room leave before final original-window delivery")
     args = parser.parse_args()
     if args.kernel_read_facts and not args.write_facts:
         parser.error("--kernel-read-facts requires the original --write-facts plans")
+    if args.room_revocation and not (args.kernel_read_facts and args.write_facts):
+        parser.error("room revocation requires original kernel-read and write facts")
     if args.relay_application and not (args.relay and args.relay_keygen and args.kernel_read_facts and args.write_facts):
         parser.error("Relay16 requires --relay, --relay-keygen, --kernel-read-facts and --write-facts")
     if not args.relay_application and (args.relay or args.relay_keygen):
@@ -421,10 +407,11 @@ def main() -> int:
     groups = OwnedGroups()
     lab = EvidenceLab(args, groups)
     run_nonce, round_nonce = secrets.token_hex(16), secrets.token_hex(16)
-    report = {"schema_version": 1, "scope": relay_fixture.SCOPE if args.relay_application else stall_contract.SCOPE if args.server_stall else fault_contract.SCOPE if args.fault_recovery else "linux_same_host_kernel_tun_application", "source_commit": args.head,
+    report = {"schema_version": 1, "scope": revoke_contract.SCOPE if args.room_revocation else relay_fixture.SCOPE if args.relay_application else stall_contract.SCOPE if args.server_stall else fault_contract.SCOPE if args.fault_recovery else "linux_same_host_kernel_tun_application", "source_commit": args.head,
               "run_id": lab.run_id, "github_run_id": os.environ.get("GITHUB_RUN_ID"),
               "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
-              "manifest": (relay_fixture.manifest(run_nonce, round_nonce, args.relay_application) if args.relay_application else
+              "manifest": (revoke_contract.manifest(run_nonce, round_nonce) if args.room_revocation else
+                           relay_fixture.manifest(run_nonce, round_nonce, args.relay_application) if args.relay_application else
                            stall_contract.manifest(run_nonce, round_nonce) if args.server_stall else
                            fault_contract.manifest(run_nonce, round_nonce) if args.fault_recovery else manifest(run_nonce, round_nonce)),
               "kernel_environment_verified": None, "canonical_current_owner_verified": None,
@@ -437,8 +424,12 @@ def main() -> int:
                                  Path(__file__).with_name("linux_tun_fault.py"), Path(__file__).with_name("linux_tun_fault_contract.py"),
                                  Path(__file__).with_name("linux_tun_stall.py"), Path(__file__).with_name("linux_tun_stall_contract.py"),
                                  Path(__file__).with_name("linux_tun_relay.py"),
+                                 Path(__file__).with_name("linux_tun_fixture.py"),
+                                 Path(__file__).with_name("linux_tun_revoke_contract.py"),
+                                 Path(__file__).with_name("linux_tun_room_revoke.py"),
                                  Path(__file__).with_name("udp_stall_echo.py"),
                                  DUAL / "udp_business_probe.py", DUAL / "udp_business_summary.py", DUAL / "tcp_business_probe.py",
+                                 DUAL / "probe_completion_barrier.py",
                                  ROOT / ".github/workflows/parallel-rooms.yml")},
               "binary_sha256": {"daemon": None, "control": None}}
     plan = None
@@ -480,6 +471,8 @@ def main() -> int:
                                     kernel_control_bytes_per_stream=4 * 1024 * 1024,
                                     kernel_registered_requests_per_daemon=1000, kernel_capture_TTL_seconds=120,
                                     kernel_capture_additional_process_groups=0)
+            report["limits"].update(tcp_terminal_handoff_files=4,
+                                    tcp_terminal_handoff_bytes=1024, tcp_terminal_handoff_reads_per_child=128)
             for name in ["linux_tun_kernel_capture.py", "linux_tun_live_window.py", "linux_tun_native_transaction.py"]:
                 path = Path(__file__).with_name(name)
                 report["source_sha256"][str(path.relative_to(ROOT))] = digest(path)
@@ -515,8 +508,8 @@ def main() -> int:
         finalize_observations(report, groups, lambda deadline=None: cleanup_network(plan, deadline=deadline),
                               fault_cleanup=(lambda deadline: fault_slot[0].cleanup(deadline) if fault_slot else
                                              {"complete": True, "admitted": False, "original_namespace_fd_closed": True}) if args.fault_recovery else None,
-                              summary=relay_fixture.summarize if args.relay_application else stall_contract.summarize if args.server_stall else fault_contract.summarize if args.fault_recovery else summarize,
-                              requested_count=16 if args.server_stall or args.relay_application else 32)
+                              summary=revoke_contract.summarize if args.room_revocation else relay_fixture.summarize if args.relay_application else stall_contract.summarize if args.server_stall else fault_contract.summarize if args.fault_recovery else summarize,
+                              requested_count=16 if args.server_stall or args.relay_application or args.room_revocation else 32)
         if captures is not None:
             captures.persist_interrupted()
             report["original_write_observations"] = captures.summary(report["manifest"])
@@ -554,7 +547,7 @@ def main() -> int:
                             and application_ok)
         if args.kernel_read_facts:
             original_kernel = report.get("original_kernel_read_observations", {})
-            qualified = original_kernel.get("passed") is True and original_kernel.get("full128_owner_evidence_complete") is True
+            qualified = revoke_contract.kernel_evidence_passed(report, room_revocation=args.room_revocation)
             report["kernel_environment_verified"] = qualified
             report["canonical_current_owner_verified"] = qualified and original_kernel.get("canonical_current_owner_verified") is True
             report["passed"] = report["passed"] and qualified
@@ -568,17 +561,18 @@ def main() -> int:
             uid, gid = int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
             for path in [*args.output_dir.rglob("*"), args.output_dir]:
                 os.chown(path, uid, gid)
-    result = {"scope": report["scope"], "passed": report["passed"], "requests": 16 if args.server_stall or args.relay_application else 32,
+    result = {"scope": report["scope"], "passed": report["passed"], "requests": 16 if args.server_stall or args.relay_application or args.room_revocation else 32,
               "success_requests": report["application"]["success_requests"], "cleanup_complete": report["cleanup_complete"]}
     if args.write_facts:
         result["original_write_observations_passed"] = report.get("original_write_observations", {}).get("passed", False)
     if args.kernel_read_facts:
         result["original_kernel_read_observations_passed"] = report.get("original_kernel_read_observations", {}).get("passed", False)
+    if args.room_revocation:
+        result["room_revocation_observations_passed"] = revoke_contract.kernel_evidence_passed(report, room_revocation=True)
     print(json.dumps(result))
-    return int(not report["passed"] or (args.write_facts and not
-               report.get("original_write_observations", {}).get("passed", False)) or (args.kernel_read_facts and not
-               (report.get("original_kernel_read_observations", {}).get("passed", False)
-                and report.get("kernel_control_cleanup", {}).get("complete", False))))
+    return revoke_contract.exit_status(report, write_facts=args.write_facts,
+                                       kernel_read_facts=args.kernel_read_facts,
+                                       room_revocation=args.room_revocation)
 
 
 if __name__ == "__main__":

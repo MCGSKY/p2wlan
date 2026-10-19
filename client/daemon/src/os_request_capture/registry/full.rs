@@ -50,8 +50,7 @@ impl CaptureSession {
         // No lock or retry: loss must remain observable even when the history
         // mutex itself caused the miss. Later duplicates never rearm a scope.
         self.full_loss.record(reason);
-        self.full_complete.store(false, Ordering::Release);
-        self.gap();
+        self.original_observation_lost(&self.full_complete);
     }
 }
 
@@ -116,12 +115,19 @@ impl FrameSpanCoverage {
             return Err(CaptureFailure::InvalidPlan);
         }
         let before = self.covered;
-        for byte in start..end {
-            let bit = 1 << (byte % 64);
-            if self.seen[byte / 64] & bit == 0 {
-                self.seen[byte / 64] |= bit;
-                self.covered += 1;
-            }
+        let first_word = start / 64;
+        let last_word = (end - 1) / 64;
+        for word in first_word..=last_word {
+            let low = if word == first_word { start % 64 } else { 0 };
+            let high = if word == last_word {
+                (end - 1) % 64 + 1
+            } else {
+                64
+            };
+            let mask = (u64::MAX << low) & (u64::MAX >> (64 - high));
+            let fresh = mask & !self.seen[word];
+            self.seen[word] |= mask;
+            self.covered += fresh.count_ones() as usize;
         }
         Ok(self.covered != before)
     }
@@ -157,7 +163,8 @@ pub(super) struct FullPacketSnapshot {
     full_observed_monotonic_ns: u64,
     publication_observed_monotonic_ns: Option<u64>,
     packet_len: usize,
-    packet_sha256: String,
+    #[serde(serialize_with = "super::snapshot_hex::serialize")]
+    packet_sha256: [u8; 32],
     spans: Vec<ReadFrameSpan>,
     attempt_id: u64,
     encryption_generation: u64,
@@ -200,7 +207,7 @@ pub(super) fn snapshot(reads: &[Arc<KernelReadBinding>]) -> Vec<FullPacketSnapsh
                 full_observed_monotonic_ns: observed_monotonic_ns,
                 publication_observed_monotonic_ns: read.original_publication_ns.get().copied(),
                 packet_len: read.packet_len,
-                packet_sha256: hex::encode(read.packet_sha256),
+                packet_sha256: read.packet_sha256,
                 spans: read.spans.clone(),
                 attempt_id: record.attempt_id(),
                 encryption_generation: record.encryption_generation(),

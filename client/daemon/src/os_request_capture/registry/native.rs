@@ -9,7 +9,13 @@ use crate::overlay_requests::{
 use crate::rooms::RoomSendPermit;
 
 type Check<T> = Result<T, Outcome>;
+#[cfg(all(unix, test))]
+mod epoch_guard_tests;
 mod selection;
+#[cfg(all(unix, test))]
+mod terminal_failure_tests;
+#[cfg(all(unix, test))]
+mod terminal_wait_tests;
 
 pub(crate) struct OriginalKernelExchange {
     scope: Weak<CaptureSession>,
@@ -132,6 +138,36 @@ fn unknown() -> Outcome {
 }
 
 impl OriginalKernelExchange {
+    pub(crate) fn emit_try_context(&self) -> Option<crate::transport::EmitTryContext> {
+        self.scope
+            .upgrade()?
+            .emit_trace
+            .context(self.epoch_try_context()?)
+    }
+
+    pub(crate) fn epoch_try_context(&self) -> Option<crate::peer::EpochTryContext> {
+        let scope = self.scope.upgrade()?;
+        let key = self.plan.requests.get(self.slot)?;
+        Some(crate::peer::EpochTryContext {
+            capture_owner: scope.owner,
+            capture_id: scope.capture_id,
+            run: key.run,
+            round: key.round,
+            request_nonce: key.request_nonce,
+            sequence: key.sequence,
+            protocol: match self.plan.protocol {
+                Protocol::Udp => "udp",
+                Protocol::Tcp => "tcp",
+            },
+            kind: match key.kind {
+                RequestKind::Request => "request",
+                RequestKind::Response => "response",
+            },
+            first_read_ordinal: self.reads.first()?.read.ordinal(),
+            read_peer_input_ordinal: None,
+        })
+    }
+
     fn capture(
         scope: &Arc<CaptureSession>,
         state: &RegistryState,
@@ -393,6 +429,7 @@ impl CaptureSession {
         flow: usize,
         slots: &[usize],
     ) {
+        let mut completed = false;
         for &slot in slots {
             if state.flows[flow].requests[slot].native_credit.is_some() {
                 continue;
@@ -403,6 +440,7 @@ impl CaptureSession {
                 Err(reason) => {
                     state.flows[flow].requests[slot].native_credit =
                         Some(NativeFrameOutcome::failure(reason));
+                    completed = true;
                     continue;
                 }
             };
@@ -421,6 +459,7 @@ impl CaptureSession {
                     .is_err()
             {
                 state.flows[flow].requests[slot].native_credit = Some(result);
+                completed = true;
                 continue;
             }
             result
@@ -457,6 +496,10 @@ impl CaptureSession {
                 );
             }
             state.flows[flow].requests[slot].native_credit = Some(result);
+            completed = true;
+        }
+        if completed {
+            self.record_native_terminal_progress();
         }
     }
 }

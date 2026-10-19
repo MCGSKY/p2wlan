@@ -328,6 +328,65 @@ pub(crate) struct DataplaneProfiler {
     tail_event_records: Mutex<Vec<TailEventRecord>>,
 }
 
+/// Two diagnostic samples owned by the original preparation future. Declare
+/// this before its epoch guard so histogram locks and logger callbacks run
+/// after the actual epoch unlock, including early return and cancellation.
+/// Durations and observation times are captured at the original sample sites;
+/// only publication is deferred. No packet, owner or network fact is retained.
+pub(crate) struct DeferredEpochProfile<'a> {
+    profiler: &'a DataplaneProfiler,
+    sampled: bool,
+    wait: Option<(u64, u64)>,
+    hold: Option<(u64, u64)>,
+}
+
+impl<'a> DeferredEpochProfile<'a> {
+    pub(crate) fn new(profiler: &'a DataplaneProfiler, sampled: bool) -> Self {
+        Self {
+            profiler,
+            sampled,
+            wait: None,
+            hold: None,
+        }
+    }
+
+    pub(crate) fn waited(&mut self, duration: Duration) {
+        if self.sampled {
+            self.wait = Some((
+                duration_us(duration),
+                duration_us(self.profiler.started_at.elapsed()),
+            ));
+        }
+    }
+
+    pub(crate) fn held(&mut self, duration: Duration) {
+        if self.sampled {
+            self.hold = Some((
+                duration_us(duration),
+                duration_us(self.profiler.started_at.elapsed()),
+            ));
+        }
+    }
+}
+
+impl Drop for DeferredEpochProfile<'_> {
+    fn drop(&mut self) {
+        for (stage, sample) in [
+            ("tx_epoch_gate_wait_us", self.wait),
+            ("tx_epoch_gate_hold_us", self.hold),
+        ] {
+            if let Some((value, observed_at_us)) = sample {
+                self.profiler.record_value_at(
+                    stage,
+                    value,
+                    ProfileUnit::Microseconds,
+                    observed_at_us,
+                );
+            }
+        }
+    }
+}
+
 impl DataplaneProfiler {
     fn new() -> Self {
         Self {
@@ -770,6 +829,104 @@ mod profiling_tests {
     use p2pnet_tun::Ipv4Packet;
 
     use super::*;
+
+    #[test]
+    fn epoch_profile_deferred_pair_preserves_original_values_times_and_units() {
+        let profiler = DataplaneProfiler::new();
+        let mut deferred = DeferredEpochProfile::new(&profiler, true);
+        deferred.waited(Duration::from_micros(7));
+        deferred.held(Duration::from_micros(11));
+        let original_wait = deferred.wait.unwrap();
+        let original_hold = deferred.hold.unwrap();
+        assert!(profiler.state.lock().unwrap().stages.is_empty());
+        drop(deferred);
+        let state = profiler.state.lock().unwrap();
+        for (stage, original) in [
+            ("tx_epoch_gate_wait_us", original_wait),
+            ("tx_epoch_gate_hold_us", original_hold),
+        ] {
+            let samples = &state.stages[&(stage, ProfileUnit::Microseconds)];
+            assert_eq!(samples.total, 1);
+            assert_eq!(samples.values.len(), 1);
+            assert_eq!(
+                (samples.values[0].value, samples.values[0].observed_at_us),
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_profile_unsampled_empty_and_early_return_keep_original_sample_counts() {
+        let profiler = DataplaneProfiler::new();
+        let mut unsampled = DeferredEpochProfile::new(&profiler, false);
+        unsampled.waited(Duration::from_micros(3));
+        unsampled.held(Duration::from_micros(5));
+        drop(unsampled);
+        drop(DeferredEpochProfile::new(&profiler, true));
+        assert!(profiler.state.lock().unwrap().stages.is_empty());
+        let mut early = DeferredEpochProfile::new(&profiler, true);
+        early.waited(Duration::from_micros(13));
+        drop(early);
+        let state = profiler.state.lock().unwrap();
+        assert_eq!(state.stages.len(), 1);
+        let wait = &state.stages[&("tx_epoch_gate_wait_us", ProfileUnit::Microseconds)];
+        assert_eq!(wait.total, 1);
+        assert_eq!(wait.values[0].value, 13);
+    }
+
+    #[test]
+    fn epoch_profile_cancelled_future_unlocks_actual_epoch_before_blocked_histogram() {
+        use std::sync::{mpsc, Arc};
+        use std::task::{Context, Poll, Waker};
+        struct Released(Option<mpsc::Sender<()>>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let profiler = Arc::new(DataplaneProfiler::new());
+        let gate = Arc::new(crate::peer::NetworkEpochGate::new(()));
+        let state = profiler.state.lock().unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn({
+            let profiler = profiler.clone();
+            let gate = gate.clone();
+            move || {
+                let future = async {
+                    let mut deferred = DeferredEpochProfile::new(&profiler, true);
+                    // A test-only observation between the original local drop
+                    // owners; no callback is added to the production future.
+                    let _released = Released(Some(released_tx));
+                    let _epoch = gate.try_lock().unwrap();
+                    deferred.waited(Duration::from_micros(17));
+                    std::future::pending::<()>().await;
+                };
+                let mut future = Box::pin(future);
+                let mut context = Context::from_waker(Waker::noop());
+                assert!(matches!(
+                    std::future::Future::poll(future.as_mut(), &mut context),
+                    Poll::Pending
+                ));
+                ready_tx.send(()).unwrap();
+                drop(future);
+                done_tx.send(()).unwrap();
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        released_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            gate.try_lock().is_ok(),
+            "the real epoch must be free while profiling is blocked"
+        );
+        assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        drop(state);
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(stage_values(&profiler, "tx_epoch_gate_wait_us"), vec![17]);
+        assert!(stage_values(&profiler, "tx_epoch_gate_hold_us").is_empty());
+    }
 
     fn stage_values(profiler: &DataplaneProfiler, stage: &'static str) -> Vec<u64> {
         profiler

@@ -58,14 +58,19 @@ async fn pause_after_peer_membership_publish_for_test(peer_id: &str) {
     }
 }
 
+struct PeerUpdateResources<'a> {
+    epoch_guard: crate::peer::NetworkEpochGuard<'a>,
+    conns: tokio::sync::RwLockWriteGuard<'a, HashMap<String, PeerConnection>>,
+    ip_map: tokio::sync::RwLockWriteGuard<'a, HashMap<String, String>>,
+    generation: u64,
+}
+
 impl PeerManager {
     async fn lock_peer_update_resources<'a>(
         &'a self,
         trace: &mut PeerUpdateLockTrace<'_>,
-    ) -> (
-        tokio::sync::MutexGuard<'a, ()>,
-        tokio::sync::RwLockWriteGuard<'a, HashMap<String, PeerConnection>>,
-    ) {
+        info: &PeerInfo,
+    ) -> Option<PeerUpdateResources<'a>> {
         loop {
             let epoch_guard = match self.network_epoch_gate.try_lock() {
                 Ok(guard) => guard,
@@ -84,7 +89,58 @@ impl PeerManager {
                 Ok(connections) => {
                     trace.acquired(PeerUpdateLockResource::NetworkEpochGate);
                     trace.acquired(PeerUpdateLockResource::ConnectionsWrite);
-                    return (epoch_guard, connections);
+                    let generation = self.current_network_generation_sync();
+                    // Keep the original early stale-roster fence under the
+                    // epoch/connection owners, before waiting for the IP map.
+                    let registration_floor = connections
+                        .get(&info.node_id)
+                        .filter(|conn| conn.public_key == info.public_key)
+                        .map_or(0, |conn| conn.registration_seq)
+                        .max(
+                            self.remote_identity_ledger
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .get(&info.node_id)
+                                .filter(|identity| identity.public_key == info.public_key)
+                                .map_or(0, |identity| identity.registration_seq),
+                        );
+                    if info.registration_seq < registration_floor {
+                        debug!(peer = %info.node_id, reason_code = "peer_registration_snapshot_stale",
+                            incoming = info.registration_seq, current = registration_floor,
+                            "Ignoring stale peer capability and metadata snapshot");
+                        return None;
+                    }
+                    match self.ip_to_node.try_write() {
+                        Ok(ip_map) => {
+                            trace.acquired(PeerUpdateLockResource::IpToNodeWrite);
+                            return Some(PeerUpdateResources {
+                                epoch_guard,
+                                conns: connections,
+                                ip_map,
+                                generation,
+                            });
+                        }
+                        Err(_) => {
+                            drop(connections);
+                            drop(epoch_guard);
+                            trace.released(PeerUpdateLockResource::ConnectionsWrite);
+                            trace.released(PeerUpdateLockResource::NetworkEpochGate);
+                            trace.wait_started(
+                                PeerUpdateLockResource::IpToNodeWrite,
+                                "fair_writer_queue_probe",
+                                "none",
+                            );
+                            // Preserve the original IP writer's fair queue,
+                            // but wait with neither epoch nor connections held.
+                            // The same loop reacquires all original resources
+                            // and rechecks the stale-roster prefix before any
+                            // peer mutation can use the generation snapshot.
+                            let queue_probe = self.ip_to_node.write().await;
+                            trace.queue_probe_acquired(PeerUpdateLockResource::IpToNodeWrite);
+                            drop(queue_probe);
+                            trace.queue_probe_released(PeerUpdateLockResource::IpToNodeWrite);
+                        }
+                    }
                 }
                 Err(_) => {
                     drop(epoch_guard);
@@ -147,32 +203,18 @@ impl PeerManager {
         // the generation snapshot and the connection mutation as one epoch
         // transaction; otherwise a public-key/session reset could be
         // published immediately before an old ACK commits.
-        let (epoch_guard, mut conns) = self.lock_peer_update_resources(&mut lock_trace).await;
-        let generation = self.current_network_generation_sync();
-        // Reject a delayed roster before it can mutate even endpoint or online
-        // state. Retain this fence across PeerLeft using the existing bounded
-        // identity tombstones, without retaining capability truth separately.
-        let registration_floor = conns
-            .get(&info.node_id)
-            .filter(|conn| conn.public_key == info.public_key)
-            .map_or(0, |conn| conn.registration_seq)
-            .max(
-                self.remote_identity_ledger
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .get(&info.node_id)
-                    .filter(|identity| identity.public_key == info.public_key)
-                    .map_or(0, |identity| identity.registration_seq),
-            );
-        if info.registration_seq < registration_floor {
-            debug!(peer = %info.node_id, reason_code = "peer_registration_snapshot_stale",
-                incoming = info.registration_seq, current = registration_floor,
-                "Ignoring stale peer capability and metadata snapshot");
+        let Some(PeerUpdateResources {
+            epoch_guard,
+            mut conns,
+            mut ip_map,
+            generation,
+        }) = self.lock_peer_update_resources(&mut lock_trace, info).await
+        else {
             return PeerUpdate {
                 last_seen_only: true,
                 ..PeerUpdate::default()
             };
-        }
+        };
         // Un-quarantine evidence is computed under the connection lock but the
         // quarantine map is re-opened only AFTER the lock is dropped:
         // `unquarantine_peer` records a diagnostics event that re-locks the
@@ -183,23 +225,6 @@ impl PeerManager {
         let mut revoke_relay_after_lock = false;
         let mut clear_hard_hard_after_lock = false;
         let mut direct_first_deadline_changed = false;
-        let mut ip_map = match self.ip_to_node.try_write() {
-            Ok(ip_map) => {
-                lock_trace.acquired(PeerUpdateLockResource::IpToNodeWrite);
-                ip_map
-            }
-            Err(_) => {
-                lock_trace.wait_started(
-                    PeerUpdateLockResource::IpToNodeWrite,
-                    "fair_writer_queue",
-                    "network_epoch_gate,connections_write",
-                );
-                let ip_map = self.ip_to_node.write().await;
-                lock_trace.acquired(PeerUpdateLockResource::IpToNodeWrite);
-                ip_map
-            }
-        };
-
         let is_new = !conns.contains_key(&info.node_id);
 
         let conn = conns

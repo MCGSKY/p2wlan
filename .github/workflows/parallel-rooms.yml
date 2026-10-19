@@ -66,11 +66,17 @@ jobs:
             python scripts/parallel-rooms/test_linux_tun_live_window.py -v
             python scripts/parallel-rooms/test_linux_tun_native_transaction.py -v
             python scripts/parallel-rooms/test_linux_tun_relay.py -v
+            python scripts/parallel-rooms/test_linux_tun_room_revoke.py -v
+            python scripts/parallel-rooms/test_linux_tun_cleanup_gate.py -v
+            python scripts/dual-end/test_probe_completion_barrier.py -v
           else
             python3 scripts/parallel-rooms/test_linux_tun_kernel_capture.py -v
             python3 scripts/parallel-rooms/test_linux_tun_live_window.py -v
             python3 scripts/parallel-rooms/test_linux_tun_native_transaction.py -v
             python3 scripts/parallel-rooms/test_linux_tun_relay.py -v
+            python3 scripts/parallel-rooms/test_linux_tun_room_revoke.py -v
+            python3 scripts/parallel-rooms/test_linux_tun_cleanup_gate.py -v
+            python3 scripts/dual-end/test_probe_completion_barrier.py -v
           fi
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
         with:
@@ -181,6 +187,23 @@ jobs:
               --output-dir "$RUNNER_TEMP/linux-tun-relay-$protocol" || relay_result=1
           done
           exit "$relay_result"
+      - name: Real kernel TUN original room revocation
+        if: ${{ !cancelled() }}
+        timeout-minutes: 3
+        run: |
+          python3 scripts/parallel-rooms/linux_tun_cleanup_gate.py \
+            --reports-root "$RUNNER_TEMP" \
+            --head "$(git rev-parse HEAD)" \
+            --run-id "$GITHUB_RUN_ID" \
+            --attempt "$GITHUB_RUN_ATTEMPT"
+          sudo --preserve-env=GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT python3 scripts/parallel-rooms/linux_tun_evidence.py \
+            --write-facts \
+            --kernel-read-facts \
+            --daemon target/debug/p2wlan-daemon \
+            --control target/debug/p2wlan-control \
+            --head "$(git rev-parse HEAD)" \
+            --room-revocation \
+            --output-dir "$RUNNER_TEMP/linux-tun-room-revocation"
       - name: Retain original Linux TUN failure programs
         if: failure()
         run: |
@@ -192,6 +215,15 @@ jobs:
             --report "$RUNNER_TEMP/linux-tun-recovery/report.json" \
             --report "$RUNNER_TEMP/linux-tun-server-stall/report.json" \
             --output "$RUNNER_TEMP/linux-tun-original-programs"
+      - name: Retain original room revocation failure programs
+        if: failure()
+        run: |
+          sudo --preserve-env=GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT python3 scripts/parallel-rooms/retain_linux_tun_programs.py \
+            --daemon target/debug/p2wlan-daemon \
+            --control target/debug/p2wlan-control \
+            --head "$(git rev-parse HEAD)" \
+            --report "$RUNNER_TEMP/linux-tun-room-revocation/report.json" \
+            --output "$RUNNER_TEMP/linux-tun-room-revocation-original-programs"
       - name: Retain original supplementary Relay failure programs
         if: failure()
         run: |
@@ -214,6 +246,8 @@ jobs:
             ${{ runner.temp }}/linux-tun-application/
             ${{ runner.temp }}/linux-tun-recovery/
             ${{ runner.temp }}/linux-tun-server-stall/
+            ${{ runner.temp }}/linux-tun-room-revocation/
+            ${{ runner.temp }}/linux-tun-room-revocation-original-programs/
             ${{ runner.temp }}/linux-tun-original-programs/
             ${{ runner.temp }}/linux-tun-relay-udp/
             ${{ runner.temp }}/linux-tun-relay-tcp/

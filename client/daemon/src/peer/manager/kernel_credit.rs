@@ -59,7 +59,10 @@ impl PeerManager {
             Err(reason) => return reason.into(),
         };
         *owner_check = "emit_registry";
-        let _emit = match owners.wireguard.try_emit_guard(request.peer()) {
+        let _emit = match owners
+            .wireguard
+            .try_emit_guard(request.peer(), request.emit_try_context())
+        {
             Ok(guard) => guard,
             Err(crate::transport::OriginalKernelEmitFailure::Registry) => {
                 return Contended(CreditLock::Emit)
@@ -70,7 +73,10 @@ impl PeerManager {
             }
         };
         *owner_check = "epoch";
-        let Ok(_epoch) = self.network_epoch_gate.try_lock() else {
+        let Ok(_epoch) = self
+            .network_epoch_gate
+            .try_lock_original(request.epoch_try_context())
+        else {
             return Contended(CreditLock::Epoch);
         };
         *owner_check = "session";

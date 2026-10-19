@@ -105,7 +105,11 @@ impl WireGuardTransport {
             wire_fp = format_args!("{wire_fp:016x}"),
             "encrypted control packet entered its caller-provided transport handoff"
         );
-        emit(encrypted).await?;
+        let emitted = emit(encrypted).await;
+        // Counter order requires the fence through the real handoff. The
+        // completed diagnostic is not part of that transaction and may block.
+        drop(_emit_guard);
+        emitted?;
         debug!(
             event = "control_transport_handoff_completed",
             peer_id = %peer_id,
@@ -136,7 +140,7 @@ impl WireGuardTransport {
     ) -> Result<Option<EncryptedOutboundWithSource>> {
         let emit_lock = self.outbound_emit_lock(&packet.peer_id).await;
         let _emit_guard = emit_lock.lock().await;
-        self.encrypt_outbound_inner_with_capture(packet, false, false, true)
+        self.encrypt_outbound_inner_with_capture(packet, false, false, true, None)
             .await
     }
 
@@ -176,7 +180,7 @@ impl WireGuardTransport {
     pub(crate) async fn encrypt_outbound_with_guard(
         &self,
         packet: OutboundPacket,
-    ) -> Result<Option<(EncryptedPeerPacket, Arc<OwnedMutexGuard<()>>)>> {
+    ) -> Result<Option<(EncryptedPeerPacket, Arc<OwnedEmitGuard>)>> {
         let peer_id = packet.peer_id.clone();
         let emit_guard = Arc::new(self.acquire_outbound_emit_guard(&peer_id).await);
         let Some(encrypted) = self.encrypt_outbound_with_emit_guard(packet).await? else {
@@ -190,18 +194,26 @@ impl WireGuardTransport {
     /// transaction (for example the network-generation gate) acquire it
     /// first, so every production path uses the lock order
     /// `emit -> epoch -> sessions`.
-    pub(crate) async fn acquire_outbound_emit_guard(&self, peer_id: &str) -> OwnedMutexGuard<()> {
-        self.outbound_emit_lock(peer_id).await.lock_owned().await
+    #[track_caller]
+    pub(crate) fn acquire_outbound_emit_guard<'a>(
+        &'a self,
+        peer_id: &'a str,
+    ) -> impl Future<Output = OwnedEmitGuard> + 'a {
+        let site = emit_gate::caller_site();
+        async move {
+            self.outbound_emit_lock(peer_id)
+                .await
+                .lock_owned_at(site)
+                .await
+        }
     }
 
     /// Try to enter the per-peer counter-ordering boundary without waiting
     /// behind either the lock registry or business/control emission. Any
     /// contention is reported to the caller so it can retain exact work in
     /// its bounded ledger.
-    pub(crate) fn try_acquire_outbound_emit_guard(
-        &self,
-        peer_id: &str,
-    ) -> Option<OwnedMutexGuard<()>> {
+    #[track_caller]
+    pub(crate) fn try_acquire_outbound_emit_guard(&self, peer_id: &str) -> Option<OwnedEmitGuard> {
         self.try_outbound_emit_lock(peer_id)?.try_lock_owned().ok()
     }
 
@@ -230,8 +242,9 @@ impl WireGuardTransport {
     pub(crate) async fn encrypt_outbound_with_emit_guard_and_source(
         &self,
         packet: OutboundPacket,
+        profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
     ) -> Result<Option<EncryptedOutboundWithSource>> {
-        self.encrypt_outbound_inner_with_capture(packet, false, true, true)
+        self.encrypt_outbound_inner_with_capture(packet, false, true, true, profile)
             .await
     }
 
@@ -240,8 +253,9 @@ impl WireGuardTransport {
     pub(crate) async fn encrypt_outbound_with_emit_guard_observed(
         &self,
         packet: OutboundPacket,
+        profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
     ) -> Result<Option<EncryptedOutboundWithSource>> {
-        self.encrypt_outbound_inner_with_capture(packet, false, true, false)
+        self.encrypt_outbound_inner_with_capture(packet, false, true, false, profile)
             .await
     }
 
@@ -393,7 +407,10 @@ impl WireGuardTransport {
         }
     }
 
-    pub(in crate::transport) async fn outbound_emit_lock(&self, peer_id: &str) -> Arc<Mutex<()>> {
+    pub(in crate::transport) async fn outbound_emit_lock(
+        &self,
+        peer_id: &str,
+    ) -> Arc<emit_gate::EmitGate> {
         let mut locks = self.outbound_emit_locks.lock().await;
         if let Some(lock) = locks.get(peer_id).and_then(Weak::upgrade) {
             return lock;
@@ -404,7 +421,7 @@ impl WireGuardTransport {
         // cannot grow the registry without adding O(peer_count) work to every
         // ordinary packet on an already-active peer.
         locks.retain(|_, lock| lock.strong_count() > 0);
-        let lock = Arc::new(Mutex::new(()));
+        let lock = Arc::new(emit_gate::EmitGate::new(&self.outbound_emit_locks));
         locks.insert(peer_id.to_string(), Arc::downgrade(&lock));
         lock
     }
@@ -412,21 +429,21 @@ impl WireGuardTransport {
     pub(in crate::transport) fn try_outbound_emit_lock(
         &self,
         peer_id: &str,
-    ) -> Option<Arc<Mutex<()>>> {
+    ) -> Option<Arc<emit_gate::EmitGate>> {
         Self::try_outbound_emit_lock_in(&self.outbound_emit_locks, peer_id)
     }
 
     pub(in crate::transport) fn try_outbound_emit_lock_in(
-        registry: &Mutex<HashMap<String, Weak<Mutex<()>>>>,
+        registry: &Arc<emit_gate::EmitRegistry>,
         peer_id: &str,
-    ) -> Option<Arc<Mutex<()>>> {
+    ) -> Option<Arc<emit_gate::EmitGate>> {
         let mut locks = registry.try_lock().ok()?;
         if let Some(lock) = locks.get(peer_id).and_then(Weak::upgrade) {
             return Some(lock);
         }
 
         locks.retain(|_, lock| lock.strong_count() > 0);
-        let lock = Arc::new(Mutex::new(()));
+        let lock = Arc::new(emit_gate::EmitGate::new(registry));
         locks.insert(peer_id.to_string(), Arc::downgrade(&lock));
         Some(lock)
     }
@@ -462,9 +479,15 @@ impl WireGuardTransport {
         queue_if_unavailable: bool,
         is_business: bool,
     ) -> Result<Option<EncryptedPeerPacket>> {
-        self.encrypt_outbound_inner_with_capture(packet, queue_if_unavailable, is_business, false)
-            .await
-            .map(|encrypted| encrypted.map(EncryptedOutboundWithSource::into_packet))
+        self.encrypt_outbound_inner_with_capture(
+            packet,
+            queue_if_unavailable,
+            is_business,
+            false,
+            None,
+        )
+        .await
+        .map(|encrypted| encrypted.map(EncryptedOutboundWithSource::into_packet))
     }
 
     // One actual slow crypto path, shared by compatibility and sourced entries.
@@ -474,6 +497,7 @@ impl WireGuardTransport {
         queue_if_unavailable: bool,
         is_business: bool,
         capture_source: bool,
+        mut profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
     ) -> Result<Option<EncryptedOutboundWithSource>> {
         let profiler = global_dataplane_profiler();
         let sampled = packet.trace.as_ref().map(|trace| trace.sampled);
@@ -481,9 +505,11 @@ impl WireGuardTransport {
         let mut sessions = self.sessions.lock().await;
         let session_lock_acquired = Instant::now();
         if let Some(sampled) = sampled {
-            profiler.record(
+            crate::dataplane::record_crypto_profile(
+                profiler,
+                profile.as_deref_mut(),
                 sampled,
-                "tx_session_lock_wait_us",
+                crate::dataplane::CryptoProfileStage::SessionWait,
                 session_lock_acquired.duration_since(session_lock_started),
             );
         }
@@ -542,9 +568,11 @@ impl WireGuardTransport {
         };
         let crypto_us = crypto_started.elapsed().as_micros() as u64;
         if let Some(sampled) = sampled {
-            profiler.record(
+            crate::dataplane::record_crypto_profile(
+                profiler,
+                profile.as_deref_mut(),
                 sampled,
-                "tx_crypto_exec_us",
+                crate::dataplane::CryptoProfileStage::Crypto,
                 Duration::from_micros(crypto_us),
             );
         }
@@ -577,9 +605,11 @@ impl WireGuardTransport {
             "WireGuard counter allocated under the per-peer emit ordering lock"
         );
         if let Some(sampled) = sampled {
-            profiler.record(
+            crate::dataplane::record_crypto_profile(
+                profiler,
+                profile,
                 sampled,
-                "tx_session_lock_hold_us",
+                crate::dataplane::CryptoProfileStage::SessionHold,
                 session_lock_acquired.elapsed(),
             );
         }
