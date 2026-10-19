@@ -143,7 +143,7 @@ pub(super) fn spans_complete<'a>(
     slot: usize,
     plan: &RegisteredFlowPlan,
 ) -> bool {
-    #[cfg(test)]
+    #[cfg(all(unix, test))]
     snapshot_coverage_probe_for_test();
     let Some(mut coverage) = FrameSpanCoverage::new(plan, slot) else {
         return false;
@@ -342,20 +342,20 @@ pub(super) mod tests;
 // Only deterministic metadata controls install this one-shot thread-local hook.
 // It observes the real mutex during the original coverage operation, with no
 // native read/write, positive owner, retry, timer or production callback.
-#[cfg(test)]
+#[cfg(all(unix, test))]
 thread_local! {
     static SNAPSHOT_COVERAGE_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 pub(super) fn on_next_snapshot_coverage_for_test(probe: impl FnOnce() + 'static) {
     SNAPSHOT_COVERAGE_PROBE.with(|slot| {
         assert!(slot.borrow_mut().replace(Box::new(probe)).is_none());
     });
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 fn snapshot_coverage_probe_for_test() {
     let probe = SNAPSHOT_COVERAGE_PROBE.with(|slot| slot.borrow_mut().take());
     if let Some(probe) = probe {
