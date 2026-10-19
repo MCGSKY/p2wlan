@@ -547,12 +547,12 @@ pub(super) async fn encrypt_then_send_with_deadline(
         complete_inner_ip_packet_len(&retry_packet.packet).unwrap_or(retry_packet.packet.len()),
         force_relay,
         window,
-        physical_attempt.slow_capture(),
+        Some(&mut physical_attempt),
     )
     .await;
     let transport_handoff_completed = Instant::now();
-    // The inner send future has ended. Seal its original result and release
-    // the counter fence before histogram locks or diagnostic subscribers run.
+    // The inner send future has ended. Seal any remaining original result;
+    // Relay already sealed before its post-send policy waits. Finish is idempotent.
     // Retain the original completion timestamp for every duration below.
     physical_attempt.finish(matches!(
         &outcome,
@@ -795,7 +795,7 @@ async fn send_encrypted_packet_bounded_with_origin(
     inner_ip_packet_len: usize,
     force_relay: bool,
     window: SendAdmissionWindow<'_>,
-    origin: Option<&mut super::physical_attempt::PhysicalSendCapture>,
+    origin: Option<&mut super::physical_attempt::OutboundPhysicalAttempt>,
 ) -> SendOutcome {
     // Capture the exact shared connection before entering the bounded send.
     // The same snapshot is passed into the send operation, so a supervisor
@@ -930,7 +930,7 @@ async fn send_encrypted_packet_once_with_origin(
     inner_ip_packet_len: usize,
     force_relay: bool,
     window: SendAdmissionWindow<'_>,
-    mut origin: Option<&mut super::physical_attempt::PhysicalSendCapture>,
+    mut origin: Option<&mut super::physical_attempt::OutboundPhysicalAttempt>,
 ) -> SendOutcome {
     let profiler = global_dataplane_profiler();
     // Take one path/generation snapshot atomically. Managed Direct keeps this
@@ -1067,11 +1067,11 @@ async fn send_encrypted_packet_once_with_origin(
                         )
                     })
             } else {
-                match origin.as_deref_mut() {
+                match origin.as_deref_mut().and_then(|owner| owner.capture()) {
                     Some(origin) => plan.udp.try_send_direct_business_packet_with_origin(
                         &plan.prepared,
                         packet,
-                        Some(origin.udp()),
+                        Some(origin),
                     ),
                     None => plan
                         .udp
@@ -1196,7 +1196,7 @@ async fn send_encrypted_packet_once_with_origin(
                 reason: "managed Direct became selected without a pre-encryption token".to_string(),
             };
         }
-        let direct_result = match origin.as_deref_mut() {
+        let direct_result = match origin.as_deref_mut().and_then(|owner| owner.capture()) {
             Some(origin) => {
                 send_direct_if_selected_with_origin(
                     packet,
@@ -1205,7 +1205,7 @@ async fn send_encrypted_packet_once_with_origin(
                     &selection,
                     udp_local_endpoint,
                     sampled,
-                    Some(origin.udp()),
+                    Some(origin),
                 )
                 .await
             }
@@ -1374,7 +1374,7 @@ async fn send_original_relay_with_capture(
     generation: u64,
     relay_send_started: &AtomicBool,
     sampled: Option<bool>,
-    origin: Option<&mut super::physical_attempt::PhysicalSendCapture>,
+    origin: Option<&mut super::physical_attempt::OutboundPhysicalAttempt>,
 ) -> SendOutcome {
     if packet.has_original_echo() {
         let Some(prewrite) = packet.original_echo_prewrite() else {
@@ -1382,27 +1382,50 @@ async fn send_original_relay_with_capture(
                 reason: "original echo encryption/emit source unavailable".into(),
             };
         };
-        return super::relay::send_via_relay_with_echo(
-            relay,
-            packet,
-            peers,
-            generation,
-            relay_send_started,
-            sampled,
-            prewrite,
-        )
-        .await;
+        return match origin {
+            Some(owner) => {
+                super::relay::send_via_relay_with_attempt(
+                    relay,
+                    packet,
+                    peers,
+                    generation,
+                    relay_send_started,
+                    sampled,
+                    None,
+                    Some(prewrite),
+                    owner,
+                )
+                .await
+            }
+            None => {
+                super::relay::send_via_relay_with_echo(
+                    relay,
+                    packet,
+                    peers,
+                    generation,
+                    relay_send_started,
+                    sampled,
+                    prewrite,
+                )
+                .await
+            }
+        };
     }
-    match origin.and_then(|origin| origin.relay(packet)) {
-        Some(origin) => {
-            super::relay::send_via_relay_with_origin(
+    match origin {
+        Some(owner) => {
+            let capture = owner
+                .slow_capture()
+                .and_then(|storage| storage.relay(packet));
+            super::relay::send_via_relay_with_attempt(
                 relay,
                 packet,
                 peers,
                 generation,
                 relay_send_started,
                 sampled,
-                Some(origin),
+                capture,
+                None,
+                owner,
             )
             .await
         }

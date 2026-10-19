@@ -67,6 +67,7 @@ pub(super) async fn send_via_relay_with_origin(
         sampled,
         origin,
         None,
+        None,
     )
     .await
 }
@@ -90,6 +91,33 @@ pub(super) async fn send_via_relay_with_echo(
         sampled,
         None,
         Some(echo),
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn send_via_relay_with_attempt(
+    relay: &RelayTransport,
+    packet: &EncryptedPeerPacket,
+    peers: &PeerManager,
+    generation: u64,
+    relay_send_started: &AtomicBool,
+    sampled: Option<bool>,
+    origin: Option<Arc<crate::relay::RelaySendCapture>>,
+    echo: Option<Arc<crate::overlay_requests::OriginalEchoPrewrite>>,
+    attempt: &mut super::physical_attempt::OutboundPhysicalAttempt,
+) -> SendOutcome {
+    send_via_relay_qualified(
+        relay,
+        packet,
+        peers,
+        generation,
+        relay_send_started,
+        sampled,
+        origin,
+        echo,
+        Some(attempt),
     )
     .await
 }
@@ -105,6 +133,7 @@ async fn send_via_relay_qualified(
     sampled: Option<bool>,
     origin: Option<Arc<crate::relay::RelaySendCapture>>,
     echo: Option<Arc<crate::overlay_requests::OriginalEchoPrewrite>>,
+    attempt: Option<&mut super::physical_attempt::OutboundPhysicalAttempt>,
 ) -> SendOutcome {
     relay_send_started.store(true, Ordering::Release);
     debug!(
@@ -130,6 +159,11 @@ async fn send_via_relay_qualified(
         }
     };
     let relay_send_call_us = relay_send_call_started.elapsed();
+    // The real client await and its original duration sample have completed.
+    // Seal only the original captured result before profiling or policy awaits.
+    if let Some(attempt) = attempt {
+        attempt.finish(false);
+    }
     if let Some(sampled) = sampled {
         global_dataplane_profiler().record(sampled, "relay_send_call_us", relay_send_call_us);
     }

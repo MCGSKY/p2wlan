@@ -40,6 +40,175 @@ async fn admitted(
     );
     (f, transport, fixture, remote)
 }
+struct RelayPublicationProbe {
+    request: std::sync::Weak<crate::overlay_requests::CanonicalOverlayRequest>,
+    transport: WireGuardTransport,
+    recorded: Arc<std::sync::atomic::AtomicBool>,
+    emit_released: Arc<std::sync::atomic::AtomicBool>,
+    sender: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RelayPublicationProbe {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Name(bool);
+        impl tracing::field::Visit for Name {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "event" && value == "overlay_original_publication_observed" {
+                    self.0 = true;
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        let mut name = Name(false);
+        event.record(&mut name);
+        if name.0 {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.recorded.store(
+                self.request
+                    .upgrade()
+                    .is_some_and(|r| r.physical_publication.record().is_some()),
+                SeqCst,
+            );
+            self.emit_released.store(
+                self.transport
+                    .try_acquire_outbound_emit_guard(PEER)
+                    .is_some(),
+                SeqCst,
+            );
+            if let Some(sender) = self.sender.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+}
+
+async fn relay_full_before_pending_policy(path: WriterPath, cancel: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
+    let budget = Budget::new();
+    let (f, transport, mut fixture, mut remote) = admitted(path, budget).await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let (capture_tx, capture_rx) = tokio::sync::oneshot::channel();
+    let _setup = install_relay_capture_setup_for_test(&f.record, move |storage, packet| {
+        let capture = storage.relay_for_test(packet);
+        capture.after_full_for_test(move || {
+            let _ = entered_tx.send(());
+            release_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("bounded original Full barrier release");
+        });
+        let _ = capture_tx.send(capture);
+    });
+    let (recorded_tx, recorded_rx) = tokio::sync::oneshot::channel();
+    let recorded = Arc::new(AtomicBool::new(false));
+    let emit_released = Arc::new(AtomicBool::new(false));
+    let subscriber = tracing_subscriber::registry().with(RelayPublicationProbe {
+        request: Arc::downgrade(&f.record),
+        transport: transport.clone(),
+        recorded: recorded.clone(),
+        emit_released: emit_released.clone(),
+        sender: std::sync::Mutex::new(Some(recorded_tx)),
+    });
+    let udps = RwLock::new(None);
+    let relays = RwLock::new(Some(fixture.transport().clone()));
+    let initial_clients = fixture.client_count();
+    let mut send = Box::pin(
+        encrypt_then_send_with_deadline(
+            f.delivery.clone(),
+            &transport,
+            &f.peers,
+            f.record.generation,
+            false,
+            &udps,
+            &relays,
+            true,
+            Some(Instant::now() + Duration::from_secs(1)),
+            None,
+        )
+        .with_subscriber(subscriber),
+    );
+    assert!(
+        budget
+            .step(poll_fn(|cx| Poll::Ready(matches!(
+                send.as_mut().poll(cx),
+                Poll::Pending
+            ))))
+            .await
+    );
+    budget.step(entered_rx).await.unwrap();
+    let capture = budget.step(capture_rx).await.unwrap();
+    assert!(capture.branches().unwrap()[0].original().is_some());
+    let held = budget
+        .step(f.peers.hold_connections_writer_for_test())
+        .await;
+    release_tx.send(()).unwrap();
+    tokio::select! {
+        observed = budget.step(recorded_rx) => observed.unwrap(),
+        _ = &mut send => panic!("post-send policy must still wait for its original connection writer"),
+    }
+    assert!(recorded.load(SeqCst) && emit_released.load(SeqCst));
+    assert!(f.peers.network_epoch_gate().try_lock_owned().is_ok());
+    assert!(relays.try_write().is_ok());
+    let record = f.record.physical_publication.record().unwrap();
+    let pointer = record as *const _;
+    let observed = f
+        .record
+        .physical_publication
+        .recorded_observed_at()
+        .unwrap();
+    assert!(record.relay().unwrap().original().unwrap().completed_at() <= observed);
+    assert_eq!(record.attempt_id(), 1);
+    assert_eq!(
+        record.qualify(&f.record, Instant::now()),
+        PhysicalInputQualification::UnknownRelayPublication
+    );
+    if cancel {
+        drop(send);
+        drop(held);
+    } else {
+        drop(held);
+        assert!(matches!(budget.step(send).await, EncryptSendOutcome::Sent));
+    }
+    assert_eq!(
+        pointer,
+        f.record.physical_publication.record().unwrap() as *const _
+    );
+    assert_eq!(
+        f.record.physical_publication.state(),
+        PhysicalPublicationState::Recorded
+    );
+    let frame = fixture.next_frame(budget).await;
+    let bytes = frame.parse_forward_payload().unwrap().1;
+    assert_eq!(crate::transport::wire_counter(bytes), Some(0));
+    assert_eq!(
+        remote.decrypt_from_bytes(bytes).unwrap(),
+        f.record.original_packet()
+    );
+    assert_eq!(fixture.client_count(), initial_clients);
+    assert_eq!(Arc::strong_count(&f.record), 1);
+    assert!(transport.try_acquire_outbound_emit_guard(PEER).is_some());
+    drop(relays);
+    fixture.finish(budget).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_full_publication_precedes_pending_policy_general() {
+    relay_full_before_pending_policy(WriterPath::General, false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_full_publication_precedes_pending_policy_legacy() {
+    relay_full_before_pending_policy(WriterPath::LegacyAddress, false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_full_publication_precedes_pending_policy_cancel_general() {
+    relay_full_before_pending_policy(WriterPath::General, true).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_full_publication_precedes_pending_policy_cancel_legacy() {
+    relay_full_before_pending_policy(WriterPath::LegacyAddress, true).await;
+}
+
 async fn actual_slow(path: WriterPath) {
     let budget = Budget::new();
     let (f, transport, mut fixture, mut remote) = admitted(path, budget).await;
