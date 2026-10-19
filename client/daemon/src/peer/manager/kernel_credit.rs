@@ -59,7 +59,10 @@ impl PeerManager {
             Err(reason) => return reason.into(),
         };
         *owner_check = "emit_registry";
-        let _emit = match owners.wireguard.try_emit_guard(request.peer()) {
+        let _emit = match owners
+            .wireguard
+            .try_emit_guard(request.peer(), request.emit_try_context())
+        {
             Ok(guard) => guard,
             Err(crate::transport::OriginalKernelEmitFailure::Registry) => {
                 return Contended(CreditLock::Emit)

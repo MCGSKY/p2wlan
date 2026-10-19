@@ -138,6 +138,13 @@ fn unknown() -> Outcome {
 }
 
 impl OriginalKernelExchange {
+    pub(crate) fn emit_try_context(&self) -> Option<crate::transport::EmitTryContext> {
+        self.scope
+            .upgrade()?
+            .emit_trace
+            .context(self.epoch_try_context()?)
+    }
+
     pub(crate) fn epoch_try_context(&self) -> Option<crate::peer::EpochTryContext> {
         let scope = self.scope.upgrade()?;
         let key = self.plan.requests.get(self.slot)?;

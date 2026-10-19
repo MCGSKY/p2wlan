@@ -26,7 +26,7 @@ use p2pnet_tun::{Ipv4Packet, Protocol};
 
 use p2pnet_wireguard::{MessageTransport, TransportSession, WireGuardError};
 
-use tokio::sync::{mpsc, watch, Mutex, OwnedMutexGuard, RwLock};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
 
 use tracing::{debug, info, warn};
 
@@ -468,7 +468,7 @@ impl WireGuardTransport {
 }
 
 enum CurrentSessionEvidenceGuardOutcome {
-    Current(OwnedMutexGuard<()>),
+    Current(OwnedEmitGuard),
     Contended,
     Stale,
 }
@@ -547,7 +547,7 @@ pub struct WireGuardTransport {
     /// encryption, while the emit lock is held only from counter allocation
     /// through the actual transport handoff.
     outbound_ingress_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
-    outbound_emit_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+    outbound_emit_locks: Arc<emit_gate::EmitRegistry>,
     promoted_responder_tokens:
         Arc<std::sync::Mutex<HashMap<String, VecDeque<PromotedResponderToken>>>>,
     hedge_replay_counters: Arc<std::sync::Mutex<HashMap<String, HedgeReplayCounter>>>,
@@ -623,9 +623,13 @@ mod direct_validation;
 mod dplpmtud;
 mod inbound;
 pub(crate) use inbound::OriginalOverlayIngressSource;
+mod emit_gate;
 mod relay_control;
 #[cfg(test)]
 mod resource_queue_test_gate;
+pub(crate) use emit_gate::OwnedEmitGuard;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) use emit_gate::{EmitRefusalSnapshot, EmitTrace, EmitTryContext};
 mod sessions;
 #[cfg(test)]
 pub(crate) use resource_queue_test_gate::ResourceQueueTestGate;

@@ -176,7 +176,7 @@ impl WireGuardTransport {
     pub(crate) async fn encrypt_outbound_with_guard(
         &self,
         packet: OutboundPacket,
-    ) -> Result<Option<(EncryptedPeerPacket, Arc<OwnedMutexGuard<()>>)>> {
+    ) -> Result<Option<(EncryptedPeerPacket, Arc<OwnedEmitGuard>)>> {
         let peer_id = packet.peer_id.clone();
         let emit_guard = Arc::new(self.acquire_outbound_emit_guard(&peer_id).await);
         let Some(encrypted) = self.encrypt_outbound_with_emit_guard(packet).await? else {
@@ -190,18 +190,26 @@ impl WireGuardTransport {
     /// transaction (for example the network-generation gate) acquire it
     /// first, so every production path uses the lock order
     /// `emit -> epoch -> sessions`.
-    pub(crate) async fn acquire_outbound_emit_guard(&self, peer_id: &str) -> OwnedMutexGuard<()> {
-        self.outbound_emit_lock(peer_id).await.lock_owned().await
+    #[track_caller]
+    pub(crate) fn acquire_outbound_emit_guard<'a>(
+        &'a self,
+        peer_id: &'a str,
+    ) -> impl Future<Output = OwnedEmitGuard> + 'a {
+        let site = emit_gate::caller_site();
+        async move {
+            self.outbound_emit_lock(peer_id)
+                .await
+                .lock_owned_at(site)
+                .await
+        }
     }
 
     /// Try to enter the per-peer counter-ordering boundary without waiting
     /// behind either the lock registry or business/control emission. Any
     /// contention is reported to the caller so it can retain exact work in
     /// its bounded ledger.
-    pub(crate) fn try_acquire_outbound_emit_guard(
-        &self,
-        peer_id: &str,
-    ) -> Option<OwnedMutexGuard<()>> {
+    #[track_caller]
+    pub(crate) fn try_acquire_outbound_emit_guard(&self, peer_id: &str) -> Option<OwnedEmitGuard> {
         self.try_outbound_emit_lock(peer_id)?.try_lock_owned().ok()
     }
 
@@ -393,7 +401,10 @@ impl WireGuardTransport {
         }
     }
 
-    pub(in crate::transport) async fn outbound_emit_lock(&self, peer_id: &str) -> Arc<Mutex<()>> {
+    pub(in crate::transport) async fn outbound_emit_lock(
+        &self,
+        peer_id: &str,
+    ) -> Arc<emit_gate::EmitGate> {
         let mut locks = self.outbound_emit_locks.lock().await;
         if let Some(lock) = locks.get(peer_id).and_then(Weak::upgrade) {
             return lock;
@@ -404,7 +415,7 @@ impl WireGuardTransport {
         // cannot grow the registry without adding O(peer_count) work to every
         // ordinary packet on an already-active peer.
         locks.retain(|_, lock| lock.strong_count() > 0);
-        let lock = Arc::new(Mutex::new(()));
+        let lock = Arc::new(emit_gate::EmitGate::new(&self.outbound_emit_locks));
         locks.insert(peer_id.to_string(), Arc::downgrade(&lock));
         lock
     }
@@ -412,21 +423,21 @@ impl WireGuardTransport {
     pub(in crate::transport) fn try_outbound_emit_lock(
         &self,
         peer_id: &str,
-    ) -> Option<Arc<Mutex<()>>> {
+    ) -> Option<Arc<emit_gate::EmitGate>> {
         Self::try_outbound_emit_lock_in(&self.outbound_emit_locks, peer_id)
     }
 
     pub(in crate::transport) fn try_outbound_emit_lock_in(
-        registry: &Mutex<HashMap<String, Weak<Mutex<()>>>>,
+        registry: &Arc<emit_gate::EmitRegistry>,
         peer_id: &str,
-    ) -> Option<Arc<Mutex<()>>> {
+    ) -> Option<Arc<emit_gate::EmitGate>> {
         let mut locks = registry.try_lock().ok()?;
         if let Some(lock) = locks.get(peer_id).and_then(Weak::upgrade) {
             return Some(lock);
         }
 
         locks.retain(|_, lock| lock.strong_count() > 0);
-        let lock = Arc::new(Mutex::new(()));
+        let lock = Arc::new(emit_gate::EmitGate::new(registry));
         locks.insert(peer_id.to_string(), Arc::downgrade(&lock));
         Some(lock)
     }

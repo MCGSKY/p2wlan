@@ -4,7 +4,7 @@ use super::*;
 fn metadata_owner() -> OriginalKernelTransportCurrent {
     OriginalKernelTransportCurrent {
         sessions: Arc::new(Mutex::new(HashMap::new())),
-        emit: Arc::new(Mutex::new(HashMap::new())),
+        emit: Arc::new(EmitRegistry::new()),
     }
 }
 
@@ -13,13 +13,13 @@ fn original_kernel_emit_registry_contention_is_distinct_from_peer_emit_contentio
     let owner = metadata_owner();
     let held = owner.emit.try_lock().unwrap();
     assert!(matches!(
-        owner.try_emit_guard("peer"),
+        owner.try_emit_guard("peer", None),
         Err(OriginalKernelEmitFailure::Registry)
     ));
     drop(held);
-    let emit = owner.try_emit_guard("peer").unwrap();
+    let emit = owner.try_emit_guard("peer", None).unwrap();
     assert!(matches!(
-        owner.try_emit_guard("peer"),
+        owner.try_emit_guard("peer", None),
         Err(OriginalKernelEmitFailure::Emit)
     ));
     drop(emit);
@@ -28,12 +28,12 @@ fn original_kernel_emit_registry_contention_is_distinct_from_peer_emit_contentio
 #[test]
 fn original_kernel_idle_emit_registry_uses_the_actual_new_lock_incarnation() {
     let owner = metadata_owner();
-    let emit = owner.try_emit_guard("peer").unwrap();
+    let emit = owner.try_emit_guard("peer", None).unwrap();
     let first = owner.emit.try_lock().unwrap()["peer"].clone();
     assert!(first.upgrade().is_some());
     drop(emit);
     assert!(first.upgrade().is_none());
-    let next = owner.try_emit_guard("peer").unwrap();
+    let next = owner.try_emit_guard("peer", None).unwrap();
     let second = owner.emit.try_lock().unwrap()["peer"].clone();
     assert!(!first.ptr_eq(&second));
     assert!(second.upgrade().is_some());

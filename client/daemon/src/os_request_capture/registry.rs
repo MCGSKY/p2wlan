@@ -68,6 +68,8 @@ pub(crate) struct CaptureSession {
     native_terminal_revision: AtomicU64,
     #[cfg(any(target_os = "linux", all(unix, test)))]
     epoch_trace: crate::peer::EpochTraceLease,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    emit_trace: Arc<crate::transport::EmitTrace>,
     expires: Instant,
     peers: Weak<PeerManager>,
     #[cfg(unix)]
@@ -182,6 +184,9 @@ pub(super) struct ReadSnapshot {
     #[cfg(any(target_os = "linux", all(unix, test)))]
     #[serde(skip_serializing_if = "Option::is_none")]
     original_read_peer_epoch_refusal: Option<crate::peer::EpochRefusalSnapshot>,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_kernel_emit_refusal: Option<crate::transport::EmitRefusalSnapshot>,
 }
 #[cfg(unix)]
 #[derive(Serialize)]
@@ -256,6 +261,7 @@ impl CaptureSession {
                 plan.capture_id,
                 expires,
             ),
+            emit_trace: crate::transport::EmitTrace::new(owner, plan.capture_id, expires),
             expires,
             peers: Arc::downgrade(peers),
             capture_id: plan.capture_id,
@@ -391,6 +397,8 @@ impl CaptureSession {
         self.active.store(false, Ordering::Release);
         #[cfg(any(target_os = "linux", all(unix, test)))]
         self.epoch_trace.deactivate();
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        self.emit_trace.deactivate();
     }
 
     pub(super) fn bind_system_device(&self, device: &Arc<DeviceLease>) -> bool {
@@ -759,6 +767,8 @@ impl CaptureSession {
             original_kernel_epoch_refusal: self.epoch_trace.snapshot(),
             #[cfg(any(target_os = "linux", all(unix, test)))]
             original_read_peer_epoch_refusal: self.epoch_trace.read_peer_snapshot(),
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            original_kernel_emit_refusal: self.emit_trace.snapshot(),
         })
     }
 }

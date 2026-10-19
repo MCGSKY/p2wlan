@@ -5,7 +5,7 @@ use super::*;
 /// timeout in post-commit bookkeeping so the caller can finish its owner.
 struct DirectValidationAckCommitHooks<'a> {
     pair: Option<&'a mut (dyn crate::peer::DirectCommitHooks + Send)>,
-    session_guard: &'a mut Option<OwnedMutexGuard<()>>,
+    session_guard: &'a mut Option<OwnedEmitGuard>,
     committed: &'a mut bool,
 }
 
@@ -58,7 +58,7 @@ impl WireGuardTransport {
         socket_index: Option<usize>,
         direct_socket: Option<Arc<tokio::net::UdpSocket>>,
         peer_session_generation: PeerSessionGeneration,
-        mut session_guard: Option<OwnedMutexGuard<()>>,
+        mut session_guard: Option<OwnedEmitGuard>,
         token: crate::transport::DirectValidationToken,
     ) {
         if token.kind == DirectValidationKind::Request {

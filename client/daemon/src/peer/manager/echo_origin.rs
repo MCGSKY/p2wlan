@@ -46,7 +46,7 @@ impl OriginalEchoPeerReadGuard<'_> {
 pub(crate) struct OriginalEchoPeerWriteGuard<'a> {
     pub(crate) current: OriginalEchoPeerReadGuard<'a>,
     _owner: Arc<PeerManager>,
-    _emit: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    _emit: Arc<crate::transport::OwnedEmitGuard>,
     _epoch: OwnedNetworkEpochGuard,
 }
 
@@ -248,7 +248,7 @@ impl PeerManager {
         self: &Arc<Self>,
         input: &OriginalEchoInput,
         tx: &'a crate::transport::OriginalEncryptionSource,
-        emit: &std::sync::Weak<tokio::sync::OwnedMutexGuard<()>>,
+        emit: &std::sync::Weak<crate::transport::OwnedEmitGuard>,
     ) -> std::result::Result<OriginalEchoPeerWriteGuard<'a>, OverlayCreditOutcome> {
         use OverlayCreditOutcome::{Contended, Stale};
         if !input.owner().ptr_eq(&Arc::downgrade(self)) {
