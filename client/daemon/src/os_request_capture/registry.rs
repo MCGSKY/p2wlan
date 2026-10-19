@@ -173,6 +173,9 @@ pub(super) struct ReadSnapshot {
     retained_original_reads: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     original_input_registry_refusal: Option<control_lock::InputRefusalSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_authenticated_input_registry_refusal:
+        Option<control_lock::AuthenticatedRefusalSnapshot>,
     #[cfg(any(target_os = "linux", all(unix, test)))]
     #[serde(skip_serializing_if = "Option::is_none")]
     original_kernel_epoch_refusal: Option<crate::peer::EpochRefusalSnapshot>,
@@ -749,6 +752,9 @@ impl CaptureSession {
             first_original_inbound_loss: self.inbound_loss.snapshot(),
             retained_original_reads: state.read_history.len(),
             original_input_registry_refusal: self.state.input_refusal_snapshot(),
+            original_authenticated_input_registry_refusal: self
+                .state
+                .authenticated_refusal_snapshot(),
             #[cfg(any(target_os = "linux", all(unix, test)))]
             original_kernel_epoch_refusal: self.epoch_trace.snapshot(),
             #[cfg(any(target_os = "linux", all(unix, test)))]

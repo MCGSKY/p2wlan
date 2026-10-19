@@ -306,6 +306,21 @@ async fn contended_original_ingress_cannot_rearm_on_duplicate_after_room_renewal
     assert_eq!(loss["native_os_write_verified"], false);
     assert_eq!(loss["physical_send_verified"], false);
     assert_eq!(loss["canonical_current_owner_verified"], false);
+    let refusal = &snapshot["original_authenticated_input_registry_refusal"];
+    assert_eq!(
+        refusal["scope"],
+        "actual_authenticated_input_registry_try_lock_refusal_only"
+    );
+    assert!(refusal.get("read_ordinal").is_none());
+    assert_eq!(refusal["holder"]["release_completion_observed"], true);
+    for key in [
+        "native_os_write_verified",
+        "physical_send_verified",
+        "canonical_current_owner_verified",
+    ] {
+        assert_eq!(refusal[key], false);
+    }
+    assert!(snapshot.get("original_input_registry_refusal").is_none());
 }
 
 impl Drop for Harness {

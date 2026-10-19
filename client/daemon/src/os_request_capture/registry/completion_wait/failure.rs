@@ -54,6 +54,8 @@ pub(in crate::os_request_capture::registry) struct FailureMetadata {
     first_original_full_retention_loss: Option<FullRetentionLossReason>,
     first_original_inbound_loss: Option<super::super::inbound_loss::InboundLossSnapshot>,
     original_input_registry_refusal: Option<control_lock::InputRefusalSnapshot>,
+    original_authenticated_input_registry_refusal:
+        Option<control_lock::AuthenticatedRefusalSnapshot>,
     original_kernel_epoch_refusal: Option<crate::peer::EpochRefusalSnapshot>,
     original_read_peer_epoch_refusal: Option<crate::peer::EpochRefusalSnapshot>,
     observations_are_sequential_not_atomic: bool,
@@ -125,6 +127,9 @@ impl CaptureSession {
             first_original_full_retention_loss: self.full_loss.snapshot(),
             first_original_inbound_loss: self.inbound_loss.snapshot(),
             original_input_registry_refusal: self.state.input_refusal_snapshot(),
+            original_authenticated_input_registry_refusal: self
+                .state
+                .authenticated_refusal_snapshot(),
             original_kernel_epoch_refusal: self.epoch_trace.snapshot(),
             original_read_peer_epoch_refusal: self.epoch_trace.read_peer_snapshot(),
             observations_are_sequential_not_atomic: true,

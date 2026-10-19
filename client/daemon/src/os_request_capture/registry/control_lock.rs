@@ -9,7 +9,12 @@ use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError, TryLockResult};
 use tokio::sync::Notify;
 
 mod refusal;
-pub(super) use refusal::InputRefusalSnapshot;
+pub(super) use refusal::{AuthenticatedRefusalSnapshot, InputRefusalSnapshot};
+
+enum ObservedTry {
+    KernelInput(u64),
+    AuthenticatedInput,
+}
 
 pub(super) struct ControlState<T> {
     inner: Mutex<T>,
@@ -63,22 +68,43 @@ impl<T> ControlState<T> {
 
     #[track_caller]
     pub(super) fn try_input_lock(&self, read_ordinal: u64) -> TryLockResult<StateGuard<'_, T>> {
-        self.try_lock_at(refusal::Site::caller(), Some(read_ordinal))
+        self.try_lock_at(
+            refusal::Site::caller(),
+            Some(ObservedTry::KernelInput(read_ordinal)),
+        )
+    }
+
+    #[track_caller]
+    pub(super) fn try_authenticated_lock(&self) -> TryLockResult<StateGuard<'_, T>> {
+        self.try_lock_at(
+            refusal::Site::caller(),
+            Some(ObservedTry::AuthenticatedInput),
+        )
     }
 
     fn try_lock_at(
         &self,
         site: refusal::Site,
-        input: Option<u64>,
+        input: Option<ObservedTry>,
     ) -> TryLockResult<StateGuard<'_, T>> {
-        let started = input.and_then(|_| crate::os_request_capture::clock::monotonic_ns());
+        let started = input
+            .as_ref()
+            .and_then(|_| crate::os_request_capture::clock::monotonic_ns());
         let result = self.inner.try_lock();
-        let returned = input.and_then(|_| crate::os_request_capture::clock::monotonic_ns());
+        let returned = input
+            .as_ref()
+            .and_then(|_| crate::os_request_capture::clock::monotonic_ns());
         match result {
             Ok(guard) => Ok(self.wrap(guard, site)),
             Err(TryLockError::WouldBlock) => {
-                if let Some(read) = input {
-                    self.refusals.refused(read, started, returned);
+                match input {
+                    Some(ObservedTry::KernelInput(read)) => {
+                        self.refusals.refused(read, started, returned)
+                    }
+                    Some(ObservedTry::AuthenticatedInput) => {
+                        self.refusals.authenticated_refused(started, returned)
+                    }
+                    None => {}
                 }
                 Err(TryLockError::WouldBlock)
             }
@@ -90,6 +116,10 @@ impl<T> ControlState<T> {
 
     pub(super) fn input_refusal_snapshot(&self) -> Option<InputRefusalSnapshot> {
         self.refusals.snapshot()
+    }
+
+    pub(super) fn authenticated_refusal_snapshot(&self) -> Option<AuthenticatedRefusalSnapshot> {
+        self.refusals.authenticated_snapshot()
     }
 
     #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -109,36 +139,42 @@ impl<T> ControlState<T> {
 
     /// At most one control waiter; no packet worker enters this path. The
     /// deadline belongs to the original command/window, never a new timeout.
-    pub(super) async fn lock_until(
+    /// Capture its actual call site synchronously, before polling the unchanged
+    /// wait future; tracking a caller on an async fn would lose that site.
+    #[track_caller]
+    pub(super) fn lock_until(
         &self,
         end: tokio::time::Instant,
-    ) -> Result<StateGuard<'_, T>, CaptureFailure> {
-        self.waiting
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| CaptureFailure::Contended)?;
-        let _waiter = Waiter(&self.waiting);
-        loop {
-            if tokio::time::Instant::now() >= end {
-                return Err(CaptureFailure::ControlNotReady);
-            }
-            let changed = self.changed.notified();
-            tokio::pin!(changed);
-            // Subscribe before trying, so release between try and await is
-            // retained. Poison remains terminal instead of being waited out.
-            changed.as_mut().enable();
-            match self.try_lock() {
-                Ok(guard) => {
-                    if tokio::time::Instant::now() >= end {
-                        return Err(CaptureFailure::ControlNotReady);
-                    }
-                    return Ok(guard);
+    ) -> impl std::future::Future<Output = Result<StateGuard<'_, T>, CaptureFailure>> {
+        let site = refusal::Site::caller();
+        async move {
+            self.waiting
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| CaptureFailure::Contended)?;
+            let _waiter = Waiter(&self.waiting);
+            loop {
+                if tokio::time::Instant::now() >= end {
+                    return Err(CaptureFailure::ControlNotReady);
                 }
-                Err(TryLockError::Poisoned(_)) => return Err(CaptureFailure::Contended),
-                Err(TryLockError::WouldBlock) => {}
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                // Subscribe before trying, so release between try and await is
+                // retained. Poison remains terminal instead of being waited out.
+                changed.as_mut().enable();
+                match self.try_lock_at(site, None) {
+                    Ok(guard) => {
+                        if tokio::time::Instant::now() >= end {
+                            return Err(CaptureFailure::ControlNotReady);
+                        }
+                        return Ok(guard);
+                    }
+                    Err(TryLockError::Poisoned(_)) => return Err(CaptureFailure::Contended),
+                    Err(TryLockError::WouldBlock) => {}
+                }
+                tokio::time::timeout_at(end, changed)
+                    .await
+                    .map_err(|_| CaptureFailure::ControlNotReady)?;
             }
-            tokio::time::timeout_at(end, changed)
-                .await
-                .map_err(|_| CaptureFailure::ControlNotReady)?;
         }
     }
 }

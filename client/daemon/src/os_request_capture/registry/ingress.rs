@@ -249,6 +249,12 @@ impl KernelCaptureRuntime {
         {
             return Ok(None);
         }
+        #[cfg(unix)]
+        let mut state = scope
+            .state
+            .try_authenticated_lock()
+            .map_err(|_| CaptureFailure::Contended)?;
+        #[cfg(not(unix))]
         let mut state = scope
             .state
             .try_lock()
