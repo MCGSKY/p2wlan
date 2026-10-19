@@ -139,5 +139,104 @@ class ActualStreamControls(unittest.TestCase):
                 self.exchange(raw, close=close)
 
 
+@unittest.skipUnless(hasattr(socket, "AF_UNIX"), "actual Unix control sockets required")
+class ActualSnapshotPairControls(unittest.TestCase):
+    """Actual socket replies containing labels only, with no native fact rows."""
+
+    def collect(self, *, invalid_first=False):
+        original = SimpleNamespace(boot_id="metadata-only", pid=1, parent_pid=2,
+                                   uid=3, start_ticks=4, net_namespace="metadata-only")
+        clock = dict(clock_name="CLOCK_MONOTONIC", boot_id=original.boot_id,
+                     process_id=original.pid, parent_pid=original.parent_pid,
+                     uid=original.uid, start_ticks=original.start_ticks,
+                     net_namespace=original.net_namespace)
+        value = dict(schema_version=2, capture_id="a" * 32, owner=1,
+                     scope="registered_native_frame_capture", active=True,
+                     producer_scope="b" * 32, registration_revision=0,
+                     observed_monotonic_ns=1, requests=[], clock_scope=clock,
+                     daemon_registration_verified=False, physical_send_verified=False,
+                     canonical_current_owner_verified=False)
+        endpoints, workers, requests, errors = [], [], [], []
+
+        def serve(peer, response):
+            try:
+                peer.settimeout(2)
+                data = bytearray()
+                while b"\n" not in data:
+                    block = peer.recv(4096)
+                    if not block:
+                        return
+                    data.extend(block)
+                requests.append(json.loads(data))
+                peer.sendall(kernel.encode(response))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                peer.close()
+
+        for index in range(2):
+            parent, peer = socket.socketpair()
+            endpoint = kernel.Endpoint(parent, None, original, "a" * 32, "b" * 32)
+            endpoints.append(endpoint)
+            response = copy.deepcopy(value)
+            response["incoming_provenance_complete"] = index == 1
+            if invalid_first and index == 0:
+                response["clock_scope"]["start_ticks"] += 1
+            worker = threading.Thread(target=serve, args=(peer, response))
+            worker.start()
+            workers.append(worker)
+        deadline = time.monotonic() + 1
+        try:
+            if invalid_first:
+                with self.assertRaises(kernel.CaptureError) as caught:
+                    kernel.snapshot_pair(endpoints, deadline=deadline)
+                self.assertEqual(caught.exception.code, "kernel_original_daemon_birth_namespace_clock_mismatch")
+            else:
+                snapshots = kernel.snapshot_pair(endpoints, deadline=deadline)
+                self.assertFalse(snapshots[0]["incoming_provenance_complete"])
+                self.assertTrue(snapshots[1]["incoming_provenance_complete"])
+                self.assertTrue(all(not s["requests"] and not s["canonical_current_owner_verified"]
+                                    and not s["physical_send_verified"] for s in snapshots))
+            self.assertEqual([len(endpoint.raw_snapshots) for endpoint in endpoints], [1, 1])
+        finally:
+            for endpoint in endpoints:
+                endpoint.close()
+            for worker in workers:
+                worker.join(timeout=3)
+                self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(all(request["op"] == "snapshot" and
+                            request["original_deadline_ns"] <= int(deadline * 1_000_000_000)
+                            for request in requests))
+
+    def test_first_provenance_gap_retains_both_replies_without_native_credit(self):
+        self.collect()
+
+    def test_first_birth_failure_keeps_original_error_and_second_raw_reply(self):
+        self.collect(invalid_first=True)
+
+    def test_expired_shared_deadline_sends_neither_endpoint_and_never_retries(self):
+        endpoints, peers = [], []
+        for _ in range(2):
+            parent, peer = socket.socketpair()
+            endpoints.append(kernel.Endpoint(parent, None, None, "a" * 32, "b" * 32))
+            peers.append(peer)
+        try:
+            with self.assertRaises(kernel.CaptureError) as caught:
+                kernel.snapshot_pair(endpoints, deadline=time.monotonic() - 1)
+            self.assertEqual(caught.exception.code, "kernel_control_original_deadline")
+            self.assertTrue(all(e.output_bytes == 0 and not e.raw_snapshots for e in endpoints))
+            for peer in peers:
+                peer.setblocking(False)
+                with self.assertRaises(BlockingIOError):
+                    peer.recv(1)
+        finally:
+            for endpoint in endpoints:
+                endpoint.close()
+            for peer in peers:
+                peer.close()
+
+
 if __name__ == "__main__":
     unittest.main()

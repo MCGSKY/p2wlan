@@ -173,6 +173,20 @@ class Endpoint:
             connection.close()
 
 
+def snapshot_pair(endpoints, *, deadline=None):
+    """Retain both original replies before validating either endpoint's facts."""
+    require(len(endpoints) == MAX_ENDPOINTS, "original_kernel_endpoint_count")
+    values, first_error = [], None
+    for endpoint in endpoints:
+        try:
+            values.append(endpoint.snapshot(deadline=deadline))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            first_error = first_error if first_error is not None else error
+    if first_error is not None:
+        raise first_error
+    return values
+
+
 def read_pair(request, response, write):
     """Historical byte/time comparison, supplied only after owned collection.
 
@@ -280,8 +294,8 @@ class KernelCaptures:
             pairs, native_pairs = [], []
             app = record["entry"].get("records")
             require(isinstance(app, list) and len(app) == 8, "original_kernel_original_application_records_missing")
-            for endpoint, kind in zip(record["endpoints"], ["request", "response"]):
-                snapshot = endpoint.snapshot(deadline=deadline)
+            snapshots = snapshot_pair(record["endpoints"], deadline=deadline)
+            for snapshot, kind in zip(snapshots, ["request", "response"]):
                 rows = [r for r in snapshot["requests"] if r.get("producer_scope") == capture.prepared.producer_scope]
                 require(len(rows) == 8 and {r.get("sequence") for r in rows} == set(range(8)), "original_kernel_eight_slots_missing")
                 rows.sort(key=lambda r: r["sequence"])
