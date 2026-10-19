@@ -189,6 +189,120 @@ fn original_frame_spans_keep_udp_slots_distinct_and_bound_tcp_bitmap() {
     assert!(FrameSpanCoverage::new(&oversized, 0).is_none());
 }
 
+// Independent byte membership oracle: this never constructs a read or a Full.
+fn compare_span_with_byte_membership(
+    coverage: &mut FrameSpanCoverage,
+    bytes: &mut [bool],
+    span: ReadFrameSpan,
+) {
+    let start = usize::from(span.start);
+    let end = usize::from(span.end);
+    let expected = if span.slot != coverage.slot {
+        Ok(false)
+    } else if start >= end || end > bytes.len() {
+        Err(CaptureFailure::InvalidPlan)
+    } else {
+        let changed = bytes[start..end].iter().any(|covered| !covered);
+        bytes[start..end].fill(true);
+        Ok(changed)
+    };
+    assert_eq!(coverage.add(&span), expected);
+    assert_eq!(coverage.covered, bytes.iter().filter(|b| **b).count());
+    assert_eq!(coverage.is_complete(), bytes.iter().all(|b| *b));
+    for byte in 0..coverage.seen.len() * 64 {
+        assert_eq!(
+            coverage.seen[byte / 64] & (1 << (byte % 64)) != 0,
+            bytes.get(byte).copied().unwrap_or(false)
+        );
+    }
+}
+
+fn pure_span_coverage(length: usize) -> FrameSpanCoverage {
+    assert!((1..=MAX_FRAME_WIRE_BYTES).contains(&length));
+    FrameSpanCoverage {
+        slot: 1,
+        length,
+        seen: [0; MAX_FRAME_WIRE_BYTES.div_ceil(64)],
+        covered: 0,
+    }
+}
+
+#[test]
+fn word_span_coverage_matches_byte_membership_for_original_frame_ranges() {
+    for protocol in ["udp", "tcp"] {
+        let empty = FrameSpanCoverage::new(&plan(protocol, 2), 1).unwrap();
+        for start in 0..empty.length {
+            for end in start + 1..=empty.length {
+                let mut coverage = empty.clone();
+                let mut bytes = vec![false; coverage.length];
+                compare_span_with_byte_membership(
+                    &mut coverage,
+                    &mut bytes,
+                    ReadFrameSpan::new(1, start as u16, end as u16),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn word_span_coverage_matches_byte_membership_at_all_maximum_frame_word_edges() {
+    for start in 0..MAX_FRAME_WIRE_BYTES {
+        for end in (64..MAX_FRAME_WIRE_BYTES)
+            .step_by(64)
+            .flat_map(|edge| [edge - 1, edge, edge + 1])
+            .chain([MAX_FRAME_WIRE_BYTES])
+            .filter(|end| *end > start)
+        {
+            let mut coverage = pure_span_coverage(MAX_FRAME_WIRE_BYTES);
+            let mut bytes = vec![false; MAX_FRAME_WIRE_BYTES];
+            compare_span_with_byte_membership(
+                &mut coverage,
+                &mut bytes,
+                ReadFrameSpan::new(1, start as u16, end as u16),
+            );
+        }
+    }
+}
+
+#[test]
+fn word_span_coverage_preserves_overlaps_duplicates_invalid_and_other_slot_order() {
+    for length in [1, 63, 64, 65, 127, 128, 129, 195, MAX_FRAME_WIRE_BYTES] {
+        let mut coverage = pure_span_coverage(length);
+        let mut bytes = vec![false; length];
+        for start in (0..length).rev().step_by(3) {
+            let end = (start + 67).min(length);
+            for slot in [0, 1, 1, 2] {
+                compare_span_with_byte_membership(
+                    &mut coverage,
+                    &mut bytes,
+                    ReadFrameSpan::new(slot, start as u16, end as u16),
+                );
+            }
+        }
+        for slot in [1, 0, 2] {
+            for (start, end) in [(0, 0), (1, 0), (length, length + 1), (0, length + 1)] {
+                compare_span_with_byte_membership(
+                    &mut coverage,
+                    &mut bytes,
+                    ReadFrameSpan::new(slot, start as u16, end as u16),
+                );
+            }
+        }
+        compare_span_with_byte_membership(
+            &mut coverage,
+            &mut bytes,
+            ReadFrameSpan::new(1, 0, length as u16),
+        );
+        compare_span_with_byte_membership(
+            &mut coverage,
+            &mut bytes,
+            ReadFrameSpan::new(1, 0, length as u16),
+        );
+        assert!(coverage.is_complete());
+    }
+}
+
 #[tokio::test]
 async fn full_loss_diagnostic_keeps_first_site_without_restoring_credit() {
     let (setup, _parent) = descriptor_scope().await;

@@ -115,12 +115,19 @@ impl FrameSpanCoverage {
             return Err(CaptureFailure::InvalidPlan);
         }
         let before = self.covered;
-        for byte in start..end {
-            let bit = 1 << (byte % 64);
-            if self.seen[byte / 64] & bit == 0 {
-                self.seen[byte / 64] |= bit;
-                self.covered += 1;
-            }
+        let first_word = start / 64;
+        let last_word = (end - 1) / 64;
+        for word in first_word..=last_word {
+            let low = if word == first_word { start % 64 } else { 0 };
+            let high = if word == last_word {
+                (end - 1) % 64 + 1
+            } else {
+                64
+            };
+            let mask = (u64::MAX << low) & (u64::MAX >> (64 - high));
+            let fresh = mask & !self.seen[word];
+            self.seen[word] |= mask;
+            self.covered += fresh.count_ones() as usize;
         }
         Ok(self.covered != before)
     }
