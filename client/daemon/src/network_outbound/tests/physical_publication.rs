@@ -168,6 +168,102 @@ async fn preparation_udp_slot_wait_rechecks_generation_before_counter() {
     preparation_slot_wait_control(false, true).await;
 }
 
+async fn assert_preparation_counter_unallocated(
+    transport: &WireGuardTransport,
+    f: &RoutedRequestFixture,
+    remote: &mut p2pnet_wireguard::TransportSession,
+) {
+    assert_eq!(
+        f.record.physical_publication.state(),
+        PhysicalPublicationState::Idle
+    );
+    assert!(f.record.physical_publication.record().is_none());
+    let encrypted = transport
+        .encrypt_outbound(OutboundPacket {
+            peer_id: PEER.to_string(),
+            dst_ip: f.delivery.dst_ip.clone(),
+            packet: f.record.original_packet().to_vec(),
+            trace: None,
+            room_authorization: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::transport::wire_counter(&encrypted.wire_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        remote.decrypt_from_bytes(&encrypted.wire_bytes).unwrap(),
+        f.record.original_packet()
+    );
+}
+
+async fn preparation_connection_writer_control(advance_generation: bool, cancel: bool) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (f, transport, udp, receiver, mut remote) = direct_fixture(false).await;
+        let udps = RwLock::new(Some(udp));
+        let relays = RwLock::new(None);
+        let writer = f.peers.hold_connections_writer_for_test().await;
+        tokio::task::yield_now().await;
+        let mut send = Box::pin(encrypt_then_send_with_deadline(
+            f.delivery.clone(), &transport, &f.peers, f.record.generation, true,
+            &udps, &relays, false, Some(Instant::now() + Duration::from_secs(1)), None,
+        ));
+        assert!(matches!(futures_util::poll!(send.as_mut()), std::task::Poll::Pending));
+        assert!(transport.try_acquire_outbound_emit_guard(PEER).is_none());
+        assert!(f.peers.network_epoch_gate().try_lock_owned().is_ok());
+        assert_eq!(f.record.physical_publication.state(), PhysicalPublicationState::Idle);
+        let mut wire = [0u8; 2048];
+        assert!(matches!(receiver.try_recv_from(&mut wire), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        if cancel {
+            drop(send);
+            drop(writer);
+            assert!(transport.try_acquire_outbound_emit_guard(PEER).is_some());
+            assert_preparation_counter_unallocated(&transport, &f, &mut remote).await;
+        } else if advance_generation {
+            // The real lifecycle owner acquires epoch and queues behind the
+            // held writer. Preparation must yield its granted writer when it
+            // cannot reacquire epoch, letting this original update complete.
+            let mut advance = Box::pin(f.peers.advance_network_generation("connection-wait-control"));
+            assert!(matches!(futures_util::poll!(advance.as_mut()), std::task::Poll::Pending));
+            assert!(f.peers.network_epoch_gate().try_lock_owned().is_err());
+            drop(writer);
+            let (outcome, next) = tokio::join!(send, advance);
+            assert!(next > f.record.generation);
+            assert!(matches!(outcome, EncryptSendOutcome::Retryable {
+                reason_code: REASON_OUTBOUND_GENERATION_CHANGED, ..
+            }));
+            assert_preparation_counter_unallocated(&transport, &f, &mut remote).await;
+        } else {
+            drop(writer);
+            assert!(matches!(send.await, EncryptSendOutcome::Sent));
+            let (n, _) = receiver.recv_from(&mut wire).await.unwrap();
+            assert_eq!(crate::transport::wire_counter(&wire[..n]), Some(0));
+            assert_eq!(remote.decrypt_from_bytes(&wire[..n]).unwrap(), f.record.original_packet());
+            assert_eq!(f.record.physical_publication.record().unwrap().qualify(&f.record, Instant::now()), PhysicalInputQualification::UnknownUdpPublication);
+        }
+        assert!(matches!(receiver.try_recv_from(&mut wire), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        assert!(transport.try_acquire_outbound_emit_guard(PEER).is_some());
+        assert!(f.peers.network_epoch_gate().try_lock_owned().is_ok());
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn preparation_connection_writer_wait_releases_epoch_before_actual_udp() {
+    preparation_connection_writer_control(false, false).await;
+}
+
+#[tokio::test]
+async fn preparation_connection_writer_wait_rechecks_generation_before_counter() {
+    preparation_connection_writer_control(true, false).await;
+}
+
+#[tokio::test]
+async fn preparation_connection_writer_wait_cancel_releases_emit_without_counter() {
+    preparation_connection_writer_control(false, true).await;
+}
+
 struct OutboundCompletionProbe {
     transport: WireGuardTransport,
     record: Arc<crate::overlay_requests::CanonicalOverlayRequest>,

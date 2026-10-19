@@ -152,7 +152,6 @@ pub(super) async fn encrypt_then_send_with_deadline(
             // actual budget, socket and native handoff fences remain authoritative.
             let relay_available = relay_transport.read().await.is_some();
             let udp = udp_transport.read().await.clone();
-            let epoch_gate = peers.network_epoch_gate();
             let epoch_gate_wait_started = Instant::now();
             // Declare before the real guard: success, early return and future
             // cancellation release epoch before histogram locks/log callbacks.
@@ -160,7 +159,8 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 profiler,
                 sampled_trace.as_ref().is_some_and(|trace| trace.sampled),
             );
-            let _epoch_guard = epoch_gate.lock().await;
+            let (_epoch_guard, mut path_connections) =
+                peers.lock_epoch_and_connections_write().await;
             let epoch_gate_acquired = Instant::now();
             if sampled_trace.is_some() {
                 epoch_profile.waited(epoch_gate_acquired.duration_since(epoch_gate_wait_started));
@@ -168,6 +168,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Generation);
             let current_generation = peers.current_network_generation_sync();
             if current_generation != expected_generation {
+                drop(path_connections);
                 debug!(
                     event = "outbound_counter_allocation_rejected",
                     peer_id = %preparation_retry.peer_id,
@@ -186,16 +187,16 @@ pub(super) async fn encrypt_then_send_with_deadline(
             }
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Path);
             let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
-            let selection = peers
-                .select_path_for_data_with_local_endpoint_in_epoch(
-                    &preparation_retry.peer_id,
-                    prefer_direct,
-                    relay_available || relay_expected,
-                    udp_local_endpoint,
-                    current_generation,
-                    false,
-                )
-                .await;
+            let selection = peers.select_path_for_data_with_local_endpoint_in_epoch_with_conns(
+                &mut path_connections,
+                &preparation_retry.peer_id,
+                prefer_direct,
+                relay_available || relay_expected,
+                udp_local_endpoint,
+                current_generation,
+                false,
+            );
+            drop(path_connections);
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::DirectBudget);
             let mut force_relay = false;
             // A sealed Relay REQUEST echo must use its original Relay writer.
