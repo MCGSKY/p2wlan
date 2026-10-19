@@ -181,3 +181,98 @@ async fn read_peer_epoch_metadata_wrong_scope_owner_and_retirement_stay_unknown(
     assert!(setup.session.epoch_trace.snapshot().is_none());
     no_kernel_credit(&setup.session);
 }
+
+#[tokio::test]
+async fn first_capture_metadata_records_actual_epoch_try_without_creating_a_read() {
+    let (setup, _parent, peers) = setup().await;
+    let plan = setup.session.state.lock().unwrap().flows[0].plan.clone();
+    // A diagnostic label in this control, never a constructed KernelRead.
+    let context = context(&setup.session);
+    let gate = peers.network_epoch_gate();
+    let held = gate.lock().await;
+    let first = FirstReadPeer::capture(&setup.session, &plan, Some(context));
+    assert!(matches!(
+        first.original,
+        Err(OverlayCreditOutcome::Contended(
+            OverlayCreditLockSite::Epoch
+        ))
+    ));
+    let before =
+        serde_json::to_value(setup.session.epoch_trace.read_peer_snapshot().unwrap()).unwrap();
+    assert_eq!(before["original_input_read_ordinal"], 19);
+    assert!(before.get("first_read_ordinal").is_none());
+    assert_eq!(before["holder"]["release_completion_observed"], false);
+    negative(&before);
+    drop(held);
+    let after =
+        serde_json::to_value(setup.session.epoch_trace.read_peer_snapshot().unwrap()).unwrap();
+    assert_eq!(after["holder"]["release_completion_observed"], true);
+    assert_eq!(after["original_input_read_ordinal"], 19);
+    assert!(setup.session.epoch_trace.snapshot().is_none());
+    no_kernel_credit(&setup.session);
+}
+
+#[tokio::test]
+async fn first_capture_metadata_cached_positive_never_resamples_contended_epoch() {
+    let (setup, _parent, peers) = setup().await;
+    let first = collect(&setup.session);
+    assert!(first.original.is_ok());
+    let before = setup.session.gaps.load(Ordering::Acquire);
+    let gate = peers.network_epoch_gate();
+    let held = gate.lock().await;
+    let duplicate = collect(&setup.session);
+    assert!(Arc::ptr_eq(&first, &duplicate));
+    assert!(duplicate.original.is_ok());
+    assert_eq!(setup.session.gaps.load(Ordering::Acquire), before);
+    assert!(setup.session.epoch_trace.read_peer_snapshot().is_none());
+    drop(held);
+    no_kernel_credit(&setup.session);
+}
+
+#[tokio::test]
+async fn first_capture_metadata_cached_negative_never_retries_or_refills_after_unlock() {
+    let (setup, _parent, peers) = setup().await;
+    let gate = peers.network_epoch_gate();
+    let held = gate.lock().await;
+    let first = collect(&setup.session);
+    assert!(first.original.is_err());
+    let before = setup.session.gaps.load(Ordering::Acquire);
+    assert_eq!(before, 1);
+    let still_held = collect(&setup.session);
+    assert!(Arc::ptr_eq(&first, &still_held));
+    assert_eq!(setup.session.gaps.load(Ordering::Acquire), before);
+    drop(held);
+    let after_unlock = collect(&setup.session);
+    assert!(Arc::ptr_eq(&first, &after_unlock));
+    assert!(matches!(
+        after_unlock.original,
+        Err(OverlayCreditOutcome::Contended(
+            OverlayCreditLockSite::Epoch
+        ))
+    ));
+    assert_eq!(setup.session.gaps.load(Ordering::Acquire), before);
+    no_kernel_credit(&setup.session);
+}
+
+#[tokio::test]
+async fn first_capture_metadata_wrong_context_and_retirement_cannot_enable_observation() {
+    let (setup, _parent, peers) = setup().await;
+    let plan = setup.session.state.lock().unwrap().flows[0].plan.clone();
+    let mut context = context(&setup.session);
+    let gate = peers.network_epoch_gate();
+    let held = gate.lock().await;
+    context.capture_id[0] ^= 1;
+    assert!(FirstReadPeer::capture(&setup.session, &plan, Some(context))
+        .original
+        .is_err());
+    assert!(setup.session.epoch_trace.read_peer_snapshot().is_none());
+    context.capture_id[0] ^= 1;
+    setup.session.retire();
+    assert!(FirstReadPeer::capture(&setup.session, &plan, Some(context))
+        .original
+        .is_err());
+    drop(held);
+    assert!(setup.session.epoch_trace.read_peer_snapshot().is_none());
+    assert!(setup.session.epoch_trace.snapshot().is_none());
+    no_kernel_credit(&setup.session);
+}

@@ -52,7 +52,9 @@ async fn setup() -> (
 
 fn collect(scope: &CaptureSession) -> Arc<FirstReadPeer> {
     let mut state = scope.state.lock().unwrap();
-    scope.first_read_peers(&mut state.flows[0], &[0]).remove(0)
+    scope
+        .first_read_peers(&mut state.flows[0], &[0], None)
+        .remove(0)
 }
 
 fn no_kernel_credit(scope: &CaptureSession) {
@@ -214,11 +216,11 @@ async fn first_read_peer_contention_returns_without_waiting_and_cannot_refill() 
     assert!(duplicate.original.is_err());
     let target = TARGET.parse().unwrap();
     assert!(peers
-        .try_capture_original_kernel_read_peer(PEER, target)
+        .try_capture_original_kernel_read_peer(PEER, target, None)
         .is_ok());
     peers.with_original_kernel_peer_connections_held_for_test(|| {
         assert!(matches!(
-            peers.try_capture_original_kernel_read_peer(PEER, target),
+            peers.try_capture_original_kernel_read_peer(PEER, target, None),
             Err(OverlayCreditOutcome::Contended(
                 OverlayCreditLockSite::Connections
             ))
@@ -226,7 +228,7 @@ async fn first_read_peer_contention_returns_without_waiting_and_cannot_refill() 
     });
     peers.with_original_kernel_peer_membership_held_for_test(|| {
         assert!(matches!(
-            peers.try_capture_original_kernel_read_peer(PEER, target),
+            peers.try_capture_original_kernel_read_peer(PEER, target, None),
             Err(OverlayCreditOutcome::Contended(
                 OverlayCreditLockSite::Membership
             ))
@@ -239,7 +241,7 @@ async fn first_read_peer_contention_returns_without_waiting_and_cannot_refill() 
 async fn first_read_peer_wrong_vip_offline_and_weak_owners_never_grant_credit() {
     let (setup, parent, peers) = setup().await;
     assert!(peers
-        .try_capture_original_kernel_read_peer(PEER, "10.21.1.4".parse().unwrap())
+        .try_capture_original_kernel_read_peer(PEER, "10.21.1.4".parse().unwrap(), None)
         .is_err());
     let first = collect(&setup.session);
     peers.remove_peer(PEER).await;

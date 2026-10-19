@@ -597,7 +597,12 @@ impl CaptureSession {
         if slots.is_empty() {
             return Ok(None);
         }
-        let original_peers = self.first_read_peers(flow, &slots);
+        let original_peers = self.first_read_peers(
+            flow,
+            &slots,
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            Some(&original),
+        );
         let original_request_rooms = self.first_read_request_rooms(flow, &slots, room.as_ref());
         for slot in &slots {
             let read = &mut flow.requests[*slot];

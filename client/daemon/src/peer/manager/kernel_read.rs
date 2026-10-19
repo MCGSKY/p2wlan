@@ -137,12 +137,15 @@ impl PeerManager {
         self: &Arc<Self>,
         peer: &str,
         target: std::net::Ipv4Addr,
+        #[cfg(any(target_os = "linux", all(unix, test)))] context: Option<
+            crate::peer::EpochTryContext,
+        >,
     ) -> std::result::Result<OriginalKernelReadPeer, OverlayCreditOutcome> {
         let (generation, lifecycle) = self.try_kernel_read_peer_values(
             peer,
             target,
             #[cfg(any(target_os = "linux", all(unix, test)))]
-            None,
+            context,
         )?;
         Ok(OriginalKernelReadPeer {
             owner: Arc::downgrade(self),

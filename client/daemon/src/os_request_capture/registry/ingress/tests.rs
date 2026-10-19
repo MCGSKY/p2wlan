@@ -22,7 +22,7 @@ async fn actual_reader_ingress_peer_metadata_cannot_borrow_new_network_identity(
     let before = Instant::now();
     let original = harness
         .peers
-        .try_capture_original_kernel_read_peer(PEER, REMOTE.parse().unwrap())
+        .try_capture_original_kernel_read_peer(PEER, REMOTE.parse().unwrap(), None)
         .unwrap();
     assert!(original.matches_original_ingress(&binding.source, before));
     let generation = harness
@@ -32,7 +32,7 @@ async fn actual_reader_ingress_peer_metadata_cannot_borrow_new_network_identity(
     let later_time = Instant::now();
     let later = harness
         .peers
-        .try_capture_original_kernel_read_peer(PEER, REMOTE.parse().unwrap())
+        .try_capture_original_kernel_read_peer(PEER, REMOTE.parse().unwrap(), None)
         .unwrap();
     assert_eq!(later.generation(), generation);
     assert!(!later.matches_original_ingress(&binding.source, later_time));

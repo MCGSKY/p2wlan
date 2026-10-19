@@ -37,7 +37,13 @@ impl FirstReadPeer {
             .as_ref()
             .is_ok_and(|peer| peer.matches_original_ingress(source, before))
     }
-    fn capture(scope: &CaptureSession, plan: &RegisteredFlowPlan) -> Self {
+    fn capture(
+        scope: &CaptureSession,
+        plan: &RegisteredFlowPlan,
+        #[cfg(any(target_os = "linux", all(unix, test)))] context: Option<
+            crate::peer::EpochTryContext,
+        >,
+    ) -> Self {
         let original = scope
             .peers
             .upgrade()
@@ -45,7 +51,12 @@ impl FirstReadPeer {
                 OverlayCreditUnknown::OriginalAuthorization,
             ))
             .and_then(|peers| {
-                peers.try_capture_original_kernel_read_peer(&plan.peer, plan.flow.dst_v4)
+                peers.try_capture_original_kernel_read_peer(
+                    &plan.peer,
+                    plan.flow.dst_v4,
+                    #[cfg(any(target_os = "linux", all(unix, test)))]
+                    context,
+                )
             });
         if original.is_err() {
             scope.gap();
@@ -107,19 +118,64 @@ impl CaptureSession {
         &self,
         flow: &mut FlowState,
         slots: &[usize],
+        #[cfg(any(target_os = "linux", all(unix, test)))] original: Option<&KernelRead>,
     ) -> Vec<Arc<FirstReadPeer>> {
-        // One bounded, synchronous observation before the original read
-        // context is handed to any async forwarding/route/crypto consumer.
-        let observed = Arc::new(FirstReadPeer::capture(self, &flow.plan));
+        // Capture once for previously unobserved slots of this original read.
+        // Cached positive and negative expectations never perform another try.
+        let plan = flow.plan.clone();
+        let mut observed = None;
         slots
             .iter()
             .map(|slot| {
                 flow.requests[*slot]
                     .first_peer
-                    .get_or_insert_with(|| observed.clone())
+                    .get_or_insert_with(|| {
+                        observed
+                            .get_or_insert_with(|| {
+                                #[cfg(any(target_os = "linux", all(unix, test)))]
+                                let context = original.and_then(|read| {
+                                    self.read_peer_epoch_context(&plan, *slot, read.ordinal())
+                                });
+                                Arc::new(FirstReadPeer::capture(
+                                    self,
+                                    &plan,
+                                    #[cfg(any(target_os = "linux", all(unix, test)))]
+                                    context,
+                                ))
+                            })
+                            .clone()
+                    })
                     .clone()
             })
             .collect()
+    }
+
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    fn read_peer_epoch_context(
+        &self,
+        plan: &RegisteredFlowPlan,
+        slot: usize,
+        read_ordinal: u64,
+    ) -> Option<crate::peer::EpochTryContext> {
+        let key = plan.requests.get(slot)?;
+        Some(crate::peer::EpochTryContext {
+            capture_owner: self.owner,
+            capture_id: self.capture_id,
+            run: key.run,
+            round: key.round,
+            request_nonce: key.request_nonce,
+            sequence: key.sequence,
+            protocol: match plan.protocol {
+                Protocol::Udp => "udp",
+                Protocol::Tcp => "tcp",
+            },
+            kind: match key.kind {
+                crate::business_evidence::RequestKind::Request => "request",
+                crate::business_evidence::RequestKind::Response => "response",
+            },
+            first_read_ordinal: 0,
+            read_peer_input_ordinal: Some(read_ordinal),
+        })
     }
 }
 
@@ -164,25 +220,7 @@ impl KernelReadBinding {
         if !std::ptr::eq(self.scope.as_ptr(), scope) {
             return None;
         }
-        let key = self.plan.requests.get(*self.slots.get(index)?)?;
-        Some(crate::peer::EpochTryContext {
-            capture_owner: scope.owner,
-            capture_id: scope.capture_id,
-            run: key.run,
-            round: key.round,
-            request_nonce: key.request_nonce,
-            sequence: key.sequence,
-            protocol: match self.plan.protocol {
-                Protocol::Udp => "udp",
-                Protocol::Tcp => "tcp",
-            },
-            kind: match key.kind {
-                crate::business_evidence::RequestKind::Request => "request",
-                crate::business_evidence::RequestKind::Response => "response",
-            },
-            first_read_ordinal: 0,
-            read_peer_input_ordinal: Some(self.read.ordinal()),
-        })
+        scope.read_peer_epoch_context(&self.plan, *self.slots.get(index)?, self.read.ordinal())
     }
 
     pub(crate) fn original_peer_matches_encryption(
