@@ -13,6 +13,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 import zipfile
@@ -197,7 +198,8 @@ def inspect_ndk(root, version, evidence, end):
     if revisions != [version]:
         raise SetupError("ndk_revision_mismatch", "NDK source.properties disagrees with Flutter")
     llvm = root / "toolchains/llvm/prebuilt/linux-x86_64/bin"
-    for name in ["clang", "llvm-ar", "aarch64-linux-android21-clang", "aarch64-linux-android21-clang++"]:
+    for name in ["clang", "llvm-ar", "aarch64-linux-android21-clang", "aarch64-linux-android21-clang++",
+                 "aarch64-linux-android23-clang", "aarch64-linux-android23-clang++"]:
         candidate = llvm / name
         if not candidate.is_file() or not os.access(candidate, os.X_OK) or not candidate.resolve().is_relative_to(root.resolve()):
             raise SetupError("ndk_toolchain_invalid", "NDK arm64 compiler or archiver is missing or escapes its root")
@@ -213,7 +215,67 @@ def inspect_ndk(root, version, evidence, end):
                 compiler_sha256=digest((llvm / "clang").resolve()), compiler_version_stdout_sha256=digest(output))
 
 
-def prepare(flutter_sdk, work_dir, github_env, source_commit):
+def bind_gradle_properties(properties, root):
+    if properties is None:
+        return None
+    if not properties.is_absolute() or properties.name != "local.properties" or properties.is_symlink():
+        raise SetupError("gradle_ndk_properties_invalid", "Expected an absolute regular local.properties path")
+    target = properties.parent.resolve(strict=True) / properties.name
+    if target.exists() and (not target.is_file() or target.stat().st_size > 128 * 1024):
+        raise SetupError("gradle_ndk_properties_invalid", "Gradle local properties exceed input bounds")
+    before = target.read_bytes() if target.exists() else b""
+    if b"\0" in before:
+        raise SetupError("gradle_ndk_properties_invalid", "Gradle local properties contain NUL")
+    kept, replaced = [], False
+    for line in re.findall(r"[^\r\n]*(?:\r\n|\r|\n|$)", before.decode("latin-1")):
+        text = line.lstrip(" \t\f").rstrip("\r\n")
+        if not text or text.startswith(("#", "!")):
+            kept.append(line)
+            continue
+        if (len(text) - len(text.rstrip("\\"))) % 2:
+            raise SetupError("gradle_ndk_properties_invalid", "Continued local properties are not supported")
+        key = re.split(r"[=: \t\f]", text, maxsplit=1)[0]
+        if "\\" in key:
+            raise SetupError("gradle_ndk_properties_invalid", "Escaped local-property keys are ambiguous")
+        if key == "ndk.dir":
+            if replaced:
+                raise SetupError("gradle_ndk_properties_invalid", "Duplicate ndk.dir property")
+            replaced = True
+        else:
+            kept.append(line)
+    escaped = []
+    for char in str(root):
+        if char == "\t":
+            escaped.append("\\t")
+        elif char in "\\ :=#!":
+            escaped.append("\\" + char)
+        elif 0x21 <= ord(char) <= 0x7e:
+            escaped.append(char)
+        else:
+            encoded = char.encode("utf-16-be")
+            escaped.extend(f"\\u{int.from_bytes(encoded[i:i + 2], 'big'):04x}" for i in range(0, len(encoded), 2))
+    prefix = "".join(kept)
+    if prefix and not prefix.endswith(("\n", "\r")):
+        prefix += "\n"
+    after = (prefix + "ndk.dir=" + "".join(escaped) + "\n").encode("latin-1")
+    mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else 0o600
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".p2wlan-ndk-", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(after)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(mode)
+        temporary.replace(target)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+    return dict(path=str(target), before_sha256=hashlib.sha256(before).hexdigest(),
+                after_sha256=digest(target), ndk_dir=str(root), other_properties_preserved=True)
+
+
+def prepare(flutter_sdk, work_dir, github_env, source_commit, android_local_properties=None):
     if not re.fullmatch(r"[a-f0-9]{40}", source_commit):
         raise SetupError("source_commit_invalid", "Expected a complete checkout commit")
     if not work_dir.is_absolute() or any(c in str(work_dir) for c in "\r\n"):
@@ -243,6 +305,7 @@ def prepare(flutter_sdk, work_dir, github_env, source_commit):
         # payloads/commands stay in evidence; the installed compiler stays live.
         vendor.unlink()
         receipt["successful_archive_reclaimed_after_verification"] = True
+        receipt["gradle_local_properties"] = bind_gradle_properties(android_local_properties, root)
         values = {key: str(root) for key in ["ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "P2WLAN_ANDROID_NDK_PATH"]}
         with github_env.open("a") as stream:
             stream.write("".join(f"{key}={value}\n" for key, value in values.items()))
@@ -262,9 +325,10 @@ def main():
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--github-env", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--android-local-properties", type=Path)
     args = parser.parse_args()
     try:
-        receipt = prepare(args.flutter_sdk, args.work_dir, args.github_env, args.source_commit)
+        receipt = prepare(args.flutter_sdk, args.work_dir, args.github_env, args.source_commit, args.android_local_properties)
     except (SetupError, OSError, ValueError, subprocess.TimeoutExpired, zipfile.BadZipFile) as error:
         parser.exit(1, json.dumps(dict(reason_code=getattr(error, "code", "ndk_setup_invalid"), detail=str(error))) + "\n")
     print(json.dumps(receipt, sort_keys=True))

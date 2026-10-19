@@ -25,7 +25,8 @@ def package(revision=VERSION, extra=()):
     with zipfile.ZipFile(output, "w") as archive:
         rows = [("source.properties", f"Pkg.Revision = {revision}\n".encode(), stat.S_IFREG | 0o644),
                 ("toolchains/llvm/prebuilt/linux-x86_64/bin/clang", b"#!/bin/sh\nprintf 'fixture clang version 0\\n'\n", stat.S_IFREG | 0o755)]
-        for name in ["llvm-ar", "aarch64-linux-android21-clang", "aarch64-linux-android21-clang++"]:
+        for name in ["llvm-ar", "aarch64-linux-android21-clang", "aarch64-linux-android21-clang++",
+                     "aarch64-linux-android23-clang", "aarch64-linux-android23-clang++"]:
             rows.append(("toolchains/llvm/prebuilt/linux-x86_64/bin/" + name, b"clang", stat.S_IFLNK | 0o777))
         for name, data, mode in rows:
             info = zipfile.ZipInfo(ROOT + "/" + name)
@@ -60,7 +61,7 @@ class NdkInputFixtureTests(unittest.TestCase):
         self.github_env.write_text("EXISTING=1\n")
         self.real_run = subprocess.run
 
-    def prepare_fixture(self, data, broken_first=False):
+    def prepare_fixture(self, data, broken_first=False, local_properties=None):
         calls = []
         def run(command, **kwargs):
             if "--url" not in command:
@@ -76,7 +77,7 @@ class NdkInputFixtureTests(unittest.TestCase):
                 target.write_bytes(data)
             return subprocess.CompletedProcess(command, 0)
         with patch.object(ndk.platform, "system", return_value="Linux"), patch.object(ndk.platform, "machine", return_value="x86_64"), patch.object(ndk.subprocess, "run", side_effect=run):
-            result = ndk.prepare(self.flutter, self.root / "work", self.github_env, "1" * 40)
+            result = ndk.prepare(self.flutter, self.root / "work", self.github_env, "1" * 40, local_properties)
         return result, calls
 
     def test_flutter_version_is_unique_and_invalid_declarations_are_rejected(self):
@@ -167,6 +168,54 @@ class NdkInputFixtureTests(unittest.TestCase):
         self.assertFalse((checkout / "work").exists())
         self.assertEqual(marker.read_bytes(), b"unchanged")
         self.assertEqual(self.github_env.read_text(), "EXISTING=1\n")
+
+    def test_missing_actual_arm64_api23_driver_never_exports_environment(self):
+        source = io.BytesIO(package())
+        output = io.BytesIO()
+        with zipfile.ZipFile(source) as before, zipfile.ZipFile(output, "w") as after:
+            for info in before.infolist():
+                if not info.filename.endswith("/aarch64-linux-android23-clang"):
+                    after.writestr(info, before.read(info))
+        with self.assertRaises(ndk.SetupError) as raised:
+            self.prepare_fixture(output.getvalue())
+        self.assertEqual(raised.exception.code, "ndk_toolchain_invalid")
+        self.assertEqual(self.github_env.read_text(), "EXISTING=1\n")
+
+    def test_verified_ndk_binds_local_properties_without_changing_other_keys(self):
+        properties = self.root / "local.properties"
+        before = b"# keep\r\nsdk.dir=/existing/sdk\nndk.dir=/older\nother.key=unchanged"
+        properties.write_bytes(before)
+        result, _ = self.prepare_fixture(package(), local_properties=properties)
+        root = Path(result["ndk_path"])
+        expected = b"# keep\r\nsdk.dir=/existing/sdk\nother.key=unchanged\n" + f"ndk.dir={root}\n".encode()
+        self.assertEqual(properties.read_bytes(), expected)
+        self.assertEqual(result["gradle_local_properties"]["before_sha256"], hashlib.sha256(before).hexdigest())
+        self.assertEqual(result["gradle_local_properties"]["after_sha256"], ndk.digest(properties))
+        self.assertIn(f"ANDROID_NDK_HOME={root}\n", self.github_env.read_text())
+        escaped_root = self.root / "ndk value#x:\u00e9"
+        escaped_root.mkdir()
+        ndk.bind_gradle_properties(properties, escaped_root)
+        self.assertTrue(properties.read_bytes().endswith(b"ndk.dir=" + str(self.root).encode() + b"/ndk\\ value\\#x\\:\\u00e9\n"))
+
+    def test_symlink_and_ambiguous_gradle_properties_do_not_mutate_or_export(self):
+        original = self.root / "original-properties"
+        original.write_bytes(b"unchanged\n")
+        properties = self.root / "local.properties"
+        properties.symlink_to(original)
+        with self.assertRaises(ndk.SetupError) as raised:
+            self.prepare_fixture(package(), local_properties=properties)
+        self.assertEqual(raised.exception.code, "gradle_ndk_properties_invalid")
+        self.assertEqual(original.read_bytes(), b"unchanged\n")
+        self.assertEqual(self.github_env.read_text(), "EXISTING=1\n")
+        self.assertTrue(properties.is_symlink())
+        for i, data in enumerate([b"ndk.dir=/a\nndk.dir=/b\n", b"ndk\\.dir=/a\n", b"sdk.dir=/continued\\\nvalue\n"]):
+            directory = self.root / str(i)
+            directory.mkdir()
+            path = directory / "local.properties"
+            path.write_bytes(data)
+            with self.assertRaises(ndk.SetupError):
+                ndk.bind_gradle_properties(path, self.root)
+            self.assertEqual(path.read_bytes(), data)
 
     def test_member_capacity_deadline_and_directory_payloads_are_rejected(self):
         data = package()

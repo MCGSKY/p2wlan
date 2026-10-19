@@ -202,6 +202,7 @@ jobs:
             --flutter-sdk "$FLUTTER_ROOT" \
             --work-dir "$RUNNER_TEMP/p2wlan-android-ndk" \
             --github-env "$GITHUB_ENV" \
+            --android-local-properties "$GITHUB_WORKSPACE/apps/flutter_client/android/local.properties" \
             --source-commit "$(git rev-parse HEAD)"
 
       - name: Upload Android NDK input evidence
