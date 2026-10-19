@@ -421,6 +421,9 @@ impl KernelCaptureRuntime {
                 flow.inbound.original_room[span.slot()].get_or_insert_with(|| new_room.clone());
             original_rooms.push(saved.clone());
         }
+        // The original flow updates and first room-permit selection are done.
+        // Build the immutable binding without retaining the registry guard.
+        drop(state);
         Ok(Some(Arc::new(KernelIngressBinding {
             scope: Arc::downgrade(scope),
             source: Arc::new(source.clone()),
