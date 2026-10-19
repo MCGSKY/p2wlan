@@ -50,6 +50,74 @@ fn registered(protocol: &str, kind: &str) -> RegisteredFlowPlan {
 }
 
 #[test]
+fn window_registered_validation_preserves_full_original_result_after_post_wait_clock_check() {
+    for protocol in ["udp", "tcp"] {
+        let plan = Arc::new(registered(protocol, "response"));
+        let prepared = OriginalWindowPlan {
+            producer: [0x22; 16],
+            flow: 0,
+            plan,
+        };
+        let frame_bytes = 191 + usize::from(protocol == "tcp") * 4;
+        let expected_nonce = prepared.plan.requests[0].request_nonce;
+        for mutation in 0..7 {
+            let mut wire = labels();
+            wire.frame_bytes = frame_bytes;
+            wire.producer_scope = hex::encode(prepared.producer);
+            wire.request_nonce = hex::encode(expected_nonce);
+            match mutation {
+                1 => wire.request_nonce = "00".repeat(16),
+                2 => wire.frame_bytes += 1,
+                3 => wire.original_deadline_ns += 1,
+                4 => wire.frame_sha256 = "A".repeat(64),
+                5 => wire.producer_scope = "z".repeat(32),
+                6 => wire.boot_id.clear(),
+                _ => {}
+            }
+            for now in [1_000_000_000, 1_000_000_001, 1_999_999_999, 2_000_000_000] {
+                let original = wire.validate(now, frame_bytes, &expected_nonce);
+                let prepared_result = prepared
+                    .validate_registered_wire(&wire, 1_000_000_002)
+                    .and_then(|producer| {
+                        if now < wire.complete_returned_ns || now >= wire.original_deadline_ns {
+                            Err(CaptureFailure::InvalidPlan)
+                        } else {
+                            Ok(producer)
+                        }
+                    });
+                assert_eq!(format!("{original:?}"), format!("{prepared_result:?}"));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn window_registered_validation_uses_frozen_plan_without_reacquiring_actual_registry_mutex() {
+    let (setup, _parent) = digest_scope().await;
+    let end = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    let prepared = setup
+        .session
+        .original_window_plan([0x22; 16], end)
+        .await
+        .unwrap();
+    let held = setup.session.state.lock().unwrap();
+    let mut wire = labels();
+    wire.producer_scope = hex::encode(prepared.producer);
+    wire.request_nonce = hex::encode(prepared.plan.requests[0].request_nonce);
+    assert!(prepared
+        .validate_registered_wire(&wire, 1_000_000_002)
+        .is_ok());
+    assert!(matches!(
+        setup.session.state.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ));
+    assert!(prepared.is_current(0, &held.flows[0]));
+    drop(held);
+    digest_no_credit(&setup.session);
+}
+
+#[test]
 fn original_write_window_digest_matches_tool_requests_in_both_registered_directions() {
     for (protocol, digests) in [("udp", UDP_REQUESTS), ("tcp", TCP_REQUESTS)] {
         for kind in ["request", "response"] {

@@ -1,5 +1,6 @@
 //! Descriptor/scheduler and negative metadata only. No KernelRead, Full,
 //! SystemTun write, current-owner permit or positive credit is constructed.
+use super::super::FullRetentionLossReason;
 use super::*;
 use crate::os_request_capture::plan::RegistrationPlan;
 use serde_json::json;
@@ -41,6 +42,144 @@ fn no_credit(session: &CaptureSession) {
     assert_eq!(value["system_tun_full_writes"], json!([]));
     assert_eq!(value["physical_send_verified"], false);
     assert_eq!(value["canonical_current_owner_verified"], false);
+}
+
+#[tokio::test]
+async fn terminal_handoff_irrevocable_loss_before_wait_keeps_original_negative_and_finishes_missing_rows(
+) {
+    let (setup, _parent) = scope().await;
+    {
+        let mut state = setup.session.state.lock().unwrap();
+        state.flows[0].requests[0].native_credit = Some(NativeFrameOutcome::failure(
+            Outcome::Unknown(Unknown::OriginalSource),
+        ));
+    }
+    setup
+        .session
+        .original_full_retention_lost(FullRetentionLossReason::InputRegistryContended);
+    let end = tokio::time::Instant::now() + Duration::from_secs(1);
+    let receipt = setup
+        .session
+        .wait_original_outcomes(PRODUCER, end)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(receipt).unwrap()["completed_requests"],
+        8
+    );
+    let value = serde_json::to_value(setup.session.snapshot().unwrap()).unwrap();
+    for (i, row) in value["requests"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(row["native_credit"]["status"], "unknown");
+        assert_eq!(
+            row["native_credit"]["outcome"],
+            if i == 0 {
+                "Unknown(OriginalSource)"
+            } else {
+                "Unknown(OriginalPublication)"
+            }
+        );
+        assert_eq!(row["native_credit"]["once_committed"], false);
+        assert_eq!(row["native_credit"]["commit_monotonic_ns"], json!(null));
+        assert_eq!(row["native_credit"]["owner_check"], "not_entered");
+        assert_eq!(row["first_read_ordinal"], json!(null));
+    }
+    assert_eq!(value["original_full_retention_complete"], false);
+    no_credit(&setup.session);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_handoff_irrevocable_loss_wakes_existing_wait_without_a_full_marker() {
+    let (setup, _parent) = scope().await;
+    let session = setup.session.clone();
+    let end = tokio::time::Instant::now() + Duration::from_secs(1);
+    let child = tokio::spawn(async move { session.wait_original_outcomes(PRODUCER, end).await });
+    tokio::task::yield_now().await;
+    assert!(!child.is_finished());
+    assert!(!setup.session.full_completion_pending());
+    setup
+        .session
+        .original_full_retention_lost(FullRetentionLossReason::InputRegistryContended);
+    let receipt = tokio::time::timeout_at(end, child)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let value = serde_json::to_value(receipt).unwrap();
+    assert_eq!(value["completed_requests"], 8);
+    for key in [
+        "native_os_write_verified",
+        "physical_send_verified",
+        "canonical_current_owner_verified",
+    ] {
+        assert_eq!(value[key], false);
+    }
+    assert!(!setup.session.full_completion_pending());
+    setup
+        .session
+        .original_full_retention_lost(FullRetentionLossReason::HistoryInvalid);
+    assert_eq!(
+        setup.session.full_loss.snapshot(),
+        Some(FullRetentionLossReason::InputRegistryContended)
+    );
+    no_credit(&setup.session);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_handoff_irrevocable_read_and_inbound_loss_wake_without_native_facts() {
+    for lose_read in [true, false] {
+        let (setup, _parent) = scope().await;
+        let session = setup.session.clone();
+        let end = tokio::time::Instant::now() + Duration::from_secs(1);
+        let child =
+            tokio::spawn(async move { session.wait_original_outcomes(PRODUCER, end).await });
+        tokio::task::yield_now().await;
+        assert!(!child.is_finished());
+        let flag = if lose_read {
+            &setup.session.read_complete
+        } else {
+            &setup.session.inbound_complete
+        };
+        setup.session.original_observation_lost(flag);
+        let receipt = tokio::time::timeout_at(end, child)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(receipt).unwrap()["completed_requests"],
+            8
+        );
+        assert!(setup.session.full_complete.load(Ordering::Acquire));
+        assert!(!setup.session.full_completion_pending());
+        let value = serde_json::to_value(setup.session.snapshot().unwrap()).unwrap();
+        for row in value["requests"].as_array().unwrap() {
+            assert_eq!(
+                row["native_credit"]["outcome"],
+                "Unknown(OriginalPublication)"
+            );
+            assert_eq!(row["native_credit"]["owner_check"], "not_entered");
+            assert_eq!(row["native_credit"]["once_committed"], false);
+        }
+        no_credit(&setup.session);
+    }
+}
+
+#[tokio::test]
+async fn terminal_handoff_irrevocable_loss_cannot_refill_an_expired_end_or_complete_unread_rows() {
+    let (setup, _parent) = scope().await;
+    let end = tokio::time::Instant::now();
+    setup
+        .session
+        .original_full_retention_lost(FullRetentionLossReason::InputRegistryContended);
+    assert!(matches!(
+        setup.session.wait_original_outcomes(PRODUCER, end).await,
+        Err(CaptureFailure::ControlNotReady)
+    ));
+    assert!(setup.session.state.lock().unwrap().flows[0]
+        .requests
+        .iter()
+        .all(|r| r.native_credit.is_none()));
+    no_credit(&setup.session);
 }
 
 #[tokio::test(flavor = "current_thread")]

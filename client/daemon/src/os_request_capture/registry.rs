@@ -446,10 +446,23 @@ impl CaptureSession {
             Err(_) => {
                 // A lost original read cannot be replaced by a later copy
                 // sampled under a newer peer lifecycle or network generation.
-                self.read_complete.store(false, Ordering::Release);
-                self.gap();
+                self.original_observation_lost(&self.read_complete);
                 None
             }
+        }
+    }
+
+    pub(super) fn original_observation_lost(&self, complete: &AtomicBool) {
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        let first_loss = complete.swap(false, Ordering::AcqRel);
+        #[cfg(not(any(target_os = "linux", all(unix, test))))]
+        complete.store(false, Ordering::Release);
+        self.gap();
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        if first_loss {
+            // Only the first irreversible transition of each sole provenance
+            // flag wakes the existing actor. No Full marker/fact is invented.
+            self.wake_original_terminal_loss();
         }
     }
 

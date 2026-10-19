@@ -77,8 +77,7 @@ impl CaptureSession {
         if !bound {
             self.read_complete.store(false, Ordering::Release);
             self.inbound_complete.store(false, Ordering::Release);
-            self.full_complete.store(false, Ordering::Release);
-            self.gap();
+            self.original_observation_lost(&self.full_complete);
         }
     }
 }

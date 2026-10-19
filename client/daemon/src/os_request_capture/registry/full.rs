@@ -50,8 +50,7 @@ impl CaptureSession {
         // No lock or retry: loss must remain observable even when the history
         // mutex itself caused the miss. Later duplicates never rearm a scope.
         self.full_loss.record(reason);
-        self.full_complete.store(false, Ordering::Release);
-        self.gap();
+        self.original_observation_lost(&self.full_complete);
     }
 }
 

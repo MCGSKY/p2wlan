@@ -69,6 +69,16 @@ impl CaptureSession {
                 // Only the existing bounded real-Full markers are drained.
                 // Some terminal outcome, including every refusal, is enough.
                 self.complete_pending_fulls_in(&mut state);
+                if !self.read_complete.load(Ordering::Acquire)
+                    || !self.full_complete.load(Ordering::Acquire)
+                    || !self.inbound_complete.load(Ordering::Acquire)
+                {
+                    // These flags never recover. The existing capture
+                    // predicate returns Unknown(OriginalPublication) before
+                    // any native owner/once check. Preserve recorded rows;
+                    // a lost input need not have a real-Full marker to wake us.
+                    self.try_complete_original_frames(&mut state, index, &[0, 1, 2, 3, 4, 5, 6, 7]);
+                }
                 state.flows[index]
                     .requests
                     .iter()

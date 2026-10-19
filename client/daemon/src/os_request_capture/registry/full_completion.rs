@@ -42,6 +42,12 @@ impl KernelReadBinding {
 }
 
 impl CaptureSession {
+    pub(super) fn wake_original_terminal_loss(&self) {
+        // Only a wakeup for the existing metadata actor. A lost observation
+        // is never a real-Full pending marker or a replacement native fact.
+        self.pending_full.ready.notify_one();
+    }
+
     pub(in crate::os_request_capture) async fn full_completion_ready(&self) {
         self.pending_full.ready.notified().await;
     }

@@ -126,8 +126,7 @@ impl CaptureSession {
         if !bound {
             self.inbound_loss.record(InboundLossSite::RoomBinding, None);
             self.read_complete.store(false, Ordering::Release);
-            self.inbound_complete.store(false, Ordering::Release);
-            self.gap();
+            self.original_observation_lost(&self.inbound_complete);
         }
         KernelCaptureRuntime {
             scope: Arc::downgrade(self),
@@ -204,8 +203,7 @@ impl CaptureSession {
                 .record(InboundLossSite::SystemWriteRetention, Some(error));
             // A lost Full-write observation cannot be repaired by a later
             // duplicate sampled after a lifecycle change or room renewal.
-            self.inbound_complete.store(false, Ordering::Release);
-            self.gap();
+            self.original_observation_lost(&self.inbound_complete);
         }
     }
 }
@@ -227,8 +225,7 @@ impl KernelCaptureRuntime {
                     .record(InboundLossSite::AuthenticatedInput, Some(error));
                 // A missing first input cannot be repaired by a later copy
                 // borrowing a renewed room permit. This scope never rearms.
-                scope.inbound_complete.store(false, Ordering::Release);
-                scope.gap();
+                scope.original_observation_lost(&scope.inbound_complete);
                 None
             }
         }
