@@ -407,45 +407,7 @@ impl WireGuardTransport {
         }
     }
 
-    pub(in crate::transport) async fn outbound_emit_lock(
-        &self,
-        peer_id: &str,
-    ) -> Arc<emit_gate::EmitGate> {
-        if let Some(gate) = emit_gate::cache::lookup(&self.outbound_emit_locks, peer_id) {
-            return gate;
-        }
-        // Construction and the owned key are prepared without the global
-        // index guard. Nothing is published until its original acquisition.
-        let candidate = Arc::new(emit_gate::EmitGate::new(&self.outbound_emit_locks));
-        let key = peer_id.to_string();
-        let mut locks = self.outbound_emit_locks.lock().await;
-        let gate = if let Some(gate) = locks.get(peer_id).and_then(Weak::upgrade) {
-            gate
-        } else {
-            // Preserve the sole canonical live incarnation and original GC.
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            locks.insert(key, Arc::downgrade(&candidate));
-            candidate
-        };
-        drop(locks);
-        emit_gate::cache::remember(&self.outbound_emit_locks, peer_id, &gate);
-        gate
-    }
-
-    pub(in crate::transport) fn try_outbound_emit_lock(
-        &self,
-        peer_id: &str,
-    ) -> Option<Arc<emit_gate::EmitGate>> {
-        if let Some(gate) = emit_gate::cache::lookup(&self.outbound_emit_locks, peer_id) {
-            return Some(gate);
-        }
-        // A miss uses the same single-try canonical lookup as the original
-        // native guard. The cache changes only reuse of a live producer alias.
-        let gate = Self::try_outbound_emit_lock_in(&self.outbound_emit_locks, peer_id)?;
-        emit_gate::cache::remember(&self.outbound_emit_locks, peer_id, &gate);
-        Some(gate)
-    }
-
+    #[cfg(any(target_os = "linux", all(unix, test)))]
     pub(in crate::transport) fn try_outbound_emit_lock_in(
         registry: &Arc<emit_gate::EmitRegistry>,
         peer_id: &str,

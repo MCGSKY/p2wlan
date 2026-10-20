@@ -7,6 +7,8 @@ use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, TryLockError};
 
 pub(super) mod cache;
+#[cfg(all(unix, test))]
+mod preparation_probe;
 
 #[cfg(any(target_os = "linux", all(unix, test)))]
 mod trace;
@@ -88,6 +90,8 @@ pub(crate) struct OwnedEmitGuard {
 
 impl EmitGate {
     pub(super) fn new(_registry: &Arc<EmitRegistry>) -> Self {
+        #[cfg(all(unix, test))]
+        preparation_probe::record(_registry);
         Self {
             inner: Arc::new(Mutex::new(())),
             #[cfg(any(target_os = "linux", all(unix, test)))]

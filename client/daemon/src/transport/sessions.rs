@@ -1,6 +1,7 @@
 use super::*;
 
 mod decryption;
+mod emit_index;
 mod encryption;
 mod kernel_owner;
 mod overlay_credit;
