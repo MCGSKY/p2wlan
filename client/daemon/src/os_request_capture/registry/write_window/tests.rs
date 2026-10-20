@@ -1,6 +1,9 @@
 //! Pure input controls; no clock, system read/write, Full or owner is forged.
 use super::*;
 
+#[cfg(unix)]
+mod selection;
+
 fn labels() -> WireWriteWindow {
     serde_json::from_value(serde_json::json!({
         "producer_scope":"abcdefabcdefabcdefabcdefabcdefab", "sequence":0,

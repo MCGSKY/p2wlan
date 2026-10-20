@@ -3,6 +3,8 @@
 use super::*;
 use serde::Deserialize;
 
+mod selection;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::os_request_capture) struct WireWriteWindow {
@@ -145,11 +147,22 @@ impl OriginalWindowPlan {
 }
 
 impl CaptureSession {
+    #[cfg(all(unix, test))]
     async fn original_window_plan(
         &self,
         producer: [u8; 16],
         end: tokio::time::Instant,
     ) -> Result<OriginalWindowPlan, CaptureFailure> {
+        self.original_window_plan_with_prefix(producer, end)
+            .await
+            .map(|(plan, _)| plan)
+    }
+
+    async fn original_window_plan_with_prefix(
+        &self,
+        producer: [u8; 16],
+        end: tokio::time::Instant,
+    ) -> Result<(OriginalWindowPlan, selection::RegistrationPrefix), CaptureFailure> {
         let state = self.state.lock_until(end).await?;
         if !self.is_live(Instant::now()) {
             return Err(CaptureFailure::Expired);
@@ -163,11 +176,14 @@ impl CaptureSession {
         if flows.next().is_some() || flow.requests.len() != 8 || flow.plan.payload_bytes != 128 {
             return Err(CaptureFailure::InvalidPlan);
         }
-        Ok(OriginalWindowPlan {
-            producer,
-            flow: index,
-            plan: flow.plan.clone(),
-        })
+        Ok((
+            OriginalWindowPlan {
+                producer,
+                flow: index,
+                plan: flow.plan.clone(),
+            },
+            selection::RegistrationPrefix::capture(&state),
+        ))
     }
 
     /// Only an already-owned control channel can deliver this observation.
@@ -190,7 +206,9 @@ impl CaptureSession {
         let supplied_nonce = super::super::plan::nonce(&wire.request_nonce)?;
         let supplied_producer = wire.validate(received, wire.frame_bytes, &supplied_nonce)?;
         let end = self.metadata_command_deadline(wire.original_deadline_ns)?;
-        let prepared = self.original_window_plan(supplied_producer, end).await?;
+        let (prepared, prefix) = self
+            .original_window_plan_with_prefix(supplied_producer, end)
+            .await?;
         // The first guard has already been dropped. Hash the unchanged full
         // request bytes without excluding the real input's single try-lock.
         let frame_matches = wire.matches_registered_request_frame(&prepared.plan);
@@ -200,19 +218,8 @@ impl CaptureSession {
         if !self.is_live(Instant::now()) {
             return Err(CaptureFailure::Expired);
         }
-        let producer = prepared.producer;
-        let mut flows = state
-            .flows
-            .iter_mut()
-            .enumerate()
-            .filter(|(_, f)| f.producer_scope == producer);
-        let (flow_index, flow) = flows.next().ok_or(CaptureFailure::InvalidPlan)?;
-        if flows.next().is_some() || flow.requests.len() != 8 || flow.plan.payload_bytes != 128 {
-            return Err(CaptureFailure::InvalidPlan);
-        }
-        if !prepared.is_current(flow_index, flow) {
-            return Err(CaptureFailure::InvalidPlan);
-        }
+        let flow_index = prefix.current_index(&prepared, &state)?;
+        let flow = &mut state.flows[flow_index];
         if flow.requests.iter().any(|request| {
             request
                 .original_write_window
