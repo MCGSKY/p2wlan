@@ -15,7 +15,6 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::Deserialize;
-use tokio::sync::mpsc;
 use tokio::time;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{
@@ -147,7 +146,7 @@ pub(super) fn spawn_signal_websocket(
     node_id: &str,
     network_id: &str,
     registration_seq: Option<u64>,
-    wake_tx: mpsc::Sender<()>,
+    wake_tx: super::wake::Sender,
     connected: Arc<AtomicBool>,
     telemetry_hub: Option<Arc<crate::peer::PathTelemetryHub>>,
 ) -> SignalWebSocketTask {
@@ -181,7 +180,7 @@ pub(super) async fn run_signal_websocket(
     expected_node_id: &str,
     expected_network_id: &str,
     registration_seq: Option<u64>,
-    wake_tx: mpsc::Sender<()>,
+    wake_tx: super::wake::Sender,
     connected: Arc<AtomicBool>,
     telemetry_hub: Option<Arc<crate::peer::PathTelemetryHub>>,
 ) {
@@ -205,7 +204,7 @@ async fn run_signal_websocket_with_lifecycle(
     expected_node_id: &str,
     expected_network_id: &str,
     registration_seq: Option<u64>,
-    wake_tx: mpsc::Sender<()>,
+    wake_tx: super::wake::Sender,
     lifecycle: SignalConnectionLifecycle,
     telemetry_hub: Option<Arc<crate::peer::PathTelemetryHub>>,
 ) {
@@ -241,6 +240,10 @@ async fn run_signal_websocket_with_lifecycle(
         request.headers_mut().insert(
             SEC_WEBSOCKET_PROTOCOL,
             HeaderValue::from_static(SIGNAL_WS_PROTOCOL),
+        );
+        request.headers_mut().insert(
+            HeaderName::from_static("x-p2wlan-room-roster-wake"),
+            HeaderValue::from_static("1"),
         );
         if let Some(registration_seq) = registration_seq.filter(|seq| *seq > 0) {
             let registration_seq = match HeaderValue::from_str(&registration_seq.to_string()) {
@@ -493,21 +496,28 @@ async fn run_signal_websocket_with_lifecycle(
                                             "WebSocket signaling ready for node {} at server_time_ms={}",
                                             expected_node_id, message.server_time_ms
                                         );
-                                        if wake_tx.try_send(()).is_err() && wake_tx.is_closed() {
+                                        if !wake_tx.notify(super::wake::Wake::SIGNALS) {
                                             return;
                                         }
                                     }
-                                    "signals_available" if ready => {
-                                        if message.sequence == 0 {
-                                            warn!("WebSocket signaling rejected zero notification sequence");
-                                            break;
-                                        }
-                                        if message.sequence <= last_sequence {
-                                            continue;
-                                        }
-                                        last_sequence = message.sequence;
-                                        if wake_tx.try_send(()).is_err() && wake_tx.is_closed() {
-                                            return;
+                                    "signals_available" | "roster_changed" if ready => {
+                                        match super::wake::notification(
+                                            message.message_type == "roster_changed",
+                                            (&message.node_id, &message.network_id),
+                                            (expected_node_id, expected_network_id),
+                                            message.sequence,
+                                            &mut last_sequence,
+                                        ) {
+                                            Ok(Some(wake)) => {
+                                                if !wake_tx.notify(wake) {
+                                                    return;
+                                                }
+                                            }
+                                            Ok(None) => {}
+                                            Err(reason) => {
+                                                warn!("WebSocket signaling rejected notification: {reason}");
+                                                break;
+                                            }
                                         }
                                     }
                                     "path_telemetry_ack" if ready => {

@@ -39,6 +39,7 @@ mod timing;
 pub(crate) use hard_hard_signal::HardHardStartAckDelivery;
 pub(crate) use timing::ControlTimingHint;
 use timing::ServerClockEstimate;
+mod wake;
 mod websocket;
 
 /// Single control-plane HTTP client builder shared by the ordinary loop and the

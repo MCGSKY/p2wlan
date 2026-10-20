@@ -75,6 +75,7 @@ type Client struct {
 	nodeID          string
 	networkID       string
 	registrationSeq int64
+	roomRosterWake  bool
 	expiresAt       time.Time
 	sequence        atomic.Uint64
 }
@@ -169,27 +170,7 @@ func (h *Hub) unregister(client *Client) {
 // Notify wakes the current connection for nodeID. False means the device is
 // offline or backpressured; the durable HTTP signal remains available.
 func (h *Hub) Notify(nodeID string) bool {
-	h.mu.RLock()
-	client := h.clients[nodeID]
-	h.mu.RUnlock()
-	if client == nil {
-		return false
-	}
-	sequence := client.sequence.Add(1)
-	message, err := json.Marshal(serverMessage{
-		Type:            "signals_available",
-		ProtocolVersion: ProtocolVersion,
-		Sequence:        sequence,
-		ServerTimeMS:    time.Now().UnixMilli(),
-	})
-	if err != nil {
-		return false
-	}
-	if client.enqueue(message) {
-		return true
-	}
-	client.requestClose(websocket.ClosePolicyViolation, "signal notification backpressure")
-	return false
+	return h.notify(nodeID, "", "signals_available")
 }
 
 // Close disconnects all clients and prevents future registrations.
@@ -295,6 +276,7 @@ func ServeWS(hub *Hub, guards ...UpgradeGuard) http.HandlerFunc {
 			nodeID:          claims.DeviceID,
 			networkID:       claims.NetworkID,
 			registrationSeq: regSeq,
+			roomRosterWake:  supportsRoomRosterWake(r),
 			expiresAt:       time.Unix(claims.ExpiresAt, 0),
 		}
 		previous, err := hub.register(client)
