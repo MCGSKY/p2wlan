@@ -6,8 +6,8 @@ if (flutterRoot) {
         if (settings.settingsDir.canonicalFile == flutterGradle) {
             def repositories = settings.pluginManagement.repositories
             repositories.maven {
-                name = 'P2wlanKotlinPluginCentral'
-                url = uri('https://repo.maven.apache.org/maven2')
+                name = 'P2wlanKotlinPluginCentralMirror'
+                url = uri('https://maven-central.storage-download.googleapis.com/maven2/')
                 content { includeGroup('org.jetbrains.kotlin') }
             }
             repositories.gradlePluginPortal {

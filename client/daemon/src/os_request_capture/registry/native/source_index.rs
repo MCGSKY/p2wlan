@@ -10,7 +10,7 @@ pub(in crate::os_request_capture::registry) struct RequestSources {
     pub(super) response: First<Arc<ingress::ResponseCapture>>,
 }
 pub(in crate::os_request_capture::registry) struct FlowSources {
-    pub(super) plan: Arc<RegisteredFlowPlan>,
+    pub(in crate::os_request_capture::registry) plan: Arc<RegisteredFlowPlan>,
     pub(super) invalid: Arc<AtomicBool>,
     pub(super) inbound_invalid: Arc<AtomicBool>,
     pub(in crate::os_request_capture::registry) requests: Vec<RequestSources>,

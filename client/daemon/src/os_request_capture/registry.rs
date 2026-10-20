@@ -349,7 +349,7 @@ impl CaptureSession {
         &self,
         plan: RegistrationPlan,
     ) -> Result<RegistrationReceipt, CaptureFailure> {
-        let mut prepared = registration::PreparedRegistration::new(plan);
+        let mut prepared = registration::PreparedRegistration::new(plan, self);
         let mut state = self
             .state
             .try_lock()
@@ -365,7 +365,7 @@ impl CaptureSession {
         plan: RegistrationPlan,
         end: tokio::time::Instant,
     ) -> Result<RegistrationReceipt, CaptureFailure> {
-        let mut prepared = registration::PreparedRegistration::new(plan);
+        let mut prepared = registration::PreparedRegistration::new(plan, self);
         let mut state = self.state.lock_until(end).await?;
         let result = prepared.append(self, &mut state);
         drop(state);

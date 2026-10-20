@@ -121,7 +121,7 @@ Path State Machine 的 Linux workspace 步骤使用包装器的默认 target 范
 
 Android APK 的两个 CI 构建任务使用 runner 临时目录中的独立 `GRADLE_USER_HOME`。`scripts/release/prepare_android_gradle_repositories.py` 只接受 Git checkout 外尚未存在的绝对路径，验证 Flutter SDK 后，将仓库内的 init 脚本按原字节安装到私有 `init.d`；已有目录或符号链接会使准备失败。
 
-init 脚本通过 `FLUTTER_ROOT` 精确限定 Flutter SDK 的 Gradle included build，将 `org.jetbrains.kotlin` 组的插件依赖交给 Maven Central，其他插件仍使用 Plugin Portal。Gradle 的根项目插件仓库不会自动继承到 included build。此配置不改写 SDK、插件版本或 wrapper 校验值；构建失败仍按原任务规则处理。
+init 脚本通过 `FLUTTER_ROOT` 精确限定 Flutter SDK 的 Gradle included build，将 `org.jetbrains.kotlin` 组的插件依赖交给 [Google Cloud 的 Maven Central 官方镜像](https://storage-download.googleapis.com/maven-central/index.html)，其他插件仍使用 Plugin Portal。Gradle 的根项目插件仓库不会自动继承到 included build。此配置不改写 SDK、插件版本或 wrapper 校验值；构建失败仍按原任务规则处理。
 
 ## 依赖审计输出
 
