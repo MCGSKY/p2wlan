@@ -9,6 +9,8 @@ use crate::request_carriage::test_support::{mint_input_request, InputRequestFixt
 use crate::request_carriage::test_support::{mint_routed_request, RoutedRequestFixture, PEER};
 use crate::udp::UdpSendFence;
 
+#[path = "encryption_diagnostics.rs"]
+mod encryption_diagnostics;
 #[path = "preparation_diagnostics.rs"]
 mod preparation_diagnostics;
 

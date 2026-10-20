@@ -228,3 +228,106 @@ fn crypto_profile_actual_cancelled_ciphertext_unlocks_epoch_and_session_before_b
 fn crypto_profile_actual_unavailable_session_releases_epoch_and_keeps_only_original_wait() {
     actual_crypto_unlocks_before_histogram(false, false);
 }
+
+#[test]
+fn crypto_profile_actual_fast_core_keeps_original_three_samples_until_guard_release() {
+    use crate::request_carriage::{
+        test_support::{mint_routed_request, PEER},
+        RequestEncryptionAttempt,
+    };
+    use crate::transport::{DeferredEncryptionLog, WireGuardTransport};
+    use p2pnet_crypto::NodeIdentity;
+    use p2pnet_wireguard::{HandshakeInitiator, HandshakeResponder, TransportSession};
+
+    let rt = runtime();
+    let mut f = rt.block_on(mint_routed_request());
+    let now = Instant::now();
+    f.delivery.trace = Some(crate::dataplane::DataplaneTxTrace {
+        sampled: true,
+        tun_read_started: now,
+        tun_read_completed: now,
+        route_ready: None,
+        dataplane_queue_send_started: None,
+        transport_queue_dequeued: None,
+        transport_queue_send_started: None,
+        network_queue_dequeued: None,
+    });
+    let a = NodeIdentity::generate();
+    let b = NodeIdentity::generate();
+    let mut initiator = HandshakeInitiator::new(a, b.public_key(), None);
+    let mut responder = HandshakeResponder::new(b, None);
+    let first = initiator.create_initiation().unwrap();
+    let (response, keys) = responder.consume_initiation_and_respond(&first).unwrap();
+    let local = TransportSession::new(initiator.consume_response(&response).unwrap());
+    let mut remote = TransportSession::new(keys);
+    let (transport, _rx) = WireGuardTransport::new_with_request_carriage();
+    rt.block_on(transport.replace_session_for_lifecycle(
+        PEER,
+        local,
+        f.record.expected_target_lifecycle().unwrap(),
+    ));
+    let instance = rt
+        .block_on(transport.session_status(PEER))
+        .active_session_instance
+        .unwrap();
+    let profiler = DataplaneProfiler::new();
+    let mut deferred = DeferredCryptoProfile::new(&profiler);
+    let mut log = DeferredEncryptionLog::new(PEER.into());
+    let gate = f.peers.network_epoch_gate();
+    let original;
+    {
+        let _emit = rt.block_on(transport.acquire_outbound_emit_guard(PEER));
+        let _epoch = rt.block_on(gate.lock());
+        let RequestEncryptionAttempt::Encrypted {
+            packet, plaintext, ..
+        } = transport.try_encrypt_request_with_emit_guard_diagnostics(
+            f.delivery,
+            instance,
+            Some(&mut deferred),
+            Some(&mut log),
+        )
+        else {
+            panic!("original installed session must encrypt in the actual fast core");
+        };
+        assert_eq!(crate::transport::wire_counter(&packet.wire_bytes), Some(0));
+        assert_eq!(
+            remote.decrypt_from_bytes(&packet.wire_bytes).unwrap(),
+            f.record.original_packet()
+        );
+        assert_eq!(plaintext.packet, f.record.original_packet());
+        assert_eq!(packet.source().unwrap().session_instance(), instance);
+        original = deferred.samples;
+        assert!(
+            original.iter().all(Option::is_some),
+            "actual fast core did not freeze all original stage observations"
+        );
+        assert!(
+            profiler.state.lock().unwrap().stages.is_empty(),
+            "histogram was published while original guards are held"
+        );
+    }
+    assert!(transport.try_acquire_outbound_emit_guard(PEER).is_some());
+    assert!(gate.try_lock().is_ok());
+    assert!(transport.try_session_status(PEER).is_some());
+    drop(log);
+    drop(deferred);
+    let state = profiler.state.lock().unwrap();
+    assert_eq!(state.stages.len(), 3);
+    for stage in [
+        CryptoProfileStage::SessionWait,
+        CryptoProfileStage::Crypto,
+        CryptoProfileStage::SessionHold,
+    ] {
+        let samples = &state.stages[&(stage.key(), ProfileUnit::Microseconds)];
+        assert_eq!(samples.total, 1);
+        assert_eq!(samples.values.len(), 1);
+        assert_eq!(
+            (samples.values[0].value, samples.values[0].observed_at_us),
+            original[stage as usize].unwrap()
+        );
+    }
+    assert_eq!(
+        f.record.physical_publication.state(),
+        crate::overlay_requests::PhysicalPublicationState::Idle
+    );
+}

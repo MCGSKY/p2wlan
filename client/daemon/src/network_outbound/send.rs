@@ -127,6 +127,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
         packet.peer_id.clone(),
         expected_generation,
     );
+    let mut encryption_log = crate::transport::DeferredEncryptionLog::new(packet.peer_id.clone());
     // This future contains no UDP syscall or Relay writer admission. A
     // cancellation may abandon an allocated counter, but its ciphertext has
     // never been handed off, so only the original plaintext can be retried.
@@ -379,7 +380,11 @@ pub(super) async fn encrypt_then_send_with_deadline(
             }
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Encryption);
             let mut result = match transport
-                .encrypt_request_with_emit_guard_profiled(packet, Some(&mut crypto_profile))
+                .encrypt_request_with_emit_guard_diagnostics(
+                    packet,
+                    Some(&mut crypto_profile),
+                    Some(&mut encryption_log),
+                )
                 .await
             {
                 Ok(Some(value)) => value,

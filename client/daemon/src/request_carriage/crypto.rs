@@ -39,15 +39,29 @@ impl WireGuardTransport {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn encrypt_request_with_emit_guard_profiled(
+        &self,
+        packet: RawRequestDelivery,
+        profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
+    ) -> Result<Option<EncryptedRequestDelivery>> {
+        self.encrypt_request_with_emit_guard_diagnostics(packet, profile, None)
+            .await
+    }
+
+    pub(crate) async fn encrypt_request_with_emit_guard_diagnostics(
         &self,
         mut packet: RawRequestDelivery,
         profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
+        log: Option<&mut crate::transport::DeferredEncryptionLog>,
     ) -> Result<Option<EncryptedRequestDelivery>> {
         observe_crypto_input(self, &mut packet);
         let RawRequestDelivery { raw, metadata } = packet;
         let (binding, original_residency) = metadata.into_parts();
-        let encrypted = if binding.is_some() {
+        let encrypted = if let Some(log) = log {
+            self.encrypt_outbound_with_emit_guard_diagnostics(raw, binding.is_some(), profile, log)
+                .await?
+        } else if binding.is_some() {
             self.encrypt_outbound_with_emit_guard_and_source(raw, profile)
                 .await?
         } else {
@@ -68,15 +82,39 @@ impl WireGuardTransport {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn try_encrypt_request_with_emit_guard_for_session(
+        &self,
+        packet: RawRequestDelivery,
+        expected_session_instance: u64,
+    ) -> RequestEncryptionAttempt {
+        self.try_encrypt_request_with_emit_guard_diagnostics(
+            packet,
+            expected_session_instance,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn try_encrypt_request_with_emit_guard_diagnostics(
         &self,
         mut packet: RawRequestDelivery,
         expected_session_instance: u64,
+        profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
+        log: Option<&mut crate::transport::DeferredEncryptionLog>,
     ) -> RequestEncryptionAttempt {
         observe_crypto_input(self, &mut packet);
         let RawRequestDelivery { raw, metadata } = packet;
         let (binding, original_residency) = metadata.into_parts();
-        let encrypted = if binding.is_some() {
+        let encrypted = if let Some(log) = log {
+            self.try_encrypt_outbound_with_emit_guard_diagnostics(
+                raw,
+                expected_session_instance,
+                binding.is_some(),
+                profile,
+                log,
+            )
+        } else if binding.is_some() {
             self.try_encrypt_outbound_with_emit_guard_for_session_and_source(
                 raw,
                 expected_session_instance,

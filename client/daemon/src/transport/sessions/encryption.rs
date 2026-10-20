@@ -1,6 +1,8 @@
 use super::*;
 
+mod diagnostics;
 mod origin;
+pub(crate) use diagnostics::DeferredEncryptionLog;
 pub(crate) use origin::{
     EncryptedOutboundWithSource, OriginalEchoSessionGuard, OriginalEncryptionSource,
     SessionBoundEncryptionWithSource,
@@ -140,7 +142,7 @@ impl WireGuardTransport {
     ) -> Result<Option<EncryptedOutboundWithSource>> {
         let emit_lock = self.outbound_emit_lock(&packet.peer_id).await;
         let _emit_guard = emit_lock.lock().await;
-        self.encrypt_outbound_inner_with_capture(packet, false, false, true, None)
+        self.encrypt_outbound_inner_with_capture(packet, false, false, true, None, None)
             .await
     }
 
@@ -244,7 +246,7 @@ impl WireGuardTransport {
         packet: OutboundPacket,
         profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
     ) -> Result<Option<EncryptedOutboundWithSource>> {
-        self.encrypt_outbound_inner_with_capture(packet, false, true, true, profile)
+        self.encrypt_outbound_inner_with_capture(packet, false, true, true, profile, None)
             .await
     }
 
@@ -255,8 +257,43 @@ impl WireGuardTransport {
         packet: OutboundPacket,
         profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
     ) -> Result<Option<EncryptedOutboundWithSource>> {
-        self.encrypt_outbound_inner_with_capture(packet, false, true, false, profile)
+        self.encrypt_outbound_inner_with_capture(packet, false, true, false, profile, None)
             .await
+    }
+
+    pub(crate) async fn encrypt_outbound_with_emit_guard_diagnostics(
+        &self,
+        packet: OutboundPacket,
+        capture_source: bool,
+        profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
+        log: &mut DeferredEncryptionLog,
+    ) -> Result<Option<EncryptedOutboundWithSource>> {
+        self.encrypt_outbound_inner_with_capture(
+            packet,
+            false,
+            true,
+            capture_source,
+            profile,
+            Some(log),
+        )
+        .await
+    }
+
+    pub(crate) fn try_encrypt_outbound_with_emit_guard_diagnostics(
+        &self,
+        packet: OutboundPacket,
+        expected_session_instance: u64,
+        capture_source: bool,
+        profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
+        log: &mut DeferredEncryptionLog,
+    ) -> SessionBoundEncryptionWithSource {
+        self.try_encrypt_outbound_with_emit_guard_for_session_inner(
+            packet,
+            expected_session_instance,
+            capture_source,
+            profile,
+            Some(log),
+        )
     }
 
     pub(crate) fn try_encrypt_outbound_with_emit_guard_for_session(
@@ -268,6 +305,8 @@ impl WireGuardTransport {
             packet,
             expected_session_instance,
             false,
+            None,
+            None,
         )
     }
 
@@ -281,6 +320,8 @@ impl WireGuardTransport {
             packet,
             expected_session_instance,
             true,
+            None,
+            None,
         )
     }
 
@@ -290,6 +331,8 @@ impl WireGuardTransport {
         packet: OutboundPacket,
         expected_session_instance: u64,
         capture_source: bool,
+        mut profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
+        log: Option<&mut DeferredEncryptionLog>,
     ) -> SessionBoundEncryptionWithSource {
         let profiler = global_dataplane_profiler();
         let sampled = packet.trace.as_ref().map(|trace| trace.sampled);
@@ -302,9 +345,11 @@ impl WireGuardTransport {
             .duration_since(session_lock_started)
             .as_micros() as u64;
         if let Some(sampled) = sampled {
-            profiler.record(
+            crate::dataplane::record_crypto_profile(
+                profiler,
+                profile.as_deref_mut(),
                 sampled,
-                "tx_session_lock_wait_us",
+                crate::dataplane::CryptoProfileStage::SessionWait,
                 Duration::from_micros(session_lock_wait_us),
             );
         }
@@ -365,22 +410,28 @@ impl WireGuardTransport {
             );
         }
         if let Some(sampled) = sampled {
-            profiler.record(
+            crate::dataplane::record_crypto_profile(
+                profiler,
+                profile.as_deref_mut(),
                 sampled,
-                "tx_crypto_exec_us",
+                crate::dataplane::CryptoProfileStage::Crypto,
                 Duration::from_micros(crypto_us),
             );
         }
-        debug!(
-            event = "wireguard_outbound_counter_allocated",
-            peer_id = %packet.peer_id,
-            session_instance,
-            counter = ?wire_counter(&wire_bytes),
-            bytes = wire_bytes.len(),
-            is_business = true,
-            wire_fp = format_args!("{:016x}", wire_fingerprint(&wire_bytes)),
-            "WireGuard counter allocated under the LAN Direct fast-path ordering lock"
-        );
+        if let Some(log) = log {
+            log.counter(session_instance, &wire_bytes, true, true);
+        } else {
+            debug!(
+                event = "wireguard_outbound_counter_allocated",
+                peer_id = %packet.peer_id,
+                session_instance,
+                counter = ?wire_counter(&wire_bytes),
+                bytes = wire_bytes.len(),
+                is_business = true,
+                wire_fp = format_args!("{:016x}", wire_fingerprint(&wire_bytes)),
+                "WireGuard counter allocated under the LAN Direct fast-path ordering lock"
+            );
+        }
         let encrypted = EncryptedPeerPacket {
             room_authorization: packet.room_authorization.clone(),
             peer_id: packet.peer_id.clone(),
@@ -392,9 +443,11 @@ impl WireGuardTransport {
             EncryptedOutboundWithSource::new(encrypted, source, self.resource_capture());
         let session_lock_hold_us = session_lock_acquired.elapsed().as_micros() as u64;
         if let Some(sampled) = sampled {
-            profiler.record(
+            crate::dataplane::record_crypto_profile(
+                profiler,
+                profile,
                 sampled,
-                "tx_session_lock_hold_us",
+                crate::dataplane::CryptoProfileStage::SessionHold,
                 Duration::from_micros(session_lock_hold_us),
             );
         }
@@ -460,6 +513,7 @@ impl WireGuardTransport {
             is_business,
             false,
             None,
+            None,
         )
         .await
         .map(|encrypted| encrypted.map(EncryptedOutboundWithSource::into_packet))
@@ -473,6 +527,7 @@ impl WireGuardTransport {
         is_business: bool,
         capture_source: bool,
         mut profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
+        mut log: Option<&mut DeferredEncryptionLog>,
     ) -> Result<Option<EncryptedOutboundWithSource>> {
         let profiler = global_dataplane_profiler();
         let sampled = packet.trace.as_ref().map(|trace| trace.sampled);
@@ -494,6 +549,8 @@ impl WireGuardTransport {
             if queue_if_unavailable {
                 self.queue_pending_outbound(packet, "session not ready")
                     .await;
+            } else if let Some(log) = log.as_deref_mut() {
+                log.unavailable(diagnostics::Unavailable::Missing, packet.packet.len());
             } else {
                 debug!(
                     "No WireGuard session for peer {}; dropping {} byte packet",
@@ -509,6 +566,8 @@ impl WireGuardTransport {
             if queue_if_unavailable {
                 self.queue_pending_outbound(packet, "session expired before rekey")
                     .await;
+            } else if let Some(log) = log.as_deref_mut() {
+                log.unavailable(diagnostics::Unavailable::Inactive, packet.packet.len());
             } else {
                 debug!(
                     "No usable WireGuard session for peer {}; dropping {} byte packet until rekey completes",
@@ -523,6 +582,8 @@ impl WireGuardTransport {
             if queue_if_unavailable {
                 self.queue_pending_outbound(packet, "session expired before rekey")
                     .await;
+            } else if let Some(log) = log.as_deref_mut() {
+                log.unavailable(diagnostics::Unavailable::Expired, packet.packet.len());
             } else {
                 debug!(
                     "WireGuard session for peer {} expired; dropping {} byte packet until authenticated rekey confirmation",
@@ -569,16 +630,20 @@ impl WireGuardTransport {
                 &wire_bytes,
             );
         }
-        debug!(
-            event = "wireguard_outbound_counter_allocated",
-            peer_id = %packet.peer_id,
-            session_instance,
-            counter = ?wire_counter(&wire_bytes),
-            bytes = wire_bytes.len(),
-            is_business,
-            wire_fp = format_args!("{:016x}", wire_fingerprint(&wire_bytes)),
-            "WireGuard counter allocated under the per-peer emit ordering lock"
-        );
+        if let Some(log) = log {
+            log.counter(session_instance, &wire_bytes, is_business, false);
+        } else {
+            debug!(
+                event = "wireguard_outbound_counter_allocated",
+                peer_id = %packet.peer_id,
+                session_instance,
+                counter = ?wire_counter(&wire_bytes),
+                bytes = wire_bytes.len(),
+                is_business,
+                wire_fp = format_args!("{:016x}", wire_fingerprint(&wire_bytes)),
+                "WireGuard counter allocated under the per-peer emit ordering lock"
+            );
+        }
         if let Some(sampled) = sampled {
             crate::dataplane::record_crypto_profile(
                 profiler,

@@ -214,6 +214,9 @@ pub(super) fn try_lan_direct_fast_path(
     let overlay_identity = overlay_packet_identity(&packet.packet);
     let encrypt_started = Instant::now();
     let mut epoch_gate_wait_us = 0u64;
+    // These diagnostics outlive every original guard and PhysicalAttempt.
+    let mut crypto_profile = crate::dataplane::DeferredCryptoProfile::new(profiler);
+    let mut encryption_log = crate::transport::DeferredEncryptionLog::new(peer_id.to_owned());
     let emit_guard_wait_started = Instant::now();
     let Some(emit_guard) = transport.try_acquire_outbound_emit_guard(peer_id) else {
         return FastPathAttempt::Fallback(packet);
@@ -325,8 +328,12 @@ pub(super) fn try_lan_direct_fast_path(
         };
 
         let (encrypted, plaintext, session_lock_wait_us, crypto_us) = match transport
-            .try_encrypt_request_with_emit_guard_for_session(packet, entry.session_instance)
-        {
+            .try_encrypt_request_with_emit_guard_diagnostics(
+                packet,
+                entry.session_instance,
+                Some(&mut crypto_profile),
+                Some(&mut encryption_log),
+            ) {
             RequestEncryptionAttempt::Encrypted {
                 packet: encrypted,
                 plaintext,
