@@ -26,6 +26,8 @@ use tracing::{debug, info, warn};
 
 use crate::error::{DaemonError, Result};
 
+mod tls;
+
 const SIGNAL_WS_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SIGNAL_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SIGNAL_WS_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -298,7 +300,7 @@ async fn run_signal_websocket_with_lifecycle(
                 p2pnet_netbind::connect_tcp_host(&host, port, outbound_interface.as_deref())
                     .await
                     .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
-            tokio_tungstenite::client_async_tls(request, stream).await
+            tls::handshake(request, stream).await
         })
         .await
         {
