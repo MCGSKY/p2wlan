@@ -64,3 +64,9 @@ panic = "abort"
 [profile.dev]
 opt-level = 0
 debug = true
+
+# Build identity hashes the complete running image, including debug symbols.
+# Keep the SHA compression implementation optimized in dev and inherited test
+# builds without changing workspace debug information or release settings.
+[profile.dev.package.sha2]
+opt-level = 3

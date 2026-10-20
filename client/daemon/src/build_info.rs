@@ -121,7 +121,9 @@ mod tests {
 
     #[test]
     fn build_info_is_self_consistent() {
+        let initialization_started = std::time::Instant::now();
         let info = current();
+        let initialization_elapsed = initialization_started.elapsed();
         // The reported git commit must be the real HEAD when built in a git
         // checkout (all CI and supported builds are), never a blank value.
         assert!(!info.git_commit.is_empty());
@@ -130,7 +132,15 @@ mod tests {
         assert!(!info.binary_sha256.is_empty());
         assert!(!info.binary_path.is_empty());
         // The reported SHA-256 must match the running binary on disk.
+        let verification_started = std::time::Instant::now();
         let (sha, _) = binary_sha256_and_path();
+        let verification_elapsed = verification_started.elapsed();
+        eprintln!(
+            "build_identity_image_hash bytes={} initialization_elapsed_ns={} verification_elapsed_ns={}",
+            std::fs::metadata(&info.binary_path).unwrap().len(),
+            initialization_elapsed.as_nanos(),
+            verification_elapsed.as_nanos()
+        );
         assert_eq!(info.binary_sha256, sha);
         assert_eq!(info.build_id, env!("P2WLAN_BUILD_ID"));
         // build_id embeds the short commit, so the commit is auditable even
