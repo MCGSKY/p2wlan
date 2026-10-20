@@ -5,205 +5,34 @@ impl PeerConnection {
         selection: &PathSelection,
         local_endpoint: Option<SocketAddr>,
     ) {
-        let previous = self.last_path_selection.as_ref();
-        let changed = previous
-            .map(|previous| {
-                previous.path != selection.path
-                    || previous.reason_code != selection.reason_code
-                    || previous.direct_endpoint != selection.direct_endpoint
-                    || previous.relay_hedged != selection.relay_hedged
-                    || (selection.path == Some(NetworkPath::Relay)
-                        && previous.relay_server != selection.relay_server)
-            })
-            .unwrap_or(true);
-        if !changed {
+        let Some(log) =
+            PathSelectionLog::capture(self, local_generation, selection, local_endpoint)
+        else {
             return;
-        }
-
-        let previous_path = previous.and_then(|selection| selection.path);
-        let pair = selection.direct_endpoint.and_then(|endpoint| {
-            self.candidate_pairs.iter().find(|pair| {
-                pair.local_generation == local_generation
-                    && pair.remote_endpoint == endpoint
-                    && self.pair_belongs_to_current_remote_epoch(pair)
-            })
-        });
-        let remote_endpoint = selection.direct_endpoint;
-        let remote_endpoint_text = match selection.path {
-            Some(NetworkPath::Relay) => self
-                .relay_server
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string()),
-            _ => remote_endpoint
-                .map(|endpoint| endpoint.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
         };
-        let local_endpoint_text = format_log_endpoint(
-            local_endpoint.or_else(|| pair.and_then(|pair| pair.local_endpoint)),
-        );
-        let candidate_source = pair.map(|pair| pair.source);
-        let rtt_ms = pair.and_then(|pair| pair.rtt_ewma_ms.or(pair.rtt_ms));
-        let direct_type = classify_candidate_pair_path_with_on_link_host(
-            selection.path,
-            pair,
-            selection.direct_confirmed,
-            pair.is_some_and(|pair| self.is_on_link_host_candidate(pair.remote_endpoint)),
-        );
+        let previous_path = log.previous_path;
+        // Existing caller-owned epoch paths retain their original emission order.
+        log.emit();
+        self.record_path_selection_history(local_generation, selection, previous_path);
+    }
 
-        // Emit one compact state snapshot for every selector transition.  The
-        // individual path events below describe the user-visible transition;
-        // this snapshot explains why a transition was admitted or withheld
-        // when relay setup, Direct validation, and the two-direction relay
-        // business gate race each other.  It intentionally contains only
-        // bounded diagnostic state (no ticket, key, or validation owner).
-        debug!(
-            event = "path_state_snapshot",
-            peer_id = %self.node_id,
-            generation = local_generation,
-            connection_state = ?self.state,
-            previous_path = ?previous_path,
-            selected_path = ?selection.path,
-            path_id = ?selection.direct_endpoint
-                .map(|endpoint| endpoint.to_string())
-                .or_else(|| selection.relay_server.clone()),
-            reason_code = selection.reason_code,
-            direct_confirmed = selection.direct_confirmed,
-            relay_hedged = selection.relay_hedged,
-            relay_ready_generation = ?self.relay_ready_generation,
-            relay_confirmed_generation = ?self.relay_confirmed_generation,
-            relay_confirmed_connection_id = ?self.relay_confirmed_connection_id,
-            relay_first_gate_generation = ?self.relay_first.gate_generation,
-            relay_first_business_sent_generation = ?self.relay_first.business_sent_generation,
-            relay_first_business_received_generation = ?self.relay_first.business_received_generation,
-            relay_first_business_exchange_generation = ?self.relay_first.business_exchange_generation,
-            relay_first_business_gate_completed_generation = ?self.relay_first.business_gate_completed_generation,
-            first_usable_generation = ?self.first_usable_generation,
-            first_usable_path = ?self.first_usable_path,
-            "path selector state changed: path={:?} reason_code={} reason={}",
-            selection.path,
-            selection.reason_code,
-            selection.reason,
-        );
+    fn capture_path_selection_event(
+        &mut self,
+        local_generation: u64,
+        selection: &PathSelection,
+        local_endpoint: Option<SocketAddr>,
+    ) -> Option<PathSelectionLog> {
+        let log = PathSelectionLog::capture(self, local_generation, selection, local_endpoint)?;
+        self.record_path_selection_history(local_generation, selection, log.previous_path);
+        Some(log)
+    }
 
-        if selection.path == Some(NetworkPath::Direct) && selection.direct_confirmed {
-            info!(
-                event = "candidate_pair_selected",
-                peer_id = %self.node_id,
-                local_endpoint = %local_endpoint_text,
-                remote_endpoint = %remote_endpoint_text,
-                candidate_source = ?candidate_source,
-                rtt_ms = ?rtt_ms,
-                reason = %selection.reason,
-                "candidate_pair_selected peer_id={} remote_endpoint={:?} reason={}",
-                self.node_id,
-                remote_endpoint,
-                selection.reason
-            );
-            match direct_type {
-                DirectPathType::PublicUdp => info!(
-                    event = "public_udp_direct_selected",
-                    peer_id = %self.node_id,
-                    local_endpoint = %local_endpoint_text,
-                    remote_endpoint = %remote_endpoint_text,
-                    candidate_source = ?candidate_source,
-                    rtt_ms = ?rtt_ms,
-                    reason = %selection.reason,
-                    "public_udp_direct_selected peer_id={} remote_endpoint={:?} reason={}",
-                    self.node_id,
-                    remote_endpoint,
-                    selection.reason
-                ),
-                DirectPathType::PeerReflexive => info!(
-                    event = "peer_reflexive_direct_selected",
-                    peer_id = %self.node_id,
-                    local_endpoint = %local_endpoint_text,
-                    remote_endpoint = %remote_endpoint_text,
-                    candidate_source = ?candidate_source,
-                    rtt_ms = ?rtt_ms,
-                    reason = %selection.reason,
-                    "peer_reflexive_direct_selected peer_id={} remote_endpoint={:?} reason={}",
-                    self.node_id,
-                    remote_endpoint,
-                    selection.reason
-                ),
-                DirectPathType::Overlay => info!(
-                    event = "overlay_direct_selected",
-                    peer_id = %self.node_id,
-                    local_endpoint = %local_endpoint_text,
-                    remote_endpoint = %remote_endpoint_text,
-                    candidate_source = ?candidate_source,
-                    rtt_ms = ?rtt_ms,
-                    reason = %selection.reason,
-                    "overlay_direct_selected peer_id={} remote_endpoint={:?} reason={}",
-                    self.node_id,
-                    remote_endpoint,
-                    selection.reason
-                ),
-                DirectPathType::Lan => info!(
-                    event = "lan_direct_selected",
-                    peer_id = %self.node_id,
-                    local_endpoint = %local_endpoint_text,
-                    remote_endpoint = %remote_endpoint_text,
-                    candidate_source = ?candidate_source,
-                    rtt_ms = ?rtt_ms,
-                    reason = %selection.reason,
-                    "lan_direct_selected peer_id={} remote_endpoint={:?} reason={}",
-                    self.node_id,
-                    remote_endpoint,
-                    selection.reason
-                ),
-                _ => {}
-            }
-        }
-
-        if should_record_direct_promotion(previous_path, selection) {
-            info!(
-                event = "direct_path_promoted",
-                peer_id = %self.node_id,
-                local_endpoint = %local_endpoint_text,
-                remote_endpoint = %remote_endpoint_text,
-                candidate_source = ?candidate_source,
-                rtt_ms = ?rtt_ms,
-                reason = %selection.reason,
-                "direct_path_promoted peer_id={} remote_endpoint={:?} reason={}",
-                self.node_id,
-                remote_endpoint,
-                selection.reason
-            );
-        }
-
-        if selection.reason_code == REASON_PATH_DIRECT_DEGRADED {
-            info!(
-                event = "direct_path_degraded",
-                peer_id = %self.node_id,
-                local_endpoint = %local_endpoint_text,
-                remote_endpoint = %remote_endpoint_text,
-                candidate_source = ?candidate_source,
-                rtt_ms = ?rtt_ms,
-                reason = %selection.reason,
-                "direct_path_degraded peer_id={} remote_endpoint={:?} reason={}",
-                self.node_id,
-                remote_endpoint,
-                selection.reason
-            );
-        }
-
-        if selection.path == Some(NetworkPath::Relay) {
-            info!(
-                event = "relay_fallback_selected",
-                peer_id = %self.node_id,
-                local_endpoint = %local_endpoint_text,
-                remote_endpoint = %remote_endpoint_text,
-                relay_server = ?self.relay_server,
-                candidate_source = ?candidate_source,
-                rtt_ms = ?rtt_ms,
-                reason = %selection.reason,
-                "relay_fallback_selected peer_id={} reason={}",
-                self.node_id,
-                selection.reason
-            );
-        }
-
+    fn record_path_selection_history(
+        &mut self,
+        local_generation: u64,
+        selection: &PathSelection,
+        previous_path: Option<NetworkPath>,
+    ) {
         self.path_events.push(PathSelectionEvent {
             selected_at: Instant::now(),
             network_generation: local_generation,
