@@ -4,6 +4,17 @@ use super::*;
 
 mod conflicts;
 
+// Each valid registration adds at least one of the original MAX_REQUESTS.
+// Reserve membership before exposing the scope so the sole append transaction
+// never grows this table while excluding the input reader's single try.
+pub(super) fn producer_membership() -> Result<std::collections::HashSet<[u8; 16]>, CaptureFailure> {
+    let mut producers = std::collections::HashSet::new();
+    producers
+        .try_reserve(MAX_REQUESTS)
+        .map_err(|_| CaptureFailure::Capacity)?;
+    Ok(producers)
+}
+
 pub(super) struct PreparedRegistration {
     capture_id: [u8; 16],
     producer: [u8; 16],

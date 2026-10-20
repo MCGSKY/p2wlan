@@ -119,7 +119,7 @@ struct RegistryState {
     #[cfg(unix)]
     revision: u64,
     #[cfg(unix)]
-    producers: std::collections::BTreeSet<[u8; 16]>,
+    producers: std::collections::HashSet<[u8; 16]>,
 }
 struct FlowState {
     plan: Arc<RegisteredFlowPlan>,
@@ -333,7 +333,7 @@ impl CaptureSession {
                 inbound_history,
                 requests: 0,
                 revision: 0,
-                producers: std::collections::BTreeSet::new(),
+                producers: registration::producer_membership()?,
             }),
             gaps: AtomicU64::new(0),
         });

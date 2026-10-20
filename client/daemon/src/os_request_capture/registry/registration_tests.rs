@@ -4,6 +4,7 @@ use super::*;
 use serde_json::{json, Value};
 
 pub(super) mod conflicts;
+mod producer_membership;
 
 thread_local! {
     static PREPARING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
