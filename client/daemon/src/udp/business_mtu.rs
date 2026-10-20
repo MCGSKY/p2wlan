@@ -175,10 +175,21 @@ impl UdpTransport {
 
     /// Capture exact committed Direct identity, exact socket lease, owner and
     /// confirmed budget before allocating a WireGuard counter.
+    #[cfg(test)]
     pub(crate) async fn prepare_direct_business_send(
         &self,
         peer_id: &str,
         expected_endpoint: SocketAddr,
+    ) -> DirectBusinessBudgetGate {
+        self.prepare_direct_business_send_with_resource(peer_id, expected_endpoint, &mut None)
+            .await
+    }
+
+    pub(crate) async fn prepare_direct_business_send_with_resource(
+        &self,
+        peer_id: &str,
+        expected_endpoint: SocketAddr,
+        resource: &mut Option<PreparedCommittedSocket>,
     ) -> DirectBusinessBudgetGate {
         let Some(session_generation) = self.peers.peer_session_generation_sync(peer_id) else {
             return DirectBusinessBudgetGate::ManagedPending {
@@ -242,14 +253,22 @@ impl UdpTransport {
                 reason: "exact_socket_identity_changed",
             };
         }
-        let Some((socket_index, socket, lease)) = self
-            .resolve_committed_direct_socket_with_lease(
+        let resolved = if let Some(prepared) = self.try_take_prepared_committed_socket(
+            peer_id,
+            local_endpoint,
+            epoch.network_generation,
+            resource,
+        ) {
+            Some(prepared)
+        } else {
+            self.resolve_committed_direct_socket_with_lease(
                 peer_id,
                 local_endpoint,
                 epoch.network_generation,
             )
             .await
-        else {
+        };
+        let Some((socket_index, socket, lease)) = resolved else {
             return DirectBusinessBudgetGate::ManagedPending {
                 reason: "exact_socket_missing",
             };

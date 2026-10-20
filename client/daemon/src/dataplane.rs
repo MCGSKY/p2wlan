@@ -31,6 +31,11 @@ include!("dataplane/profiling.rs");
 #[path = "dataplane/crypto_profile.rs"]
 mod crypto_profile;
 pub(crate) use crypto_profile::{record_crypto_profile, CryptoProfileStage, DeferredCryptoProfile};
+#[path = "dataplane/preparation_profile.rs"]
+mod preparation_profile;
+pub(crate) use preparation_profile::{
+    DeferredOutboundPreparationProfile, OutboundPreparationStage,
+};
 
 #[cfg(test)]
 mod tests {

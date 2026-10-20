@@ -158,3 +158,69 @@ async fn committed_direct_socket_resolution_is_exact_for_ipv6_and_generation() {
         .is_none());
     assert_eq!(udp.socket_for_peer(Some("peer-b")).await.unwrap().0, 1);
 }
+
+struct OutboundSocketEpochProbe {
+    peers: Arc<PeerManager>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    available: Arc<std::sync::atomic::AtomicBool>,
+}
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for OutboundSocketEpochProbe {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() == "p2pnet_daemon::committed_socket_lookup" {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let gate = self.peers.network_epoch_gate();
+            self.available.store(
+                gate.try_lock().is_ok(),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+    }
+}
+
+async fn outbound_socket_preparation_control(change_affinity: bool) {
+    use tracing_subscriber::prelude::*;
+    let fixture = CommittedBudgetAffinityFixture::new().await;
+    if change_affinity {
+        fixture.observe_other_probe_socket().await;
+    }
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let subscriber = tracing_subscriber::registry().with(OutboundSocketEpochProbe {
+        peers: fixture.peers.clone(),
+        calls: calls.clone(),
+        available: available.clone(),
+    });
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let transport = WireGuardTransport::new().0;
+    assert!(
+        crate::network_outbound::one_direct_budget_preparation_without_session_for_test(
+            &fixture.peers,
+            &transport,
+            &fixture.udp,
+            business_budget_ipv4_packet(64, 1),
+        )
+        .await,
+        "actual preparation must reach the unchanged missing-session result"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "this control requires exactly one actual committed socket lookup"
+    );
+    assert!(fixture.udp.direct_business_budget_ready_for_peer("peer-b"));
+    assert!(
+        available.load(std::sync::atomic::Ordering::Acquire),
+        "committed socket lookup still owns the actual outbound epoch mutex"
+    );
+}
+
+#[tokio::test]
+async fn outbound_socket_preparation_releases_epoch_for_committed_pool() {
+    outbound_socket_preparation_control(false).await;
+}
+
+#[tokio::test]
+async fn outbound_socket_preparation_releases_epoch_after_probe_affinity_changes() {
+    outbound_socket_preparation_control(true).await;
+}

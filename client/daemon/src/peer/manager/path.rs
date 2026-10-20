@@ -1,3 +1,5 @@
+include!("path/admission.rs");
+
 impl PeerManager {
     /// Subscribe to DirectFirst deadline-set changes. The authoritative
     /// deadlines remain inside each connection's path state machine; this is
@@ -202,79 +204,6 @@ impl PeerManager {
             .await
             .path
             == Some(NetworkPath::Direct)
-    }
-
-    /// Whether a queued business packet may consume a WireGuard counter in
-    /// the current generation.  A probe-only Direct ACK remains background
-    /// evidence and is subject to relay-first startup admission.  A current
-    /// encrypted-confirmed Selected Direct pair is authoritative and is
-    /// admitted immediately; Relay remains available as its warm standby.
-    /// The predicate is intentionally evaluated from one connection snapshot
-    /// so queue admission cannot observe Direct and relay confirmation from
-    /// different generations.
-    pub async fn is_data_path_admitted_for_generation(
-        &self,
-        node_id: &str,
-        generation: u64,
-        relay_available: bool,
-    ) -> bool {
-        let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
-        if generation != self.current_network_generation_sync() {
-            return false;
-        }
-        self.is_data_path_admitted_for_generation_with_conns(
-            &mut conns,
-            node_id,
-            generation,
-            relay_available,
-        )
-    }
-
-    fn is_data_path_admitted_for_generation_with_conns(
-        &self,
-        conns: &mut HashMap<String, PeerConnection>,
-        node_id: &str,
-        generation: u64,
-        relay_available: bool,
-    ) -> bool {
-        conns
-            .get_mut(node_id)
-            .map(|conn| {
-                if (relay_available || self.relay_first_required())
-                    && conn.relay_first.gate_generation != Some(generation)
-                {
-                    conn.relay_first.gate_generation = Some(generation);
-                    conn.relay_first.gate_started_at = Some(Instant::now());
-                }
-                if !conn.online || conn.state == ConnectionState::Closed {
-                    return false;
-                }
-                conn.advance_direct_first_deadline(generation);
-                if conn.has_current_authoritative_direct(generation) {
-                    return true;
-                }
-                if conn.is_on_link_direct_for_generation(generation) {
-                    return true;
-                }
-                if conn.direct_first_pending() {
-                    return false;
-                }
-                let relay_confirmed = relay_available
-                    && conn.relay_confirmed_at.is_some()
-                    && conn.relay_confirmed_generation == Some(generation)
-                    && conn
-                        .relay_confirmed_endpoint
-                        .as_deref()
-                        .is_some_and(|endpoint| !endpoint.is_empty());
-                if relay_confirmed {
-                    return true;
-                }
-                if conn.relay_first_confirmation_pending(generation, relay_available) {
-                    return false;
-                }
-                conn.state == ConnectionState::Direct && conn.direct_generation == generation
-            })
-            .unwrap_or(false)
     }
 
     /// Publish the cheap immutable state needed to enter the LAN Direct fast

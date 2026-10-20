@@ -41,3 +41,6 @@ use daemon_e2e::{
 };
 #[path = "tests/resource_runtime.rs"]
 mod resource_runtime;
+
+#[path = "tests/startup_policy.rs"]
+mod startup_policy;

@@ -52,5 +52,15 @@ mod relay_only_diagnostics;
 #[path = "tests/peer_update_resources.rs"]
 mod peer_update_resources;
 
+#[path = "tests/emit_preparation_logging.rs"]
+mod emit_preparation_logging;
 #[path = "tests/path_selection_logging.rs"]
 mod path_selection_logging;
+
+#[cfg(unix)]
+#[path = "tests/epoch_lock_callers.rs"]
+mod epoch_lock_callers;
+
+#[cfg(unix)]
+#[path = "tests/relay_admission_reader.rs"]
+mod relay_admission_reader;

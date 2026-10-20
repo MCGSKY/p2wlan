@@ -307,6 +307,9 @@ impl Daemon {
             debug!("No relay servers configured; direct UDP only unless peers provide relay later");
         }
 
+        let direct_workers_enabled =
+            self.config.relay.effective_path_policy(true) != PathPolicy::RelayOnly;
+
         let udp_bind = self.config.network.udp_bind.parse().map_err(|e| {
             DaemonError::Config(format!(
                 "invalid network.udp_bind '{}': {e}",
@@ -322,18 +325,21 @@ impl Daemon {
         // (field evidence: fresh_mapping acceptance round with two
         // stun.l.google.com resolution timeouts pushing the event loop 2s
         // after peer join was already polled).
-        let (resolved_stun, resolved_observers) = tokio::join!(
-            parse_stun_servers(&self.config.network.stun_servers, stun_timeout),
-            async {
-                if self.config.network.udp_observers.is_empty() {
-                    Ok(Vec::new())
-                } else {
-                    parse_stun_servers(&self.config.network.udp_observers, stun_timeout).await
-                }
-            },
-        );
-        let mut stun_servers = resolved_stun?;
-        let udp_observers = resolved_observers?;
+        let (mut stun_servers, udp_observers) = if direct_workers_enabled {
+            let (resolved_stun, resolved_observers) = tokio::join!(
+                parse_stun_servers(&self.config.network.stun_servers, stun_timeout),
+                async {
+                    if self.config.network.udp_observers.is_empty() {
+                        Ok(Vec::new())
+                    } else {
+                        parse_stun_servers(&self.config.network.udp_observers, stun_timeout).await
+                    }
+                },
+            );
+            (resolved_stun?, resolved_observers?)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         for observer in &udp_observers {
             if !stun_servers.contains(observer) {
                 stun_servers.push(*observer);
@@ -397,33 +403,35 @@ impl Daemon {
                 ),
             )
             .await;
-        self.task_manager
-            .spawn(
-                "direct-first-deadline",
-                false,
-                run_direct_first_deadline_loop(self.peers.clone(), self.shutdown_rx.clone()),
-            )
-            .await;
-        self.task_manager
-            .spawn(
-                "direct-probe",
-                false,
-                run_direct_probe_loop(
-                    self.peers.clone(),
-                    self.udp_transport.clone(),
-                    self.local_candidates.clone(),
-                    self.candidate_snapshot.clone(),
-                    self.punch_attempts.clone(),
-                    self.control.clone(),
-                    self.runtime_stun_servers.clone(),
-                    self.runtime_stun_timeout.clone(),
-                    self.boot_epoch_ms,
-                    DIRECT_RETRY_BASE_INTERVAL,
-                    punch_interval,
-                    punch_attempts.clamp(1, 3),
-                ),
-            )
-            .await;
+        if direct_workers_enabled {
+            self.task_manager
+                .spawn(
+                    "direct-first-deadline",
+                    false,
+                    run_direct_first_deadline_loop(self.peers.clone(), self.shutdown_rx.clone()),
+                )
+                .await;
+            self.task_manager
+                .spawn(
+                    "direct-probe",
+                    false,
+                    run_direct_probe_loop(
+                        self.peers.clone(),
+                        self.udp_transport.clone(),
+                        self.local_candidates.clone(),
+                        self.candidate_snapshot.clone(),
+                        self.punch_attempts.clone(),
+                        self.control.clone(),
+                        self.runtime_stun_servers.clone(),
+                        self.runtime_stun_timeout.clone(),
+                        self.boot_epoch_ms,
+                        DIRECT_RETRY_BASE_INTERVAL,
+                        punch_interval,
+                        punch_attempts.clamp(1, 3),
+                    ),
+                )
+                .await;
+        }
         self.task_manager
             .spawn(
                 "relay-peer-validation",
@@ -535,49 +543,56 @@ impl Daemon {
             .await?;
 
         let local_candidate_sources = self.local_candidate_sources.clone();
-        let udp_direct_context = UdpDirectTaskContext {
-            udp_bind,
-            fresh_mapping_harness_loopback: self.config.network.fresh_mapping_harness_loopback,
-            peers: self.peers.clone(),
-            control: self.control.clone(),
-            local_candidates: self.local_candidates.clone(),
-            local_candidate_sources: local_candidate_sources.clone(),
-            local_network_identity: self.local_network_identity.clone(),
-            candidate_snapshot: self.candidate_snapshot.clone(),
-            candidate_refresh_lock: self.candidate_refresh_lock.clone(),
-            nat_profile: self.nat_profile.clone(),
-            gateway_mapping_runtime: self.gateway_mapping_runtime.clone(),
-            gateway_mapping_diagnostics: self.gateway_mapping_diagnostics.clone(),
-            udp_transport_publication: self.udp_transport_publication.clone(),
-            direct_validation_transport: self.transport.clone(),
-            direct_validation_local_ip: self.config.network.virtual_ip.clone(),
-            udp_inbound_tx: network_inbound_tx.clone(),
-            local_node_id: self.config.node.node_id.clone(),
-            stun_servers,
-            stun_server_specs: self.config.network.stun_servers.clone(),
-            udp_observer_specs: self.config.network.udp_observers.clone(),
-            runtime_stun_servers: self.runtime_stun_servers.clone(),
-            stun_timeout,
-            udp_advertise,
-            upnp_enabled,
-            socket_pool_enabled,
-            socket_pool_size,
-            keepalive_interval,
-            punch_deduplicator: self.punch_attempts.clone(),
-            udp_punch_interval: punch_interval,
-            udp_punch_attempts: punch_attempts,
-            boot_epoch_ms: self.boot_epoch_ms,
-            proxy_env,
-            excluded_interfaces,
-            shutdown_rx: self.shutdown_rx.clone(),
-            android_network_change_rx: self.android_network_change_direct_rx.clone(),
-            android_network_change_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(test)]
-            original_owners_for_test: None,
-        };
-        self.task_manager
-            .spawn_result("udp-direct", false, run_udp_direct_task(udp_direct_context))
-            .await;
+        if direct_workers_enabled {
+            let udp_direct_context = UdpDirectTaskContext {
+                udp_bind,
+                fresh_mapping_harness_loopback: self.config.network.fresh_mapping_harness_loopback,
+                peers: self.peers.clone(),
+                control: self.control.clone(),
+                local_candidates: self.local_candidates.clone(),
+                local_candidate_sources: local_candidate_sources.clone(),
+                local_network_identity: self.local_network_identity.clone(),
+                candidate_snapshot: self.candidate_snapshot.clone(),
+                candidate_refresh_lock: self.candidate_refresh_lock.clone(),
+                nat_profile: self.nat_profile.clone(),
+                gateway_mapping_runtime: self.gateway_mapping_runtime.clone(),
+                gateway_mapping_diagnostics: self.gateway_mapping_diagnostics.clone(),
+                udp_transport_publication: self.udp_transport_publication.clone(),
+                direct_validation_transport: self.transport.clone(),
+                direct_validation_local_ip: self.config.network.virtual_ip.clone(),
+                udp_inbound_tx: network_inbound_tx.clone(),
+                local_node_id: self.config.node.node_id.clone(),
+                stun_servers,
+                stun_server_specs: self.config.network.stun_servers.clone(),
+                udp_observer_specs: self.config.network.udp_observers.clone(),
+                runtime_stun_servers: self.runtime_stun_servers.clone(),
+                stun_timeout,
+                udp_advertise,
+                upnp_enabled,
+                socket_pool_enabled,
+                socket_pool_size,
+                keepalive_interval,
+                punch_deduplicator: self.punch_attempts.clone(),
+                udp_punch_interval: punch_interval,
+                udp_punch_attempts: punch_attempts,
+                boot_epoch_ms: self.boot_epoch_ms,
+                proxy_env,
+                excluded_interfaces,
+                shutdown_rx: self.shutdown_rx.clone(),
+                android_network_change_rx: self.android_network_change_direct_rx.clone(),
+                android_network_change_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                #[cfg(test)]
+                original_owners_for_test: None,
+            };
+            self.task_manager
+                .spawn_result_with_shutdown(
+                    "udp-direct",
+                    false,
+                    crate::tasks::TaskShutdownMode::Cooperative,
+                    run_udp_direct_task(udp_direct_context),
+                )
+                .await;
+        }
 
         // Periodic session rekey checker — truly invokes needs_rekey / is_expired.
         self.task_manager

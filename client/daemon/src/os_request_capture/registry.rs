@@ -119,7 +119,7 @@ struct RegistryState {
     #[cfg(unix)]
     revision: u64,
     #[cfg(unix)]
-    producers: std::collections::BTreeSet<[u8; 16]>,
+    producers: std::collections::HashSet<[u8; 16]>,
 }
 struct FlowState {
     plan: Arc<RegisteredFlowPlan>,
@@ -333,7 +333,7 @@ impl CaptureSession {
                 inbound_history,
                 requests: 0,
                 revision: 0,
-                producers: std::collections::BTreeSet::new(),
+                producers: registration::producer_membership()?,
             }),
             gaps: AtomicU64::new(0),
         });
@@ -349,7 +349,7 @@ impl CaptureSession {
         &self,
         plan: RegistrationPlan,
     ) -> Result<RegistrationReceipt, CaptureFailure> {
-        let mut prepared = registration::PreparedRegistration::new(plan);
+        let mut prepared = registration::PreparedRegistration::new(plan, self);
         let mut state = self
             .state
             .try_lock()
@@ -365,7 +365,7 @@ impl CaptureSession {
         plan: RegistrationPlan,
         end: tokio::time::Instant,
     ) -> Result<RegistrationReceipt, CaptureFailure> {
-        let mut prepared = registration::PreparedRegistration::new(plan);
+        let mut prepared = registration::PreparedRegistration::new(plan, self);
         let mut state = self.state.lock_until(end).await?;
         let result = prepared.append(self, &mut state);
         drop(state);
@@ -632,11 +632,12 @@ impl CaptureSession {
 
     #[cfg(unix)]
     pub(super) fn snapshot(&self) -> Result<ReadSnapshot, CaptureFailure> {
+        let buffers = snapshot::SnapshotBuffers::prepare();
         let state = self
             .state
             .try_lock()
             .map_err(|_| CaptureFailure::Contended)?;
-        let captured = self.capture_snapshot_in(&state)?;
+        let captured = self.capture_snapshot_with_buffers(&state, buffers)?;
         drop(state);
         Ok(captured.finish())
     }
@@ -646,8 +647,9 @@ impl CaptureSession {
         &self,
         end: tokio::time::Instant,
     ) -> Result<ReadSnapshot, CaptureFailure> {
+        let buffers = snapshot::SnapshotBuffers::prepare();
         let state = self.state.lock_until(end).await?;
-        let captured = self.capture_snapshot_in(&state)?;
+        let captured = self.capture_snapshot_with_buffers(&state, buffers)?;
         drop(state);
         Ok(captured.finish())
     }

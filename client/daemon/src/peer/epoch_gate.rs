@@ -21,6 +21,18 @@ pub(crate) use trace::{EpochRefusalSnapshot, EpochTryContext};
 #[derive(Clone, Copy)]
 struct Site;
 
+// An observation label captured by a synchronous entry before constructing
+// its lock future. It never grants access to the mutex or network state.
+#[derive(Clone, Copy)]
+pub(super) struct EpochLockCaller(Site);
+
+impl EpochLockCaller {
+    #[track_caller]
+    pub(super) fn capture() -> Self {
+        Self(caller_site())
+    }
+}
+
 // Bounded observation labels only; never an epoch fence or send permit.
 #[derive(Clone, Copy)]
 pub(crate) enum OutboundEpochPhase {
@@ -74,14 +86,25 @@ impl NetworkEpochGate {
     // original lock future; track_caller on an async fn would lose this site.
     #[track_caller]
     pub(crate) fn lock(&self) -> impl Future<Output = NetworkEpochGuard<'_>> {
-        let site = caller_site();
-        async move { self.wrap(self.inner.lock().await, site) }
+        self.lock_for(EpochLockCaller::capture())
+    }
+
+    pub(super) async fn lock_for(&self, caller: EpochLockCaller) -> NetworkEpochGuard<'_> {
+        self.wrap(self.inner.lock().await, caller.0)
     }
 
     #[track_caller]
     pub(crate) fn try_lock(&self) -> Result<NetworkEpochGuard<'_>, TryLockError> {
-        let site = caller_site();
-        self.inner.try_lock().map(|guard| self.wrap(guard, site))
+        self.try_lock_for(EpochLockCaller::capture())
+    }
+
+    pub(super) fn try_lock_for(
+        &self,
+        caller: EpochLockCaller,
+    ) -> Result<NetworkEpochGuard<'_>, TryLockError> {
+        self.inner
+            .try_lock()
+            .map(|guard| self.wrap(guard, caller.0))
     }
 
     #[track_caller]

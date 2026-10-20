@@ -530,63 +530,63 @@ impl InboundHistory {
     }
 
     #[cfg(unix)]
-    pub(super) fn snapshot_coverage(&self) -> super::snapshot::SnapshotCoverage {
-        super::snapshot::SnapshotCoverage::from_rows(
+    pub(super) fn snapshot_coverage(
+        &self,
+        mut rows: Vec<(usize, Vec<ReadFrameSpan>)>,
+    ) -> super::snapshot::SnapshotCoverage {
+        rows.extend(
             self.writes
                 .iter()
                 .filter(|binding| binding.write.get().is_some())
-                .map(|binding| (binding.flow, binding.spans.clone()))
-                .collect(),
-        )
+                .map(|binding| (binding.flow, binding.spans.clone())),
+        );
+        super::snapshot::SnapshotCoverage::from_rows(rows)
     }
 
     #[cfg(unix)]
-    pub(super) fn snapshot(&self) -> Vec<WriteSnapshot> {
-        self.writes
-            .iter()
-            .filter_map(|binding| {
-                let write = binding.write.get()?;
-                Some(WriteSnapshot {
-                    scope: "original_authenticated_system_tun_full_history_only",
-                    flow: binding.flow,
-                    spans: binding.spans.clone(),
-                    write_ordinal: write.ordinal(),
-                    write_observed_monotonic_ns: write.monotonic_ns(),
-                    authenticated_observed_monotonic_ns: binding
-                        .authenticated_observed_monotonic_ns,
-                    packet_len: binding.packet_len,
-                    packet_sha256: binding.packet_sha256,
-                    network_generation: binding.source.network_generation(),
-                    session_instance: binding.source.session().session_instance(),
-                    peer_lifecycle: binding
-                        .source
-                        .session()
-                        .authorized_peer_lifecycle()
-                        .map(|life| life.value()),
-                    original_session_role: match binding.source.session().original_role() {
-                        OriginalSessionRole::Active => "active",
-                        OriginalSessionRole::Pending => "pending",
-                        OriginalSessionRole::Previous => "previous",
-                    },
-                    original_room_captured: binding
-                        .original_rooms
-                        .iter()
-                        .map(|room| room.permit.is_ok())
-                        .collect(),
-                    original_room_restricted: binding
-                        .original_rooms
-                        .iter()
-                        .map(|room| matches!(room.permit, Ok(Some(_))))
-                        .collect(),
-                    original_room_owner_live: binding
-                        .original_rooms
-                        .iter()
-                        .map(|room| room.owner.upgrade().is_some())
-                        .collect(),
-                    canonical_current_owner_verified: false,
-                })
+    pub(super) fn snapshot(&self, mut output: Vec<WriteSnapshot>) -> Vec<WriteSnapshot> {
+        output.extend(self.writes.iter().filter_map(|binding| {
+            let write = binding.write.get()?;
+            Some(WriteSnapshot {
+                scope: "original_authenticated_system_tun_full_history_only",
+                flow: binding.flow,
+                spans: binding.spans.clone(),
+                write_ordinal: write.ordinal(),
+                write_observed_monotonic_ns: write.monotonic_ns(),
+                authenticated_observed_monotonic_ns: binding.authenticated_observed_monotonic_ns,
+                packet_len: binding.packet_len,
+                packet_sha256: binding.packet_sha256,
+                network_generation: binding.source.network_generation(),
+                session_instance: binding.source.session().session_instance(),
+                peer_lifecycle: binding
+                    .source
+                    .session()
+                    .authorized_peer_lifecycle()
+                    .map(|life| life.value()),
+                original_session_role: match binding.source.session().original_role() {
+                    OriginalSessionRole::Active => "active",
+                    OriginalSessionRole::Pending => "pending",
+                    OriginalSessionRole::Previous => "previous",
+                },
+                original_room_captured: binding
+                    .original_rooms
+                    .iter()
+                    .map(|room| room.permit.is_ok())
+                    .collect(),
+                original_room_restricted: binding
+                    .original_rooms
+                    .iter()
+                    .map(|room| matches!(room.permit, Ok(Some(_))))
+                    .collect(),
+                original_room_owner_live: binding
+                    .original_rooms
+                    .iter()
+                    .map(|room| room.owner.upgrade().is_some())
+                    .collect(),
+                canonical_current_owner_verified: false,
             })
-            .collect()
+        }));
+        output
     }
 }
 

@@ -1224,16 +1224,27 @@ impl WireGuardTransport {
                                                     )
                                             })
                                     };
-                                    // This is an ingress observation, not the
-                                    // same milestone as first_usable_path.
-                                    // Keep the first ingress event for backwards
-                                    // compatibility, and also retain one event
-                                    // for each meaningful path/transport/result
-                                    // identity.  If a too-early Direct packet
-                                    // is rejected and a later Relay packet is
-                                    // accepted, the second event must remain
-                                    // visible; a single first-event key would
-                                    // otherwise hide the actual relay proof.
+                                    let business_attribution_identity = if feed.timeline.is_some()
+                                        && path == crate::peer::NetworkPath::Direct
+                                        && owns_direct_packet
+                                    {
+                                        udp.as_ref().and_then(|udp| {
+                                            udp.hard_hard_business_attribution_identity_for_ingress(
+                                                &inbound.peer_id,
+                                                source,
+                                                local_endpoint,
+                                                socket_index,
+                                                udp_transport_owner,
+                                                packet_network_generation,
+                                            )
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                    drop(session_guard);
+                                    // Publish historical diagnostics after releasing the actual
+                                    // counter fence. Preserve each path/transport/result key
+                                    // so early Direct rejection cannot hide later Relay ingress.
                                     if let Some(timeline) = feed.timeline.as_ref() {
                                         let scope =
                                             format!("peer:{}:{generation}", inbound.peer_id);
@@ -1277,23 +1288,6 @@ impl WireGuardTransport {
                                             packet_identity,
                                             wire_fingerprint(&inbound.packet),
                                         );
-                                        let business_attribution_identity = if path
-                                            == crate::peer::NetworkPath::Direct
-                                            && owns_direct_packet
-                                        {
-                                            udp.as_ref().and_then(|udp| {
-                                                    udp.hard_hard_business_attribution_identity_for_ingress(
-                                                        &inbound.peer_id,
-                                                        source,
-                                                        local_endpoint,
-                                                        socket_index,
-                                                        udp_transport_owner,
-                                                        packet_network_generation,
-                                                    )
-                                                })
-                                        } else {
-                                            None
-                                        };
                                         timeline.emit_first_scoped_with_business_attribution_identity(
                                             &scope,
                                             &format!(
@@ -1367,7 +1361,6 @@ impl WireGuardTransport {
                                         );
                                     }
                                 }
-                                drop(session_guard);
                             }
                         }
                     }

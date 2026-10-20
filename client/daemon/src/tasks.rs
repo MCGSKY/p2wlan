@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{error, info, warn};
 
 const CONTROL_HEALTH_STALE_AFTER: Duration = Duration::from_secs(30);
@@ -78,8 +78,29 @@ struct TrackedTask {
     name: String,
     critical: bool,
     handle: JoinHandle<()>,
+    shutdown_mode: TaskShutdownMode,
     finished: bool,
     error: Option<String>,
+}
+
+/// Owners with async child cleanup must observe their existing stop signal
+/// before their outer future is cancelled. All other tasks still abort first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskShutdownMode {
+    Abort,
+    Cooperative,
+}
+
+// These capabilities refer only to original tasks drained from this manager.
+// They also cancel cooperative owners if the shutdown future itself is dropped.
+struct CooperativeAbortGuard(Vec<AbortHandle>);
+
+impl Drop for CooperativeAbortGuard {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
 }
 
 /// Shared health state used by diagnostics and the main loop.
@@ -300,6 +321,7 @@ impl TaskManager {
                 name,
                 critical,
                 handle,
+                shutdown_mode: TaskShutdownMode::Abort,
                 finished: false,
                 error: None,
             },
@@ -311,6 +333,22 @@ impl TaskManager {
         self: &Arc<Self>,
         name: impl Into<String>,
         critical: bool,
+        fut: F,
+    ) where
+        F: std::future::Future<Output = Result<(), E>> + Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+    {
+        self.spawn_result_with_shutdown(name, critical, TaskShutdownMode::Abort, fut)
+            .await;
+    }
+
+    /// Cooperative owners consume their existing stop signal and join child
+    /// work within shutdown_all's original timeout; no extra grace timer runs.
+    pub(crate) async fn spawn_result_with_shutdown<F, E>(
+        self: &Arc<Self>,
+        name: impl Into<String>,
+        critical: bool,
+        shutdown_mode: TaskShutdownMode,
         fut: F,
     ) where
         F: std::future::Future<Output = Result<(), E>> + Send + 'static,
@@ -335,6 +373,7 @@ impl TaskManager {
                 name,
                 critical,
                 handle,
+                shutdown_mode,
                 finished: false,
                 error: None,
             },
@@ -394,7 +433,8 @@ impl TaskManager {
         out
     }
 
-    /// Abort all tasks and wait up to `timeout` for them to finish.
+    /// Stop all tasks within the existing timeout. Cooperative owners first
+    /// finish child cleanup; default tasks are aborted before waiting.
     pub async fn shutdown_all(&self, timeout: Duration) {
         self.request_shutdown();
         self.health
@@ -404,20 +444,30 @@ impl TaskManager {
             )
             .await;
 
-        let handles: Vec<(String, JoinHandle<()>)> = {
+        let handles: Vec<(String, JoinHandle<()>, TaskShutdownMode)> = {
             let mut tasks = self.tasks.lock().await;
-            tasks.drain().map(|(name, t)| (name, t.handle)).collect()
+            tasks
+                .drain()
+                .map(|(name, t)| (name, t.handle, t.shutdown_mode))
+                .collect()
         };
 
-        for (name, handle) in &handles {
-            if !handle.is_finished() {
+        let _cooperative_abort_guard = CooperativeAbortGuard(
+            handles
+                .iter()
+                .filter(|(_, _, mode)| *mode == TaskShutdownMode::Cooperative)
+                .map(|(_, handle, _)| handle.abort_handle())
+                .collect(),
+        );
+        for (name, handle, mode) in &handles {
+            if *mode == TaskShutdownMode::Abort && !handle.is_finished() {
                 info!("Aborting task {name}");
                 handle.abort();
             }
         }
 
         let wait = async {
-            for (name, handle) in handles {
+            for (name, handle, _) in handles {
                 match handle.await {
                     Ok(()) => debug_finished(&name),
                     Err(err) if err.is_cancelled() => debug_finished(&name),
@@ -438,6 +488,10 @@ impl TaskManager {
 fn debug_finished(name: &str) {
     info!("Task {name} stopped");
 }
+
+#[cfg(test)]
+#[path = "tasks/cooperative_shutdown_tests.rs"]
+mod cooperative_shutdown_tests;
 
 #[cfg(test)]
 mod tests {

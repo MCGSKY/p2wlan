@@ -961,28 +961,34 @@ impl PeerManager {
     /// without holding the epoch gate while waiting in Tokio's fair writer queue.
     /// This prevents cyclic deadlocks between readers finishing epoch-fenced
     /// transactions and writers queued behind them.
-    pub(crate) async fn lock_epoch_and_connections_write<'a>(
+    #[track_caller]
+    pub(crate) fn lock_epoch_and_connections_write<'a>(
         &'a self,
-    ) -> (
-        crate::peer::NetworkEpochGuard<'a>,
-        tokio::sync::RwLockWriteGuard<'a, HashMap<String, PeerConnection>>,
-    ) {
-        loop {
-            let epoch_guard = self.network_epoch_gate.lock().await;
-            match self.connections.try_write() {
-                Ok(connections) => return (epoch_guard, connections),
-                Err(_) => {
-                    drop(epoch_guard);
-                    let connections = self.connections.write().await;
-                    // The fair RwLock has granted this writer its permit.
-                    // Dropping it before try_write would let another queued
-                    // writer reserve that permit and make both owners yield
-                    // forever. Retain it only across a nonblocking epoch
-                    // attempt: no reverse-order await may hold connections.
-                    if let Ok(epoch_guard) = self.network_epoch_gate.try_lock() {
-                        return (epoch_guard, connections);
+    ) -> impl std::future::Future<
+        Output = (
+            crate::peer::NetworkEpochGuard<'a>,
+            tokio::sync::RwLockWriteGuard<'a, HashMap<String, PeerConnection>>,
+        ),
+    > + 'a {
+        let caller = crate::peer::epoch_gate::EpochLockCaller::capture();
+        async move {
+            loop {
+                let epoch_guard = self.network_epoch_gate.lock_for(caller).await;
+                match self.connections.try_write() {
+                    Ok(connections) => return (epoch_guard, connections),
+                    Err(_) => {
+                        drop(epoch_guard);
+                        let connections = self.connections.write().await;
+                        // The fair RwLock has granted this writer its permit.
+                        // Dropping it before try_write would let another queued
+                        // writer reserve that permit and make both owners yield
+                        // forever. Retain it only across a nonblocking epoch
+                        // attempt: no reverse-order await may hold connections.
+                        if let Ok(epoch_guard) = self.network_epoch_gate.try_lock_for(caller) {
+                            return (epoch_guard, connections);
+                        }
+                        drop(connections);
                     }
-                    drop(connections);
                 }
             }
         }
@@ -990,27 +996,33 @@ impl PeerManager {
 
     /// Lock the network epoch gate and connection read lock in canonical order
     /// without holding the epoch gate while waiting in Tokio's reader queue behind queued writers.
-    pub(crate) async fn lock_epoch_and_connections_read<'a>(
+    #[track_caller]
+    pub(crate) fn lock_epoch_and_connections_read<'a>(
         &'a self,
-    ) -> (
-        crate::peer::NetworkEpochGuard<'a>,
-        tokio::sync::RwLockReadGuard<'a, HashMap<String, PeerConnection>>,
-    ) {
-        loop {
-            let epoch_guard = self.network_epoch_gate.lock().await;
-            match self.connections.try_read() {
-                Ok(connections) => return (epoch_guard, connections),
-                Err(_) => {
-                    drop(epoch_guard);
-                    let connections = self.connections.read().await;
-                    // A queued writer can similarly block try_read after
-                    // a granted reader is discarded. Try the epoch while
-                    // retaining that grant, but release connections at once
-                    // if the epoch is busy; never await in reverse order.
-                    if let Ok(epoch_guard) = self.network_epoch_gate.try_lock() {
-                        return (epoch_guard, connections);
+    ) -> impl std::future::Future<
+        Output = (
+            crate::peer::NetworkEpochGuard<'a>,
+            tokio::sync::RwLockReadGuard<'a, HashMap<String, PeerConnection>>,
+        ),
+    > + 'a {
+        let caller = crate::peer::epoch_gate::EpochLockCaller::capture();
+        async move {
+            loop {
+                let epoch_guard = self.network_epoch_gate.lock_for(caller).await;
+                match self.connections.try_read() {
+                    Ok(connections) => return (epoch_guard, connections),
+                    Err(_) => {
+                        drop(epoch_guard);
+                        let connections = self.connections.read().await;
+                        // A queued writer can similarly block try_read after
+                        // a granted reader is discarded. Try the epoch while
+                        // retaining that grant, but release connections at once
+                        // if the epoch is busy; never await in reverse order.
+                        if let Ok(epoch_guard) = self.network_epoch_gate.try_lock_for(caller) {
+                            return (epoch_guard, connections);
+                        }
+                        drop(connections);
                     }
-                    drop(connections);
                 }
             }
         }

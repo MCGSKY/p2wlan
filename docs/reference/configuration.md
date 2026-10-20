@@ -53,6 +53,8 @@ Control 信令服务在 WebSocket `ready` 帧中向客户端声明 `path_telemet
 
 配置保存后重新启动对应 daemon/profile 生效。旧配置中显式保存的 `auto`、`score`、`direct-sticky`、`relay-only` 不会被悄悄迁移；需要直连优先时显式设置上述值。`auto` 保留旧的立即 Relay 回退策略，`score` 比较已确认路径质量，`direct-sticky` 只保证已确认 Direct 的保持，`relay-only` 明确禁用 Direct 业务路径。`prefer_direct=false` 仍具有 Relay-only 语义。
 
+Relay-only 启动时不解析 Direct 专用的 STUN 或 UDP observer 地址，也不启动 Direct 探测和 UDP 连接任务；Control、Relay 与 WireGuard 会话维护仍正常运行。其他路径策略保留 Direct 升级能力。
+
 `relay_startup_timeout_ms` 仍默认为 3000，旧字段 `fallback_timeout_ms` 仍是读取别名。在 Direct-first 下，首次业务 FIFO 的总等待预算包含 5 秒直连窗口，再加配置的 Relay 启动等待；未配置 Relay 时只等待 Direct，不会虚构中继。该预算不会因每个新业务包或候选刷新而无限续期；队列仍受原有包数、字节数和 generation 边界保护。
 
 CLI 的 `--prefer-direct` 与 `relay-policy=direct` 选择 Direct-first；显式 `--prefer-relay` 或 `relay-policy=prefer-relay` 使用兼容 Auto，不等同于 Relay-only。

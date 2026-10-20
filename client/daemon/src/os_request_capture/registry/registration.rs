@@ -2,6 +2,19 @@
 //! the sole append authority. Empty shared cells contain no observed IO facts.
 use super::*;
 
+mod conflicts;
+
+// Each valid registration adds at least one of the original MAX_REQUESTS.
+// Reserve membership before exposing the scope so the sole append transaction
+// never grows this table while excluding the input reader's single try.
+pub(super) fn producer_membership() -> Result<std::collections::HashSet<[u8; 16]>, CaptureFailure> {
+    let mut producers = std::collections::HashSet::new();
+    producers
+        .try_reserve(MAX_REQUESTS)
+        .map_err(|_| CaptureFailure::Capacity)?;
+    Ok(producers)
+}
+
 pub(super) struct PreparedRegistration {
     capture_id: [u8; 16],
     producer: [u8; 16],
@@ -10,10 +23,11 @@ pub(super) struct PreparedRegistration {
     sources: Result<Vec<Arc<native::source_index::FlowSources>>, CaptureFailure>,
     capture_label: String,
     producer_label: String,
+    conflicts: conflicts::Prechecked,
 }
 
 impl PreparedRegistration {
-    pub(super) fn new(plan: RegistrationPlan) -> Self {
+    pub(super) fn new(plan: RegistrationPlan, scope: &CaptureSession) -> Self {
         let producer = plan.producer_scope;
         let added = plan.flows.iter().map(|flow| flow.requests.len()).sum();
         #[cfg(all(unix, test))]
@@ -49,6 +63,7 @@ impl PreparedRegistration {
             })
             .collect();
         let sources = Self::sources(&incoming);
+        let conflicts = conflicts::Prechecked::capture(scope, &incoming);
         Self {
             capture_id: plan.capture_id,
             producer,
@@ -57,6 +72,7 @@ impl PreparedRegistration {
             sources,
             capture_label: hex::encode(plan.capture_id),
             producer_label: hex::encode(producer),
+            conflicts,
         }
     }
 
@@ -92,19 +108,7 @@ impl PreparedRegistration {
             .checked_add(self.added)
             .filter(|n| *n <= MAX_REQUESTS)
             .ok_or(CaptureFailure::Capacity)?;
-        if state.producers.contains(&self.producer)
-            || self.incoming.iter().any(|incoming| {
-                state.flows.iter().any(|old| {
-                    (old.plan.protocol == incoming.plan.protocol
-                        && old.plan.flow == incoming.plan.flow)
-                        || (old.plan.protocol == incoming.plan.protocol
-                            && incoming
-                                .plan
-                                .requests
-                                .iter()
-                                .any(|key| old.plan.requests.contains(key)))
-                })
-            })
+        if state.producers.contains(&self.producer) || self.conflicts.recheck(state, &self.incoming)
         {
             return Err(CaptureFailure::RegistrationConflict);
         }
