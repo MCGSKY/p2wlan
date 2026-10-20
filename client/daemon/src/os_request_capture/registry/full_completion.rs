@@ -1,6 +1,8 @@
 //! Resume bounded completion metadata on the existing descriptor actor.
 //! No task, packet retry, fresh deadline or replacement native fact is created.
-use super::{CaptureSession, FullRetentionLossReason, KernelReadBinding};
+#[cfg(test)]
+use super::FullRetentionLossReason;
+use super::{CaptureSession, KernelReadBinding};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
