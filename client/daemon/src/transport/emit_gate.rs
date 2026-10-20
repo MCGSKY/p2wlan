@@ -6,6 +6,8 @@ use std::ops::Deref;
 use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, TryLockError};
 
+pub(super) mod cache;
+
 #[cfg(any(target_os = "linux", all(unix, test)))]
 mod trace;
 #[cfg(any(target_os = "linux", all(unix, test)))]
