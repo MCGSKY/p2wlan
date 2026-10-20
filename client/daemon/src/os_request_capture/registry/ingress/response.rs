@@ -41,7 +41,8 @@ pub(in crate::os_request_capture::registry) struct ResponseSnapshot {
     original_room_captured: bool,
     original_system_write_contributors: usize,
     original_room_restricted: bool,
-    capture_failure: Option<String>,
+    #[serde(serialize_with = "super::super::snapshot_hex::serialize_optional_debug")]
+    capture_failure: Option<OverlayCreditOutcome>,
 }
 
 impl KernelResponseInput {
@@ -54,7 +55,9 @@ impl KernelResponseInput {
     ) -> Outcome<Self> {
         use OverlayCreditOutcome::{Stale, Unknown};
         let flow = &state.flows[flow_index];
-        if !scope.inbound_complete.load(Ordering::Acquire) || flow.inbound.invalid {
+        if !scope.inbound_complete.load(Ordering::Acquire)
+            || flow.inbound.invalid.load(Ordering::Acquire)
+        {
             return Err(Unknown(OverlayCreditUnknown::OriginalSource));
         }
         if flow.plan.requests[slot].kind != RequestKind::Response {
@@ -168,15 +171,17 @@ impl CaptureSession {
                 if original.is_err() {
                     self.gap();
                 }
-                state.flows[flow].requests[*slot].first_response =
-                    Some(Arc::new(ResponseCapture {
+                let room = state.flows[flow].inbound.original_room[*slot].clone();
+                let _ = state.flows[flow].requests[*slot]
+                    .first_response
+                    .set(Arc::new(ResponseCapture {
                         flow,
                         slot: *slot,
-                        room: state.flows[flow].inbound.original_room[*slot].clone(),
+                        room,
                         original,
                     }));
             }
-            if let Some(input) = &state.flows[flow].requests[*slot].first_response {
+            if let Some(input) = state.flows[flow].requests[*slot].first_response.as_ref() {
                 inputs.push(input.clone());
             }
         }
@@ -350,11 +355,7 @@ impl ResponseCapture {
                 .room
                 .as_ref()
                 .is_some_and(|room| matches!(room.permit, Ok(Some(_)))),
-            capture_failure: self
-                .original
-                .as_ref()
-                .err()
-                .map(|reason| format!("{reason:?}")),
+            capture_failure: self.original.as_ref().err().copied(),
         }
     }
 }

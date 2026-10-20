@@ -179,17 +179,17 @@ impl CaptureSession {
                 first_read_ordinal: row.first_read.as_ref().map(|read| read.ordinal()),
                 terminal_outcome_recorded: row.native_credit.is_some(),
                 original_write_window_received: row.original_write_window.is_some(),
-                kernel_frame_read_complete: !flow.invalid
+                kernel_frame_read_complete: !flow.invalid.load(Ordering::Acquire)
                     && (row.udp_complete || row.tcp.as_ref().is_some_and(|tcp| tcp.is_complete())),
-                historical_frame_full_complete: !flow.invalid
+                historical_frame_full_complete: !flow.invalid.load(Ordering::Acquire)
                     && self.full_complete.load(Ordering::Acquire)
                     && full::frame_complete(&state.read_history, index, slot, &flow.plan),
-                incoming_frame_system_write_complete: !flow.inbound.invalid
+                incoming_frame_system_write_complete: !flow.inbound.invalid.load(Ordering::Acquire)
                     && state
                         .inbound_history
                         .frame_complete(index, slot, &flow.plan),
-                flow_invalid: flow.invalid,
-                incoming_flow_invalid: flow.inbound.invalid,
+                flow_invalid: flow.invalid.load(Ordering::Acquire),
+                incoming_flow_invalid: flow.inbound.invalid.load(Ordering::Acquire),
             });
         }
         metadata.observation = Observation::Observed;

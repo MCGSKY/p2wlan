@@ -181,6 +181,15 @@ impl NetworkEpochGate {
         }
     }
 
+    fn ending(&self, token: Option<u64>, ended: Option<u64>) {
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        if let (Some(token), Some(trace)) = (token, self.trace.get()) {
+            trace.ending(token, ended);
+        }
+        #[cfg(not(any(target_os = "linux", all(unix, test))))]
+        let _ = (token, ended);
+    }
+
     fn released(&self, token: Option<u64>, ended: Option<u64>) {
         #[cfg(any(target_os = "linux", all(unix, test)))]
         if let (Some(token), Some(trace)) = (token, self.trace.get()) {
@@ -263,6 +272,7 @@ impl DerefMut for OwnedNetworkEpochGuard {
 impl Drop for NetworkEpochGuard<'_> {
     fn drop(&mut self) {
         let ended = observed_end(self.token);
+        self.owner.ending(self.token, ended);
         drop(self.inner.take());
         self.owner.released(self.token, ended);
     }
@@ -270,6 +280,7 @@ impl Drop for NetworkEpochGuard<'_> {
 impl Drop for OwnedNetworkEpochGuard {
     fn drop(&mut self) {
         let ended = observed_end(self.token);
+        self.owner.ending(self.token, ended);
         drop(self.inner.take());
         self.owner.released(self.token, ended);
     }

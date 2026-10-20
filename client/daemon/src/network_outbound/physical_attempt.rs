@@ -1,5 +1,6 @@
 // Sole original emit owner OUTSIDE the cancellable bounded send future.
-// The inner future borrows storage; its epoch/slot/session guards end first.
+// The inner future borrows this owner. Relay seals after the real writer
+// returns, before post-send policy waits; native epoch/slot/session guards end first.
 use crate::overlay_requests::{PhysicalRequestPublisher, PreparedPhysicalPublication};
 use crate::relay::{RelayCaptureOutcome, RelaySendCapture};
 use crate::transport::EncryptedPeerPacket;
@@ -20,9 +21,6 @@ impl PhysicalSendCapture {
             metadata_failed: false,
             relay_admitted: false,
         }
-    }
-    pub(super) fn udp(&mut self) -> &mut UdpSendCapture {
-        &mut self.udp
     }
     #[cfg(test)]
     pub(super) fn relay_for_test(&mut self, packet: &EncryptedPeerPacket) -> Arc<RelaySendCapture> {
@@ -55,6 +53,7 @@ pub(super) struct PhysicalAttempt<G> {
     publisher: Option<PhysicalRequestPublisher>,
     capture: PhysicalSendCapture,
 }
+pub(super) type OutboundPhysicalAttempt = PhysicalAttempt<Arc<crate::transport::OwnedEmitGuard>>;
 impl<G> PhysicalAttempt<G> {
     pub(super) fn new(emit: G, prepared: Option<PreparedPhysicalPublication>) -> Self {
         Self {
@@ -88,7 +87,8 @@ impl<G> PhysicalAttempt<G> {
         // Take once: Drop cannot seal a second time or publish a second fact.
         let relay = self.capture.relay.take().map(|capture| capture.finish());
         let udp = self.capture.udp.take();
-        // Seal after destroying inner, then release original emit before publish.
+        // Native handoff guards have ended. Release original emit before publish;
+        // Relay's bounded future may still await its post-send policy bookkeeping.
         drop(self.emit.take());
         if let Some(publisher) = self.publisher.as_mut() {
             if self.capture.metadata_failed || (udp.is_some() && relay.is_some()) {

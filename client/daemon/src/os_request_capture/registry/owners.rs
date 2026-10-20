@@ -63,11 +63,10 @@ impl CaptureSession {
             {
                 return false;
             }
-            if let Some(previous) = &state.current_owners {
+            if let Some(previous) = state.current_owners.as_ref() {
                 previous.same_owner(&original)
             } else {
-                state.current_owners = Some(original);
-                true
+                state.current_owners.set(Arc::new(original)).is_ok()
             }
         });
         #[cfg(any(target_os = "linux", all(unix, test)))]

@@ -51,3 +51,6 @@ mod relay_only_diagnostics;
 
 #[path = "tests/peer_update_resources.rs"]
 mod peer_update_resources;
+
+#[path = "tests/path_selection_logging.rs"]
+mod path_selection_logging;

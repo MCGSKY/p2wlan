@@ -647,6 +647,11 @@ pub use types::{
     PathSelectionDiagnostics, PathSelectionEvent, HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION,
 };
 
+const PATH_SELECTION_LOG_TARGET: &str = module_path!();
+mod path_selection_log;
+pub(crate) use path_selection_log::DeferredPathSelectionLog;
+use path_selection_log::PathSelectionLog;
+
 mod epoch_gate;
 #[cfg(any(target_os = "linux", all(unix, test)))]
 pub(crate) use epoch_gate::{EpochRefusalSnapshot, EpochTraceLease, EpochTryContext};

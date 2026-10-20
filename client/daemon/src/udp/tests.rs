@@ -12,6 +12,9 @@ include!("tests/part09.rs");
 include!("tests/socket_handoff.rs");
 include!("tests/keepalive_shadow.rs");
 
+#[path = "tests/committed_socket_resolution.rs"]
+mod committed_socket_resolution;
+
 #[path = "tests/keepalive_idle.rs"]
 mod keepalive_idle;
 

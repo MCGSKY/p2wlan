@@ -238,19 +238,22 @@ impl CaptureSession {
         if request.original_write_window.is_some() {
             return Err(CaptureFailure::DuplicateWrite);
         }
-        request.original_write_window = Some(WriteWindow {
-            scope: "original_controller_write_window_only",
-            request_nonce: wire.request_nonce,
-            original_started_ns: wire.original_started_ns,
-            original_sent_ns: wire.original_sent_ns,
-            original_deadline_ns: wire.original_deadline_ns,
-            complete_returned_ns: wire.complete_returned_ns,
-            received_monotonic_ns: received,
-            frame_bytes: wire.frame_bytes,
-            frame_sha256: wire.frame_sha256,
-            native_os_write_verified: false,
-            canonical_current_owner_verified: false,
-        });
+        request
+            .original_write_window
+            .set(WriteWindow {
+                scope: "original_controller_write_window_only",
+                request_nonce: wire.request_nonce,
+                original_started_ns: wire.original_started_ns,
+                original_sent_ns: wire.original_sent_ns,
+                original_deadline_ns: wire.original_deadline_ns,
+                complete_returned_ns: wire.complete_returned_ns,
+                received_monotonic_ns: received,
+                frame_bytes: wire.frame_bytes,
+                frame_sha256: wire.frame_sha256,
+                native_os_write_verified: false,
+                canonical_current_owner_verified: false,
+            })
+            .map_err(|_| CaptureFailure::DuplicateWrite)?;
         // The descriptor actor owns completion work. Release this registration
         // guard before waking it so real input/SystemTun retention keeps its
         // original single try while this command only installs its metadata.

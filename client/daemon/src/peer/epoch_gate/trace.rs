@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+mod last_interval;
+use last_interval::{CompletedInterval, LastInterval};
+
 pub(super) fn now_ns() -> Option<u64> {
     #[cfg(any(target_os = "linux", all(unix, test)))]
     {
@@ -122,6 +125,7 @@ struct Refusal {
     started: Option<u64>,
     returned: Option<u64>,
     holder: Option<Holder>,
+    last_completed: Option<CompletedInterval>,
     completion_claimed: AtomicBool,
     completion_observed: AtomicBool,
     ended: AtomicU64,
@@ -144,6 +148,7 @@ pub(super) struct Trace {
     first: OnceLock<Refusal>,
     read_peer_claimed: AtomicBool,
     read_peer_first: OnceLock<Refusal>,
+    last: LastInterval,
 }
 
 impl Trace {
@@ -166,6 +171,7 @@ impl Trace {
             first: OnceLock::new(),
             read_peer_claimed: AtomicBool::new(false),
             read_peer_first: OnceLock::new(),
+            last: LastInterval::new(),
         }
     }
     fn live(&self) -> bool {
@@ -238,30 +244,27 @@ impl Trace {
         {
             return;
         }
-        let token = self.current.load(Ordering::SeqCst);
-        let holder = Holder {
-            token,
-            site: Site {
-                code: self.site.load(Ordering::SeqCst),
-                line: self.line.load(Ordering::SeqCst),
-            },
-            started: nonzero(self.started.load(Ordering::SeqCst)),
-            phase: self.observed_phase(),
-        };
-        let stable = token != 0 && token == self.current.load(Ordering::SeqCst);
+        let holder = self.observed_holder();
         // Only one claimant sets the first slot. An unstable/missing holder
         // remains unknown; no initializer wait or later replacement is allowed.
         let _ = first.set(Refusal {
             context,
             started: started.filter(|n| *n != 0),
             returned: returned.filter(|n| *n != 0),
-            holder: stable.then_some(holder),
+            holder,
+            last_completed: self.last.observed_completed(),
             completion_claimed: AtomicBool::new(false),
             completion_observed: AtomicBool::new(false),
             ended: AtomicU64::new(0),
         });
     }
+    pub(super) fn ending(&self, token: u64, ended: Option<u64>) {
+        if let Some(holder) = self.observed_holder().filter(|h| h.token == token) {
+            self.last.ending(holder, ended);
+        }
+    }
     pub(super) fn released(&self, token: u64, ended: Option<u64>) {
+        self.last.complete(token);
         let _ = self
             .current
             .compare_exchange(token, 0, Ordering::SeqCst, Ordering::SeqCst);
@@ -342,6 +345,11 @@ impl Trace {
                 interval_covers_failed_try: phase_covers(covers, phase.started, first.started),
             }),
         });
+        let (last_completed_holder, last_completed_holder_interval_covers_failed_try) =
+            first.last_completed.map_or((None, false), |interval| {
+                let (holder, covers) = interval.snapshot(first.started, first.returned);
+                (Some(holder), covers)
+            });
         let context = first.context;
         Some(EpochRefusalSnapshot {
             scope,
@@ -362,6 +370,8 @@ impl Trace {
             failed_try_returned_monotonic_ns: first.returned,
             holder,
             holder_interval_covers_failed_try: covers,
+            last_completed_holder,
+            last_completed_holder_interval_covers_failed_try,
             native_os_write_verified: false,
             physical_send_verified: false,
             canonical_current_owner_verified: false,
@@ -425,6 +435,9 @@ pub(crate) struct EpochRefusalSnapshot {
     failed_try_returned_monotonic_ns: Option<u64>,
     holder: Option<EpochHolderSnapshot>,
     holder_interval_covers_failed_try: bool,
+    // A separate bounded observation; it never replaces the first holder.
+    last_completed_holder: Option<EpochHolderSnapshot>,
+    last_completed_holder_interval_covers_failed_try: bool,
     native_os_write_verified: bool,
     physical_send_verified: bool,
     canonical_current_owner_verified: bool,
@@ -465,3 +478,6 @@ mod tests {
         assert!(trace.observed_phase().is_none());
     }
 }
+
+#[cfg(test)]
+mod completed_interval_tests;

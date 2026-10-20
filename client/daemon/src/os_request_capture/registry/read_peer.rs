@@ -15,7 +15,8 @@ pub(super) struct ReadPeerSnapshot {
     known: bool,
     network_generation: Option<u64>,
     peer_lifecycle: Option<u64>,
-    capture_failure: Option<String>,
+    #[serde(serialize_with = "super::snapshot_hex::serialize_optional_debug")]
+    capture_failure: Option<OverlayCreditOutcome>,
 }
 
 impl FirstReadPeer {
@@ -104,11 +105,7 @@ impl FirstReadPeer {
                 .ok()
                 .map(|peer| peer.lifecycle().value()),
             // Diagnostic only. This text is never parsed to drive control flow.
-            capture_failure: self
-                .original
-                .as_ref()
-                .err()
-                .map(|failure| format!("{failure:?}")),
+            capture_failure: self.original.as_ref().err().copied(),
         }
     }
 }

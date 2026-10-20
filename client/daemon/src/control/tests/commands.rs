@@ -277,7 +277,7 @@ async fn network_changed_aborts_signaling_and_re_registers() {
     // A task whose "connected" bit is already set proves the abort reached the
     // signaling transport rather than merely returning a disposition.
     let connected = Arc::new(AtomicBool::new(true));
-    let (wake_tx, _wake_rx) = mpsc::channel(4);
+    let (wake_tx, _wake_rx) = wake::channel(4);
     let signal_ws_task = spawn_signal_websocket(
         &stub.base_url,
         "dc-test-device",

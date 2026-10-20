@@ -1,6 +1,13 @@
 use super::*;
 
 impl UdpTransport {
+    #[cfg(test)]
+    pub(crate) async fn hold_socket_registry_for_test(
+        &self,
+    ) -> tokio::sync::OwnedMutexGuard<SocketState> {
+        self.socket_state.clone().lock_owned().await
+    }
+
     /// Immutable hh2 classification survives detach and its ACK drain grace.
     /// A legacy PNCH must never generate a reply from that retained socket.
     pub(super) async fn permits_legacy_punch_on_socket(&self, socket_index: usize) -> bool {
@@ -552,7 +559,9 @@ impl UdpTransport {
         local_endpoint: SocketAddr,
         generation: u64,
     ) -> Option<(usize, Arc<UdpSocket>, DynamicSocketSendLease)> {
-        let state = self.socket_state.lock().await;
+        // Fixed pool/IPv6 sockets are immutable members of this transport.
+        // Their exact endpoint lookup does not read dynamic ownership state.
+        // Callers still fence generation/path/budget and the final native send.
         if generation != self.peers.current_network_generation_sync() {
             return None;
         }
@@ -571,6 +580,12 @@ impl UdpTransport {
                 socket.clone(),
                 DynamicSocketSendLease::noop(IPV6_SOCKET_INDEX),
             ));
+        }
+        let state = self.socket_state.lock().await;
+        // The original mutable-registry lookup must qualify generation after
+        // its await, before selecting a dynamic owner or acquiring its lease.
+        if generation != self.peers.current_network_generation_sync() {
+            return None;
         }
         let (&index, entry) = state.dynamic.iter().find(|(_, entry)| {
             entry.peer_id == peer_id

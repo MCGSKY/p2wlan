@@ -2,7 +2,7 @@
 //! yield within its caller's existing deadline. No guard crosses an IO await.
 use crate::os_request_capture::plan::CaptureFailure;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::LockResult;
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError, TryLockResult};
@@ -23,6 +23,7 @@ enum ObservedTry {
 
 pub(super) struct ControlState<T> {
     inner: Mutex<T>,
+    metadata_version: AtomicU64,
     changed: Notify,
     completion_released: Notify,
     waiting: AtomicBool,
@@ -31,6 +32,7 @@ pub(super) struct ControlState<T> {
 
 pub(super) struct StateGuard<'a, T> {
     inner: Option<MutexGuard<'a, T>>,
+    metadata_version: &'a AtomicU64,
     refusals: &'a refusal::RefusalDiagnostics,
     holder_token: u64,
     changed: &'a Notify,
@@ -49,6 +51,7 @@ impl<T> ControlState<T> {
     pub(super) fn new(value: T) -> Self {
         Self {
             inner: Mutex::new(value),
+            metadata_version: AtomicU64::new(0),
             changed: Notify::new(),
             completion_released: Notify::new(),
             waiting: AtomicBool::new(false),
@@ -57,8 +60,12 @@ impl<T> ControlState<T> {
     }
 
     fn wrap<'a>(&'a self, inner: MutexGuard<'a, T>, site: refusal::Site) -> StateGuard<'a, T> {
+        let _ = self
+            .metadata_version
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1));
         StateGuard {
             inner: Some(inner),
+            metadata_version: &self.metadata_version,
             refusals: &self.refusals,
             holder_token: self.refusals.acquired(site),
             changed: &self.changed,
@@ -160,6 +167,25 @@ impl<T> ControlState<T> {
         }
     }
 
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(super) fn try_metadata_version(&self) -> Result<u64, TryLockError<()>> {
+        if self.inner.is_poisoned() {
+            return Err(TryLockError::Poisoned(PoisonError::new(())));
+        }
+        std::sync::atomic::fence(Ordering::Acquire);
+        let version = self.metadata_version.load(Ordering::Acquire);
+        if !version.is_multiple_of(2) {
+            return Err(TryLockError::WouldBlock);
+        }
+        Ok(version)
+    }
+
+    #[cfg(all(unix, test))]
+    pub(super) fn actual_mutex_is_available_for_test(&self) -> bool {
+        // The same real mutex, without manufacturing a source-write version.
+        self.inner.try_lock().is_ok()
+    }
+
     pub(super) fn input_refusal_snapshot(&self) -> Option<InputRefusalSnapshot> {
         self.refusals.snapshot()
     }
@@ -251,6 +277,13 @@ impl<T> DerefMut for StateGuard<'_, T> {
 impl<T> Drop for StateGuard<'_, T> {
     fn drop(&mut self) {
         let ended = crate::os_request_capture::clock::monotonic_ns();
+        if !std::thread::panicking() {
+            // All sole source writes are complete before marking this prefix
+            // stable. The next writer cannot enter until actual mutex unlock.
+            let _ = self
+                .metadata_version
+                .try_update(Ordering::Release, Ordering::Relaxed, |v| v.checked_add(1));
+        }
         drop(self.inner.take());
         // Fixed first-refusal metadata only, after releasing the actual guard.
         self.refusals.released(self.holder_token, ended);

@@ -84,7 +84,7 @@ async fn signal_websocket_authenticates_negotiates_and_wakes() {
         let _ = socket.close(None).await;
     });
 
-    let (wake_tx, mut wake_rx) = mpsc::channel(4);
+    let (wake_tx, mut wake_rx) = wake::channel(4);
     let connected = Arc::new(AtomicBool::new(false));
     let client_connected = connected.clone();
     let base_url = format!("http://{address}");
@@ -220,7 +220,7 @@ async fn signal_websocket_exchanges_active_path_telemetry_when_advertised() {
         let _ = socket.close(None).await;
     });
 
-    let (wake_tx, mut _wake_rx) = mpsc::channel(4);
+    let (wake_tx, mut _wake_rx) = wake::channel(4);
     let connected = Arc::new(AtomicBool::new(false));
     let client_connected = connected.clone();
     let base_url = format!("http://{address}");

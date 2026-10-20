@@ -244,3 +244,135 @@ async fn emit_trace_history_keeps_no_actual_mutex_or_transport_owner_alive() {
     assert!(owners.upgrade().is_none());
     assert_eq!(snapshot(&trace), first);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn emit_trace_producer_reuses_live_canonical_gate_without_busy_index() {
+    let (transport, _) = WireGuardTransport::new();
+    let gate = transport.outbound_emit_lock("producer-cache-peer").await;
+    let registry = transport.outbound_emit_locks.lock().await;
+    let reused = transport.try_outbound_emit_lock("producer-cache-peer");
+    assert!(
+        reused
+            .as_ref()
+            .is_some_and(|other| Arc::ptr_eq(other, &gate)),
+        "a producer's live canonical gate must not depend on reentering the busy weak index"
+    );
+    let current = transport
+        .original_kernel_transport_owners()
+        .upgrade()
+        .unwrap();
+    assert!(
+        matches!(
+            current.try_emit_guard("producer-cache-peer", None),
+            Err(crate::transport::OriginalKernelEmitFailure::Registry)
+        ),
+        "the original native guard must still make its real single registry try"
+    );
+    drop(registry);
+    drop(reused);
+    drop(gate);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn emit_trace_producer_cache_cannot_borrow_another_registry_or_peer() {
+    let (transport, _) = WireGuardTransport::new();
+    let (foreign, _) = WireGuardTransport::new();
+    let gate = transport.outbound_emit_lock("cache-peer").await;
+    let foreign_index = foreign.outbound_emit_locks.lock().await;
+    assert!(foreign.try_outbound_emit_lock("cache-peer").is_none());
+    drop(foreign_index);
+    let same = transport.outbound_emit_lock("cache-peer").await;
+    assert!(Arc::ptr_eq(&same, &gate));
+    let index = transport.outbound_emit_locks.lock().await;
+    assert!(transport.try_outbound_emit_lock("different-peer").is_none());
+    drop(index);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn emit_trace_producer_cache_never_retains_a_gate_or_registry_owner() {
+    let (transport, _) = WireGuardTransport::new();
+    let gate = transport.outbound_emit_lock("cache-lifetime-peer").await;
+    let old = Arc::downgrade(&gate);
+    let registry = Arc::downgrade(&transport.outbound_emit_locks);
+    drop(gate);
+    assert!(old.upgrade().is_none());
+    let next = transport.outbound_emit_lock("cache-lifetime-peer").await;
+    assert!(!old.ptr_eq(&Arc::downgrade(&next)));
+    drop(next);
+    drop(transport);
+    assert!(registry.upgrade().is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn emit_trace_producer_cached_resource_still_uses_the_actual_counter_mutex() {
+    let (transport, _) = WireGuardTransport::new();
+    let gate = transport.outbound_emit_lock("cache-counter-peer").await;
+    let held = gate.clone().lock_owned().await;
+    let index = transport.outbound_emit_locks.lock().await;
+    let same = transport
+        .try_outbound_emit_lock("cache-counter-peer")
+        .unwrap();
+    assert!(Arc::ptr_eq(&same, &gate));
+    assert!(same.clone().try_lock_owned().is_err());
+    assert!(transport
+        .try_acquire_outbound_emit_guard("cache-counter-peer")
+        .is_none());
+    drop(index);
+    drop(held);
+    assert!(same.try_lock_owned().is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn emit_trace_producer_cache_key_bound_never_changes_long_peer_lookup() {
+    let (transport, _) = WireGuardTransport::new();
+    let peer = "x".repeat(cache::MAX_CACHED_PEER_BYTES + 1);
+    let gate = transport.outbound_emit_lock(&peer).await;
+    let index = transport.outbound_emit_locks.lock().await;
+    assert!(transport.try_outbound_emit_lock(&peer).is_none());
+    drop(index);
+    let again = transport.try_outbound_emit_lock(&peer).unwrap();
+    assert!(Arc::ptr_eq(&gate, &again));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn emit_trace_producer_cache_has_one_entry_and_cannot_refill_an_evicted_peer() {
+    let (transport, _) = WireGuardTransport::new();
+    let first = transport.outbound_emit_lock("cache-first-peer").await;
+    let second = transport.outbound_emit_lock("cache-second-peer").await;
+    let index = transport.outbound_emit_locks.lock().await;
+    assert!(Arc::ptr_eq(
+        &transport
+            .try_outbound_emit_lock("cache-second-peer")
+            .unwrap(),
+        &second
+    ));
+    assert!(transport
+        .try_outbound_emit_lock("cache-first-peer")
+        .is_none());
+    drop(index);
+    assert!(Arc::ptr_eq(
+        &transport
+            .try_outbound_emit_lock("cache-first-peer")
+            .unwrap(),
+        &first
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn emit_trace_producer_alias_and_native_guard_share_the_one_canonical_gate() {
+    let (transport, _) = WireGuardTransport::new();
+    let gate = transport.outbound_emit_lock("cache-native-peer").await;
+    let current = transport
+        .original_kernel_transport_owners()
+        .upgrade()
+        .unwrap();
+    let native = current.try_emit_guard("cache-native-peer", None).unwrap();
+    assert!(gate.clone().try_lock_owned().is_err());
+    assert!(transport
+        .try_acquire_outbound_emit_guard("cache-native-peer")
+        .is_none());
+    drop(native);
+    assert!(transport
+        .try_acquire_outbound_emit_guard("cache-native-peer")
+        .is_some());
+}

@@ -484,7 +484,7 @@ async fn run_control_loop(
             continue 'recovery;
         }
         let signal_ws_connected = Arc::new(AtomicBool::new(false));
-        let (signal_wake_tx, mut signal_wake_rx) = mpsc::channel(SIGNAL_WS_WAKE_QUEUE);
+        let (signal_wake_tx, mut signal_wake_rx) = wake::channel(SIGNAL_WS_WAKE_QUEUE);
         let signal_ws_task = token.starts_with("dc-").then(|| {
             spawn_signal_websocket(
                 &base_url,
@@ -677,56 +677,17 @@ async fn run_control_loop(
                         }
                     }
                 }
-                Some(()) = signal_wake_rx.recv() => {
-                    let signal_result = async {
-                        let current_http = http.current()?;
-                        poll_signals(
-                            &current_http,
-                            &base_url,
-                            &token,
-                            &self_node_id,
-                            registration_seq,
-                            event_tx,
-                            0,
-                            &recent_signal_ids,
-                            &server_clock,
-                            critical_auth_tx.subscribe(),
-                            &http,
-                        )
-                        .await
-                    }
-                    .await;
-                    match signal_result {
-                        Ok(()) => {
-                            signal_failures = 0;
-                            if let Some(health) = health.as_ref() {
-                                health.mark_control_success().await;
-                            }
-                            let _ = event_tx.send(ControlEvent::ControlHealthy);
-                        }
-                        Err(e) => {
-                            let err_str = e.to_string();
-                            if is_registration_conflict_error(&err_str) {
-                                emit_registration_lifecycle_conflict(health.as_ref(), event_tx, err_str).await;
-                                return;
-                            }
-                            if is_permanent_auth_error(&err_str) {
-                                error!("Permanent auth failure after WebSocket signal wake: {err_str}");
-                                if let Some(health) = health.as_ref() {
-                                    health.set_reauth_required(true);
-                                }
-                                let _ = event_tx.send(ControlEvent::ReauthRequired {
-                                    message: err_str,
-                                });
-                                break;
-                            }
-                            signal_failures = signal_failures.saturating_add(1);
-                            warn!("Signal fetch after WebSocket wake failed: {err_str}");
-                            if let Some(health) = health.as_ref() {
-                                health.set_control_connected(false);
-                            }
-                            let _ = event_tx.send(ControlEvent::Disconnected);
-                        }
+                Some(wake) = signal_wake_rx.recv() => {
+                    match handle_control_wake(
+                        wake, &http, &base_url, &token, &config, &self_node_id,
+                        registration_seq, &state, event_tx, health.as_ref(),
+                        relay_selection.as_ref(), &advertised_snapshot, &mut peer_roster_tick,
+                        signal_ws_task.as_ref(), &mut poll_failures, &mut signal_failures,
+                        &recent_signal_ids, &server_clock, &critical_auth_tx,
+                    ).await {
+                        ControlCommandDisposition::Continue => {},
+                        ControlCommandDisposition::Reregister => break,
+                        ControlCommandDisposition::Exit => return,
                     }
                 }
                 _ = signal_tick.tick() => {
