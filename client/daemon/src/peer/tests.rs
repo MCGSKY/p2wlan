@@ -54,3 +54,7 @@ mod peer_update_resources;
 
 #[path = "tests/path_selection_logging.rs"]
 mod path_selection_logging;
+
+#[cfg(unix)]
+#[path = "tests/epoch_lock_callers.rs"]
+mod epoch_lock_callers;

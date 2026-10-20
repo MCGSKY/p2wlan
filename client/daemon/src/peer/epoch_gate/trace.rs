@@ -76,6 +76,16 @@ impl Site {
             15
         } else if file.contains("/udp/") {
             16
+        } else if file.ends_with("peer/manager/relay/invalidation.rs") {
+            17
+        } else if file.ends_with("peer/manager/direct_failure.rs") {
+            18
+        } else if file.ends_with("peer/manager/peers/direct_events.rs") {
+            19
+        } else if file.ends_with("peer/manager/peers/incarnation_fencing.rs") {
+            20
+        } else if file.ends_with("peer/manager/fresh_mapping.rs") {
+            21
         } else {
             0
         };
@@ -102,6 +112,11 @@ impl Site {
             14 => "relay_probe",
             15 => "peer_path",
             16 => "udp_epoch",
+            17 => "relay_invalidation",
+            18 => "direct_failure",
+            19 => "peer_direct_event",
+            20 => "peer_incarnation",
+            21 => "fresh_mapping",
             _ => "unclassified",
         }
     }
