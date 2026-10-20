@@ -9,9 +9,13 @@ use crate::overlay_requests::{
 use crate::rooms::RoomSendPermit;
 
 type Check<T> = Result<T, Outcome>;
+pub(super) mod completion;
+pub(super) mod completion_gate;
 #[cfg(all(unix, test))]
 mod epoch_guard_tests;
+mod frozen_sources;
 mod selection;
+pub(super) mod source_index;
 #[cfg(all(unix, test))]
 mod terminal_failure_tests;
 #[cfg(all(unix, test))]
@@ -33,6 +37,8 @@ pub(crate) struct OriginalKernelExchange {
     writes: Vec<Arc<KernelIngressBinding>>,
     local: String,
     target: String,
+    flow_invalid: Arc<AtomicBool>,
+    inbound_invalid: Arc<AtomicBool>,
 }
 
 pub(super) struct NativeFrameOutcome {
@@ -68,7 +74,8 @@ impl OriginalKernelOnce<'_> {
 #[derive(Serialize)]
 pub(super) struct NativeFrameSnapshot {
     status: &'static str,
-    outcome: String,
+    #[serde(serialize_with = "super::snapshot_hex::serialize_debug")]
+    outcome: Outcome,
     owner_check: &'static str,
     once_committed: bool,
     commit_monotonic_ns: Option<u64>,
@@ -109,7 +116,7 @@ impl NativeFrameOutcome {
                 Outcome::Stale(_) => "stale",
                 Outcome::Contended(_) => "contended",
             },
-            outcome: format!("{:?}", self.outcome),
+            outcome: self.outcome,
             once_committed: self.committed,
             commit_monotonic_ns: self.commit_ns,
             original_kernel_read_ordinals: self.read_ordinals.clone(),
@@ -170,21 +177,25 @@ impl OriginalKernelExchange {
 
     fn capture(
         scope: &Arc<CaptureSession>,
-        state: &RegistryState,
-        flow: usize,
-        slot: usize,
+        source: &frozen_sources::FrozenRequestSources,
     ) -> Check<Option<Self>> {
+        #[cfg(all(unix, test))]
+        native_capture_probe_for_test();
         if !scope.read_complete.load(Ordering::Acquire)
             || !scope.full_complete.load(Ordering::Acquire)
             || !scope.inbound_complete.load(Ordering::Acquire)
         {
             return Err(unknown());
         }
-        let original = &state.flows[flow];
-        if original.invalid || original.inbound.invalid {
+        let original = &source.flow;
+        let flow = source.flow_index;
+        let slot = source.slot;
+        if original.invalid.load(Ordering::Acquire)
+            || original.inbound_invalid.load(Ordering::Acquire)
+        {
             return Err(Outcome::Stale(Stale::Identity));
         }
-        let Some(window) = &original.requests[slot].original_write_window else {
+        let Some(window) = &source.window else {
             return Ok(None);
         };
         if !window.contains(monotonic_ns().ok_or(unknown())?) {
@@ -193,8 +204,8 @@ impl OriginalKernelExchange {
         let Some(indices) = selection::select(
             &original.plan,
             slot,
-            state
-                .read_history
+            original
+                .reads
                 .iter()
                 .enumerate()
                 .filter(|(_, read)| read.flow == flow)
@@ -215,7 +226,7 @@ impl OriginalKernelExchange {
             .try_reserve(indices.selected.len())
             .map_err(|_| unknown())?;
         for index in indices.selected {
-            let read = state.read_history.get(index).ok_or(unknown())?;
+            let read = original.reads.get(index).ok_or(unknown())?;
             let record = read.physical_publication.record().ok_or(unknown())?;
             if !record.matches_original_kernel_read(read)
                 || !Arc::ptr_eq(&read.plan, &original.plan)
@@ -229,20 +240,20 @@ impl OriginalKernelExchange {
             .try_reserve(indices.skipped.len())
             .map_err(|_| unknown())?;
         for index in indices.skipped {
-            let read = state.read_history.get(index).ok_or(unknown())?;
+            let read = original.reads.get(index).ok_or(unknown())?;
             let Some(fence) = read.physical_publication.original_non_delivery_fence() else {
                 return Ok(None);
             };
             skipped.push((read.clone(), fence));
         }
-        let peer = original.requests[slot]
+        let peer = source
             .first_peer
             .as_ref()
             .ok_or(Outcome::Unknown(Unknown::OriginalAuthorization))?
             .clone();
         let expected = peer.original()?;
         let writes = if original.plan.requests[slot].kind == RequestKind::Response {
-            let sources = original.requests[slot]
+            let sources = source
                 .first_response
                 .as_ref()
                 .ok_or(unknown())?
@@ -255,9 +266,8 @@ impl OriginalKernelExchange {
             let mut coverage =
                 full::FrameSpanCoverage::new(&original.plan, slot).ok_or(unknown())?;
             let mut writes = Vec::new();
-            for write in state
-                .inbound_history
-                .original_packets()
+            for write in original
+                .writes
                 .iter()
                 .filter(|write| write.frame_flow() == flow)
             {
@@ -311,7 +321,7 @@ impl OriginalKernelExchange {
         }
         let candidate = Self {
             scope: Arc::downgrade(scope),
-            device: state.system_device.clone().ok_or(unknown())?,
+            device: original.device.clone().ok_or(unknown())?,
             plan: original.plan.clone(),
             slot,
             peer,
@@ -322,6 +332,8 @@ impl OriginalKernelExchange {
             writes,
             local: original.plan.flow.src_v4.to_string(),
             target: original.plan.flow.dst_v4.to_string(),
+            flow_invalid: original.invalid.clone(),
+            inbound_invalid: original.inbound_invalid.clone(),
         };
         candidate.check_history()?;
         Ok(Some(candidate))
@@ -405,7 +417,9 @@ impl OriginalKernelExchange {
                 && scope.read_complete.load(Ordering::Acquire)
                 && scope.full_complete.load(Ordering::Acquire)
                 && scope.inbound_complete.load(Ordering::Acquire)
-        }) && self.window.contains(ns)
+        }) && !self.flow_invalid.load(Ordering::Acquire)
+            && !self.inbound_invalid.load(Ordering::Acquire)
+            && self.window.contains(ns)
             && self
                 .skipped
                 .iter()
@@ -422,84 +436,54 @@ impl OriginalKernelExchange {
     }
 }
 
-impl CaptureSession {
-    pub(super) fn try_complete_original_frames(
-        self: &Arc<Self>,
-        state: &mut RegistryState,
-        flow: usize,
-        slots: &[usize],
-    ) {
-        let mut completed = false;
-        for &slot in slots {
-            if state.flows[flow].requests[slot].native_credit.is_some() {
-                continue;
-            }
-            let candidate = match OriginalKernelExchange::capture(self, state, flow, slot) {
-                Ok(Some(candidate)) => candidate,
-                Ok(None) => continue,
-                Err(reason) => {
-                    state.flows[flow].requests[slot].native_credit =
-                        Some(NativeFrameOutcome::failure(reason));
-                    completed = true;
-                    continue;
-                }
-            };
-            let mut result = NativeFrameOutcome::failure(unknown());
-            if result
-                .read_ordinals
-                .try_reserve(candidate.reads.len())
-                .is_err()
-                || result
-                    .write_ordinals
-                    .try_reserve(candidate.writes.len())
-                    .is_err()
-                || result
-                    .skipped_read_attempts
-                    .try_reserve(candidate.skipped.len())
-                    .is_err()
-            {
-                state.flows[flow].requests[slot].native_credit = Some(result);
-                completed = true;
-                continue;
-            }
-            result
-                .read_ordinals
-                .extend(candidate.reads.iter().map(|read| read.read.ordinal()));
-            result.skipped_read_attempts.extend(
-                candidate
-                    .skipped
-                    .iter()
-                    .map(|(read, fence)| (read.read.ordinal(), fence.attempt_id())),
-            );
-            result.write_ordinals.extend(
-                candidate
-                    .writes
-                    .iter()
-                    .filter_map(|source| source.original_write().map(|write| write.ordinal())),
-            );
-            if let (Some(peers), Some(owners)) = (
-                self.peers.upgrade(),
-                state
-                    .current_owners
-                    .as_ref()
-                    .and_then(owners::OriginalKernelOwners::upgrade),
-            ) {
-                let mut once = OriginalKernelOnce {
-                    committed: &mut result.committed,
-                    commit_ns: &mut result.commit_ns,
-                };
-                result.outcome = peers.try_commit_original_kernel_exchange(
-                    &owners,
-                    &candidate,
-                    &mut once,
-                    &mut result.owner_check,
-                );
-            }
-            state.flows[flow].requests[slot].native_credit = Some(result);
-            completed = true;
+#[cfg(all(unix, test))]
+mod snapshot_projection_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_snapshot_projection_debug_is_copied_before_serialization() {
+        let (setup, _parent) = super::super::full::tests::descriptor_scope().await;
+        let original = Outcome::Unknown(Unknown::OriginalPublication);
+        let mut outcome = NativeFrameOutcome::failure(original);
+        let captured = outcome.snapshot();
+        outcome.outcome = Outcome::Unknown(Unknown::OriginalSource);
+        let held = setup.session.state.try_lock().unwrap();
+        let value = serde_json::to_value(captured).unwrap();
+        assert_eq!(value["outcome"], format!("{original:?}"));
+        assert_eq!(value["status"], "unknown");
+        assert_eq!(value["once_committed"], false);
+        assert_eq!(value["physical_send_verified"], false);
+        assert_eq!(value["canonical_current_owner_verified"], false);
+        #[derive(Serialize)]
+        struct ErrorText {
+            #[serde(serialize_with = "super::super::snapshot_hex::serialize_optional_debug")]
+            error: Option<Outcome>,
         }
-        if completed {
-            self.record_native_terminal_progress();
-        }
+        assert_eq!(
+            serde_json::to_value(ErrorText {
+                error: Some(original)
+            })
+            .unwrap()["error"],
+            format!("{original:?}")
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorText { error: None }).unwrap()["error"],
+            serde_json::Value::Null
+        );
+        drop(held);
     }
 }
+
+#[cfg(all(unix, test))]
+thread_local! {
+    static NATIVE_CAPTURE_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(all(unix, test))]
+fn native_capture_probe_for_test() {
+    let probe = NATIVE_CAPTURE_PROBE.with(|slot| slot.borrow_mut().take());
+    if let Some(probe) = probe {
+        probe();
+    }
+}
+#[cfg(all(unix, test))]
+mod deferred_completion_tests;

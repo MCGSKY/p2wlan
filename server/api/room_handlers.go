@@ -109,7 +109,7 @@ func (s *Server) roomChanged(roomID string, revoked []string) {
 	}
 	for _, device := range devices {
 		if s.hub != nil {
-			s.hub.Notify(device.ID)
+			s.hub.NotifyRoomRoster(device.ID, roomID)
 		}
 		if s.signalNotifier != nil {
 			s.signalNotifier.notify(device.ID)

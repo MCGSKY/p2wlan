@@ -115,3 +115,42 @@ async fn full_metadata_release_does_not_refill_expired_command_deadline() {
     ));
     assert!(!state.waiting.load(Ordering::Acquire));
 }
+
+#[test]
+fn metadata_source_version_observes_real_writer_and_never_locks_it() {
+    let state = ControlState::new(1u8);
+    let first = state.try_metadata_version().unwrap();
+    let mut actual = state.try_lock().unwrap();
+    assert!(matches!(
+        state.try_metadata_version(),
+        Err(TryLockError::WouldBlock)
+    ));
+    *actual = 2;
+    drop(actual);
+    let next = state.try_metadata_version().unwrap();
+    assert!(next > first && next.is_multiple_of(2));
+    assert!(state.try_lock().is_ok());
+    assert!(state.try_metadata_version().unwrap() > next);
+}
+
+#[test]
+fn metadata_source_version_exhaustion_never_wraps_or_reopens_sampling() {
+    let state = ControlState::new(0u8);
+    state
+        .metadata_version
+        .store(u64::MAX - 1, Ordering::Release);
+    let actual = state.try_lock().unwrap();
+    assert!(matches!(
+        state.try_metadata_version(),
+        Err(TryLockError::WouldBlock)
+    ));
+    drop(actual);
+    assert_eq!(state.metadata_version.load(Ordering::Acquire), u64::MAX);
+    let actual = state.try_lock().unwrap();
+    drop(actual);
+    assert!(matches!(
+        state.try_metadata_version(),
+        Err(TryLockError::WouldBlock)
+    ));
+    assert_eq!(state.metadata_version.load(Ordering::Acquire), u64::MAX);
+}

@@ -672,6 +672,44 @@ async fn install_managed_base(f: &RoutedRequestFixture, udp: &UdpTransport, endp
     socket.writable().await.unwrap();
 }
 
+async fn fixed_managed_send_with_registry_held(pool: bool) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (f, transport, udp, receiver, mut remote) =
+            direct_fixture_with_compatibility_commit(false, false).await;
+        let udp = if pool { udp.with_socket_pool(2).await.unwrap() } else { udp };
+        let udp = udp.with_dplpmtud_local_virtual_ip("10.20.0.1".parse().unwrap());
+        udp.set_inbound_publication_owner(817);
+        install_managed_base(&f, &udp, receiver.local_addr().unwrap()).await;
+        let registry = udp.hold_socket_registry_for_test().await;
+        let slots = RwLock::new(Some(udp.clone()));
+        let relays = RwLock::new(None);
+        assert!(matches!(encrypt_then_send_with_deadline(
+            f.delivery.clone(), &transport, &f.peers, f.record.generation, true,
+            &slots, &relays, false, Some(Instant::now() + Duration::from_secs(1)), None,
+        ).await, EncryptSendOutcome::Sent));
+        let mut wire = [0; 2048];
+        let (len, _) = receiver.recv_from(&mut wire).await.unwrap();
+        assert_eq!(crate::transport::wire_counter(&wire[..len]), Some(0));
+        assert_eq!(remote.decrypt_from_bytes(&wire[..len]).unwrap(), f.record.original_packet());
+        assert!(matches!(receiver.try_recv_from(&mut wire), Err(e) if e.kind()==std::io::ErrorKind::WouldBlock));
+        assert!(transport.try_acquire_outbound_emit_guard(PEER).is_some());
+        assert!(f.peers.network_epoch_gate().try_lock_owned().is_ok());
+        assert!(f.record.physical_publication.record().unwrap().udp().unwrap().original_managed_token().is_some());
+        assert_eq!(f.record.physical_publication.record().unwrap().qualify(&f.record, Instant::now()), PhysicalInputQualification::AcceptedInput);
+        drop(registry);
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn fixed_committed_registry_contention_original_managed_primary_sends_once() {
+    fixed_managed_send_with_registry_held(false).await;
+}
+
+#[tokio::test]
+async fn fixed_committed_registry_contention_original_managed_pool_sends_once() {
+    fixed_managed_send_with_registry_held(true).await;
+}
+
 #[tokio::test]
 async fn b17_managed_original_core_full_fact_and_synthetic_emsgsize_has_no_fact() {
     tokio::time::timeout(Duration::from_secs(1), async {

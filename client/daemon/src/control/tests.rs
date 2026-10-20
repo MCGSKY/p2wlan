@@ -296,3 +296,5 @@ include!("tests/hard_hard_signal.rs");
 include!("tests/hard_hard_signal_retry.rs");
 include!("tests/candidate_lifecycle.rs");
 include!("tests/critical_capacity.rs");
+
+include!("tests/roster_wake.rs");

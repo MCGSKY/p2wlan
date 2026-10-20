@@ -12,6 +12,26 @@ pub(super) fn serialize<S: Serializer, const N: usize>(
     serializer.serialize_str(&encoded)
 }
 
+// These serializers receive copied outcomes only. Debug text is wire-format
+// metadata, never parsed for admission, and must not run under the registry.
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(super) fn serialize_debug<S: Serializer, T: std::fmt::Debug>(
+    value: &T,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&format!("{value:?}"))
+}
+
+pub(super) fn serialize_optional_debug<S: Serializer, T: std::fmt::Debug>(
+    value: &Option<T>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(value) => serializer.serialize_some(&format!("{value:?}")),
+        None => serializer.serialize_none(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::*;
