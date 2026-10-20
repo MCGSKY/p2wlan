@@ -44,6 +44,10 @@ pub(super) async fn encrypt_then_send_with_deadline(
     admission_deadline: Option<Instant>,
     stopping: Option<&AtomicBool>,
 ) -> EncryptSendOutcome {
+    // This outer owner outlives preparation (including its cancellation) and
+    // the physical attempt. A selector log never calls subscribers while this
+    // operation still owns its original epoch, connection or emit guard.
+    let mut path_log = crate::peer::DeferredPathSelectionLog::default();
     let mut packet = packet.into();
     packet.observe_resources(
         transport.resource_capture(),
@@ -195,6 +199,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 udp_local_endpoint,
                 current_generation,
                 false,
+                Some(&mut path_log),
             );
             drop(path_connections);
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::DirectBudget);

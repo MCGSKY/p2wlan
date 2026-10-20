@@ -56,6 +56,8 @@ impl PeerManager {
         relay_available: bool,
         local_endpoint: Option<SocketAddr>,
     ) -> PathSelection {
+        // Drop after the real connection writer and epoch on every exit.
+        let mut path_log = DeferredPathSelectionLog::default();
         let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
         let generation = self.current_network_generation_sync();
         self.select_path_for_data_with_local_endpoint_in_epoch_with_conns(
@@ -66,6 +68,7 @@ impl PeerManager {
             local_endpoint,
             generation,
             false,
+            Some(&mut path_log),
         )
     }
 
@@ -93,6 +96,7 @@ impl PeerManager {
             local_endpoint,
             generation,
             force_relay,
+            None,
         )
     }
 
@@ -106,6 +110,7 @@ impl PeerManager {
         local_endpoint: Option<SocketAddr>,
         generation: u64,
         force_relay: bool,
+        deferred_log: Option<&mut DeferredPathSelectionLog>,
     ) -> PathSelection {
         match conns.get_mut(node_id) {
             Some(conn) => {
@@ -126,7 +131,15 @@ impl PeerManager {
                         "Direct business budget is pending; confirmed Relay carries business until the authoritative Direct commit",
                     );
                     selection.relay_server = conn.relay_server.clone();
-                    conn.record_path_selection_event(generation, &selection, local_endpoint);
+                    if let Some(log) = deferred_log {
+                        log.record(conn.capture_path_selection_event(
+                            generation,
+                            &selection,
+                            local_endpoint,
+                        ));
+                    } else {
+                        conn.record_path_selection_event(generation, &selection, local_endpoint);
+                    }
                     conn.last_path_selection = Some(selection.clone());
                     return selection;
                 }
@@ -150,7 +163,15 @@ impl PeerManager {
                         );
                     }
                 }
-                conn.record_path_selection_event(generation, &selection, local_endpoint);
+                if let Some(log) = deferred_log {
+                    log.record(conn.capture_path_selection_event(
+                        generation,
+                        &selection,
+                        local_endpoint,
+                    ));
+                } else {
+                    conn.record_path_selection_event(generation, &selection, local_endpoint);
+                }
                 conn.last_path_selection = Some(selection.clone());
                 selection
             }
