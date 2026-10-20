@@ -86,6 +86,8 @@ impl Site {
             20
         } else if file.ends_with("peer/manager/fresh_mapping.rs") {
             21
+        } else if file.ends_with("peer/manager/path/admission.rs") {
+            22
         } else {
             0
         };
@@ -117,6 +119,7 @@ impl Site {
             19 => "peer_direct_event",
             20 => "peer_incarnation",
             21 => "fresh_mapping",
+            22 => "peer_path_admission",
             _ => "unclassified",
         }
     }

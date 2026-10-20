@@ -58,3 +58,7 @@ mod path_selection_logging;
 #[cfg(unix)]
 #[path = "tests/epoch_lock_callers.rs"]
 mod epoch_lock_callers;
+
+#[cfg(unix)]
+#[path = "tests/relay_admission_reader.rs"]
+mod relay_admission_reader;
