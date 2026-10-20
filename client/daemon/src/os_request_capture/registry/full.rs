@@ -180,7 +180,7 @@ pub(super) struct FullPacketSnapshot {
 // nonzero observation. Snapshots serialize that fact without completing it.
 #[cfg(any(target_os = "linux", all(unix, test)))]
 pub(super) fn frame_complete(
-    reads: &[Arc<KernelReadBinding>],
+    reads: &super::Published<Arc<KernelReadBinding>>,
     flow: usize,
     slot: usize,
     plan: &RegisteredFlowPlan,
@@ -196,7 +196,9 @@ pub(super) fn frame_complete(
 }
 
 #[cfg(unix)]
-pub(super) fn snapshot(reads: &[Arc<KernelReadBinding>]) -> Vec<FullPacketSnapshot> {
+pub(super) fn snapshot(
+    reads: &super::Published<Arc<KernelReadBinding>>,
+) -> Vec<FullPacketSnapshot> {
     reads
         .iter()
         .filter_map(|read| {

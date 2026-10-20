@@ -1,8 +1,8 @@
 //! Resume bounded completion metadata on the existing descriptor actor.
 //! No task, packet retry, fresh deadline or replacement native fact is created.
-use super::{CaptureSession, FullRetentionLossReason, KernelReadBinding, RegistryState};
+use super::{CaptureSession, FullRetentionLossReason, KernelReadBinding};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, TryLockError};
+use std::sync::Arc;
 use tokio::sync::Notify;
 
 pub(super) struct CompletionSignal {
@@ -56,7 +56,7 @@ impl CompletionSignal {
             || self.terminal_pending.load(Ordering::Acquire)
     }
 
-    fn clear(&self) {
+    pub(super) fn clear(&self) {
         self.pending.store(false, Ordering::Release);
         self.window_pending.store(false, Ordering::Release);
         self.terminal_pending.store(false, Ordering::Release);
@@ -65,23 +65,13 @@ impl CompletionSignal {
 
 impl KernelReadBinding {
     pub(super) fn complete_original_full_or_notify(self: &Arc<Self>, scope: &Arc<CaptureSession>) {
-        let completion = match scope.state.try_lock() {
-            Ok(state) => {
-                let mut completion = super::native::completion::NativeCompletionBatch::new();
-                scope.prepare_original_frames_in(&state, self.flow, &self.slots, &mut completion);
-                drop(state);
-                completion
-            }
-            Err(TryLockError::WouldBlock) => {
-                self.full_completion_pending.store(true, Ordering::Release);
-                scope.pending_full.request();
-                return;
-            }
-            Err(TryLockError::Poisoned(_)) => {
-                scope.original_full_retention_lost(FullRetentionLossReason::HistoryContended);
-                return;
-            }
-        };
+        let mut completion = super::native::completion::NativeCompletionBatch::new();
+        if !completion.begin(scope) {
+            self.full_completion_pending.store(true, Ordering::Release);
+            scope.pending_full.request();
+            return;
+        }
+        scope.prepare_original_frames(self.flow, &self.slots, &mut completion);
         completion.finish(scope);
     }
 }
@@ -113,41 +103,32 @@ impl CaptureSession {
         if !self.metadata_completion_pending() || !self.is_live(std::time::Instant::now()) {
             return;
         }
-        let mut state = match self.state.try_lock() {
-            Ok(state) => state,
-            Err(TryLockError::WouldBlock) => return,
-            Err(TryLockError::Poisoned(_)) => {
-                self.original_full_retention_lost(FullRetentionLossReason::HistoryContended);
-                self.pending_full.clear();
-                return;
-            }
-        };
-        let completion = self.prepare_pending_fulls_in(&mut state);
-        drop(state);
+        let completion = self.prepare_pending_fulls();
         completion.finish(self);
     }
 
-    pub(super) fn prepare_pending_fulls_in(
+    pub(super) fn prepare_pending_fulls(
         self: &Arc<Self>,
-        state: &mut RegistryState,
     ) -> super::native::completion::NativeCompletionBatch {
         let mut completion = super::native::completion::NativeCompletionBatch::new();
-        if !self.metadata_completion_pending() || !self.is_live(std::time::Instant::now()) {
+        if !self.metadata_completion_pending()
+            || !self.is_live(std::time::Instant::now())
+            || !completion.begin(self)
+        {
             return completion;
         }
-        // Clear only after acquisition. A contended attempt keeps its marker
+        // Clear only after a stable source version. A busy writer keeps its marker
         // and waits for an unlock, rather than polling or losing the event.
         if self.full_completion_pending() {
             self.pending_full.pending.store(false, Ordering::Release);
-            for index in 0..state.read_history.len() {
-                let read = &state.read_history[index];
+            for read in self.sources.reads.iter() {
                 if !read.full_completion_pending.swap(false, Ordering::AcqRel) {
                     continue;
                 }
                 let read = read.clone();
                 // The original transaction still checks its original window and
                 // current owners try-only. Existing terminal outcomes are skipped.
-                self.prepare_original_frames_in(state, read.flow, &read.slots, &mut completion);
+                self.prepare_original_frames(read.flow, &read.slots, &mut completion);
             }
         }
         let window_pending = self
@@ -165,15 +146,10 @@ impl CaptureSession {
             // Registration already bounds both dimensions. These signals
             // carry no observations: the unchanged capture predicate decides
             // eligibility and rejects missing provenance before owner/once.
-            for flow in 0..state.flows.len() {
-                for slot in 0..state.flows[flow].requests.len() {
-                    if missing
-                        || (window_pending
-                            && state.flows[flow].requests[slot]
-                                .original_write_window
-                                .is_some())
-                    {
-                        self.prepare_original_frames_in(state, flow, &[slot], &mut completion);
+            for (flow, source) in self.sources.flows.iter().enumerate() {
+                for slot in 0..source.requests.len() {
+                    if missing || (window_pending && source.requests[slot].window.is_some()) {
+                        self.prepare_original_frames(flow, &[slot], &mut completion);
                     }
                 }
             }

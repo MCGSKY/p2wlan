@@ -13,17 +13,18 @@ pub(super) struct FrozenFlowSources {
 }
 
 impl FrozenFlowSources {
-    pub(super) fn capture(state: &RegistryState, flow: usize) -> Option<Self> {
-        let original = &state.flows[flow];
+    pub(super) fn capture(index: &source_index::SourceIndex, flow: usize) -> Option<Self> {
+        #[cfg(all(unix, test))]
+        preparation_probe_for_test();
+        let original = index.flows.get(flow)?;
         let mut reads = Vec::new();
         let mut writes = Vec::new();
-        for read in state.read_history.iter().filter(|read| read.flow == flow) {
+        for read in index.reads.iter().filter(|read| read.flow == flow) {
             reads.try_reserve(1).ok()?;
             reads.push(read.clone());
         }
-        for write in state
-            .inbound_history
-            .original_packets()
+        for write in index
+            .writes
             .iter()
             .filter(|write| write.frame_flow() == flow)
         {
@@ -33,9 +34,9 @@ impl FrozenFlowSources {
         Some(Self {
             plan: original.plan.clone(),
             invalid: original.invalid.clone(),
-            inbound_invalid: original.inbound.invalid.clone(),
-            device: state.system_device.clone(),
-            owners: state.current_owners.clone(),
+            inbound_invalid: original.inbound_invalid.clone(),
+            device: index.device.as_ref().cloned(),
+            owners: index.owners.as_ref().cloned(),
             reads,
             writes,
         })
@@ -53,19 +54,32 @@ pub(super) struct FrozenRequestSources {
 
 impl FrozenRequestSources {
     pub(super) fn capture(
-        state: &RegistryState,
+        original: &source_index::RequestSources,
         flow: usize,
         slot: usize,
         sources: Arc<FrozenFlowSources>,
     ) -> Self {
-        let original = &state.flows[flow].requests[slot];
         Self {
             flow: sources,
             flow_index: flow,
             slot,
-            window: original.original_write_window.clone(),
-            first_peer: original.first_peer.clone(),
-            first_response: original.first_response.clone(),
+            window: original.window.as_ref().cloned(),
+            first_peer: original.peer.as_ref().cloned(),
+            first_response: original.response.as_ref().cloned(),
         }
+    }
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    pub(super) static PREPARATION_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(unix, test))]
+fn preparation_probe_for_test() {
+    let probe = PREPARATION_PROBE.with(|slot| slot.borrow_mut().take());
+    if let Some(probe) = probe {
+        probe();
     }
 }

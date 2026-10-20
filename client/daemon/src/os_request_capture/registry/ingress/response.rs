@@ -171,15 +171,17 @@ impl CaptureSession {
                 if original.is_err() {
                     self.gap();
                 }
-                state.flows[flow].requests[*slot].first_response =
-                    Some(Arc::new(ResponseCapture {
+                let room = state.flows[flow].inbound.original_room[*slot].clone();
+                let _ = state.flows[flow].requests[*slot]
+                    .first_response
+                    .set(Arc::new(ResponseCapture {
                         flow,
                         slot: *slot,
-                        room: state.flows[flow].inbound.original_room[*slot].clone(),
+                        room,
                         original,
                     }));
             }
-            if let Some(input) = &state.flows[flow].requests[*slot].first_response {
+            if let Some(input) = state.flows[flow].requests[*slot].first_response.as_ref() {
                 inputs.push(input.clone());
             }
         }

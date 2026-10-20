@@ -15,6 +15,7 @@ pub(super) mod completion_gate;
 mod epoch_guard_tests;
 mod frozen_sources;
 mod selection;
+pub(super) mod source_index;
 #[cfg(all(unix, test))]
 mod terminal_failure_tests;
 #[cfg(all(unix, test))]

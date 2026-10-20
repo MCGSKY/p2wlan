@@ -13,7 +13,7 @@ use crate::transport::{OriginalOverlayIngressSource, WireGuardTransport};
 use p2pnet_tun::PacketWriteContext;
 use std::sync::OnceLock;
 
-const MAX_SYSTEM_WRITES: usize = 1024;
+pub(super) const MAX_SYSTEM_WRITES: usize = 1024;
 const MAX_ORIGINAL_ENDPOINT_BYTES: usize = 4096;
 
 mod response;
@@ -66,7 +66,7 @@ pub(crate) struct KernelIngressBinding {
 }
 
 pub(super) struct InboundHistory {
-    writes: Vec<Arc<KernelIngressBinding>>,
+    pub(super) writes: Published<Arc<KernelIngressBinding>>,
 }
 
 #[cfg(unix)]
@@ -198,12 +198,12 @@ impl CaptureSession {
             for (slot, span) in slots.iter_mut().zip(&binding.spans) {
                 *slot = span.slot();
             }
-            state.inbound_history.writes.push(binding);
+            state.inbound_history.writes.push(binding)?;
             #[cfg(any(target_os = "linux", all(unix, test)))]
             {
                 let mut completion = native::completion::NativeCompletionBatch::new();
-                self.prepare_original_frames_in(&state, flow, &slots[..count], &mut completion);
                 drop(state);
+                self.prepare_original_frames(flow, &slots[..count], &mut completion);
                 completion.finish(self);
             }
             Ok(())
@@ -506,12 +506,10 @@ impl KernelIngressBinding {
 
 impl InboundHistory {
     #[cfg(any(target_os = "linux", all(unix, test)))]
-    pub(super) fn original_packets(&self) -> &[Arc<KernelIngressBinding>] {
-        &self.writes
-    }
-    #[cfg(any(target_os = "linux", all(unix, test)))]
-    pub(super) fn new() -> Self {
-        Self { writes: Vec::new() }
+    pub(super) fn new() -> Result<Self, CaptureFailure> {
+        Ok(Self {
+            writes: Published::new(MAX_SYSTEM_WRITES)?,
+        })
     }
 
     #[cfg(any(target_os = "linux", all(unix, test)))]

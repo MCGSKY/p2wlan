@@ -50,10 +50,11 @@ async fn terminal_handoff_irrevocable_loss_before_wait_keeps_original_negative_a
     let (setup, _parent) = scope().await;
     {
         let mut state = setup.session.state.lock().unwrap();
-        state.flows[0].requests[0].native_credit = Some(NativeFrameOutcome::failure(
-            Outcome::Unknown(Unknown::OriginalSource),
-        ))
-        .into();
+        state.flows[0].requests[0]
+            .native_credit
+            .get_or_insert_with(|| {
+                NativeFrameOutcome::failure(Outcome::Unknown(Unknown::OriginalSource))
+            });
     }
     setup
         .session
@@ -238,15 +239,10 @@ async fn terminal_handoff_keeps_recorded_failure_and_once_false_across_later_met
         .await
         .unwrap();
     {
-        let state = setup.session.state.lock().unwrap();
         let mut completion = completion::NativeCompletionBatch::new();
-        setup.session.prepare_original_frames_in(
-            &state,
-            0,
-            &[0, 1, 2, 3, 4, 5, 6, 7],
-            &mut completion,
-        );
-        drop(state);
+        setup
+            .session
+            .prepare_original_frames(0, &[0, 1, 2, 3, 4, 5, 6, 7], &mut completion);
         completion.finish(&setup.session);
     }
     setup

@@ -20,6 +20,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 mod binding_rejection;
+mod published;
+use published::{First, Published};
 #[cfg(unix)]
 mod control_lock;
 mod full;
@@ -90,19 +92,23 @@ pub(crate) struct CaptureSession {
     producer_scope: [u8; 16],
     #[cfg(unix)]
     clock_scope: Option<NativeClockScope>,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    sources: native::source_index::SourceIndex,
     state: RegistryMutex<RegistryState>,
     gaps: AtomicU64,
 }
 
 struct RegistryState {
-    current_owners: Option<Arc<owners::OriginalKernelOwners>>,
+    current_owners: First<Arc<owners::OriginalKernelOwners>>,
     original_room_owner: Option<Weak<crate::rooms::RoomAuthorization>>,
     flows: Vec<FlowState>,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    native_flows: Published<Arc<native::source_index::FlowSources>>,
     original_device: Option<Arc<KernelRead>>,
-    system_device: Option<Weak<DeviceLease>>,
+    system_device: First<Weak<DeviceLease>>,
     // Actual original read order includes unresolved and failed publications.
     // A later duplicate Full cannot replace an earlier uncertain producer.
-    read_history: Vec<Arc<KernelReadBinding>>,
+    read_history: Published<Arc<KernelReadBinding>>,
     inbound_history: ingress::InboundHistory,
     #[cfg(unix)]
     requests: usize,
@@ -125,9 +131,9 @@ struct RequestReadState {
     native_credit: native::completion::NativeFrameSlot,
     first_request_room: Option<Arc<ingress::OriginalIncomingRoom>>,
     #[cfg(any(target_os = "linux", all(unix, test)))]
-    original_write_window: Option<write_window::WriteWindow>,
-    first_peer: Option<Arc<read_peer::FirstReadPeer>>,
-    first_response: Option<Arc<ingress::ResponseCapture>>,
+    original_write_window: First<write_window::WriteWindow>,
+    first_peer: First<Arc<read_peer::FirstReadPeer>>,
+    first_response: First<Arc<ingress::ResponseCapture>>,
     read_events: u64,
     first_read: Option<Arc<KernelRead>>,
     last_read: Option<Arc<KernelRead>>,
@@ -270,6 +276,18 @@ impl CaptureSession {
         let expires = Instant::now()
             .checked_add(Duration::from_secs(CAPTURE_TTL_SECS))
             .ok_or(CaptureFailure::Capacity)?;
+        let current_owners = First::new();
+        let system_device = First::new();
+        let read_history = Published::new(full::MAX_FULL_PACKETS)?;
+        let inbound_history = ingress::InboundHistory::new()?;
+        let native_flows = Published::new(MAX_REQUESTS)?;
+        let sources = native::source_index::SourceIndex::new(
+            native_flows.clone(),
+            read_history.clone(),
+            inbound_history.writes.clone(),
+            system_device.clone(),
+            current_owners.clone(),
+        );
         let session = Arc::new(Self {
             owner,
             active: AtomicBool::new(true),
@@ -294,14 +312,16 @@ impl CaptureSession {
             capture_id: plan.capture_id,
             producer_scope: plan.producer_scope,
             clock_scope: NativeClockScope::capture(),
+            sources,
             state: RegistryMutex::new(RegistryState {
-                current_owners: None,
+                current_owners,
                 original_room_owner: None,
                 flows: Vec::new(),
+                native_flows,
                 original_device: None,
-                system_device: None,
-                read_history: Vec::new(),
-                inbound_history: ingress::InboundHistory::new(),
+                system_device,
+                read_history,
+                inbound_history,
                 requests: 0,
                 revision: 0,
                 producers: std::collections::BTreeSet::new(),
@@ -385,9 +405,9 @@ impl CaptureSession {
                     .map(|_| RequestReadState {
                         native_credit: native::completion::NativeFrameSlot::new(),
                         first_request_room: None,
-                        original_write_window: None,
-                        first_peer: None,
-                        first_response: None,
+                        original_write_window: First::new(),
+                        first_peer: First::new(),
+                        first_response: First::new(),
                         read_events: 0,
                         first_read: None,
                         last_read: None,
@@ -405,6 +425,17 @@ impl CaptureSession {
                 }
             })
             .collect();
+        let mut sources = Vec::new();
+        sources
+            .try_reserve_exact(incoming.len())
+            .map_err(|_| CaptureFailure::Capacity)?;
+        for flow in &incoming {
+            sources.push(native::source_index::FlowSources::capture(flow)?);
+        }
+        state.native_flows.try_reserve(sources.len())?;
+        for source in sources {
+            state.native_flows.push(source)?;
+        }
         state.flows.extend(incoming);
         state.producers.insert(producer);
         state.requests = total;
@@ -437,7 +468,10 @@ impl CaptureSession {
             self.gap();
             return false;
         }
-        state.system_device = Some(Arc::downgrade(device));
+        if state.system_device.set(Arc::downgrade(device)).is_err() {
+            self.gap();
+            return false;
+        }
         true
     }
     #[cfg(unix)]
@@ -671,7 +705,7 @@ impl CaptureSession {
             original_responses,
             original_request_rooms,
         });
-        state.read_history.push(binding.clone());
+        state.read_history.push(binding.clone())?;
         Ok(Some(binding))
     }
 

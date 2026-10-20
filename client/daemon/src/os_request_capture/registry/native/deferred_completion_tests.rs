@@ -99,15 +99,13 @@ async fn native_completion_one_inflight_slot_resumes_only_missing_metadata() {
     let (setup, _parent) = scope("udp").await;
     let state = setup.session.state.try_lock().unwrap();
     let slot = state.flows[0].requests[0].native_credit.shared();
+    drop(state);
     let mut first = completion::NativeCompletionBatch::new();
     let mut concurrent = completion::NativeCompletionBatch::new();
+    setup.session.prepare_original_frames(0, &[0], &mut first);
     setup
         .session
-        .prepare_original_frames_in(&state, 0, &[0], &mut first);
-    setup
-        .session
-        .prepare_original_frames_in(&state, 0, &[0], &mut concurrent);
-    drop(state);
+        .prepare_original_frames(0, &[0], &mut concurrent);
     let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = count.clone();
     NATIVE_CAPTURE_PROBE.with(|slot| {
@@ -143,11 +141,11 @@ async fn native_completion_dropped_preparation_is_not_a_terminal_owner_retry() {
     let (setup, _parent) = scope("udp").await;
     let state = setup.session.state.try_lock().unwrap();
     let slot = state.flows[0].requests[0].native_credit.shared();
+    drop(state);
     let mut prepared = completion::NativeCompletionBatch::new();
     setup
         .session
-        .prepare_original_frames_in(&state, 0, &[0], &mut prepared);
-    drop(state);
+        .prepare_original_frames(0, &[0], &mut prepared);
     drop(prepared);
     assert!(slot.is_none());
     assert!(setup.session.metadata_completion_pending());
@@ -166,11 +164,11 @@ async fn native_completion_frozen_sources_keep_actual_invalidation_but_no_scope_
     let (setup, parent) = scope("udp").await;
     let state = setup.session.state.try_lock().unwrap();
     let invalid = state.flows[0].invalid.clone();
+    drop(state);
     let mut prepared = completion::NativeCompletionBatch::new();
     setup
         .session
-        .prepare_original_frames_in(&state, 0, &[0], &mut prepared);
-    drop(state);
+        .prepare_original_frames(0, &[0], &mut prepared);
     invalid.store(true, Ordering::Release);
     prepared.finish(&setup.session);
     let value = serde_json::to_value(setup.session.snapshot().unwrap()).unwrap();
@@ -193,11 +191,11 @@ async fn native_completion_frozen_sources_keep_actual_invalidation_but_no_scope_
     let (setup, parent) = scope("udp").await;
     let weak = Arc::downgrade(&setup.session);
     let state = setup.session.state.try_lock().unwrap();
+    drop(state);
     let mut prepared = completion::NativeCompletionBatch::new();
     setup
         .session
-        .prepare_original_frames_in(&state, 0, &[0], &mut prepared);
-    drop(state);
+        .prepare_original_frames(0, &[0], &mut prepared);
     drop(parent);
     drop(setup);
     assert!(
@@ -318,4 +316,62 @@ async fn native_completion_executor_poison_keeps_first_negative_and_once_false()
     assert_eq!(first["physical_send_verified"], false);
     assert_eq!(first["historical_full_packets"], json!([]));
     assert_eq!(first["system_tun_full_writes"], json!([]));
+}
+
+#[tokio::test]
+async fn native_completion_preparation_never_owns_the_actual_input_mutex() {
+    let (setup, _parent) = scope("udp").await;
+    setup
+        .session
+        .original_full_retention_lost(FullRetentionLossReason::ObservationDropped);
+    let scope = Arc::downgrade(&setup.session);
+    let observed = Arc::new(AtomicBool::new(false));
+    let probe = observed.clone();
+    frozen_sources::PREPARATION_PROBE.with(|slot| {
+        assert!(slot
+            .borrow_mut()
+            .replace(Box::new(move || {
+                let scope = scope.upgrade().unwrap();
+                probe.store(
+                    scope.state.actual_mutex_is_available_for_test(),
+                    Ordering::SeqCst,
+                );
+            }))
+            .is_none());
+    });
+    setup.session.complete_pending_fulls();
+    assert_original_negative(&setup.session);
+    assert!(observed.load(Ordering::SeqCst), "native metadata preparation must release the actual input mutex before traversing original sources");
+}
+
+#[tokio::test]
+async fn native_preparation_changed_input_version_defers_before_native_capture() {
+    let (setup, _parent) = scope("udp").await;
+    setup
+        .session
+        .original_full_retention_lost(FullRetentionLossReason::ObservationDropped);
+    let native_called = Arc::new(AtomicBool::new(false));
+    let called = native_called.clone();
+    NATIVE_CAPTURE_PROBE.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            called.store(true, Ordering::SeqCst);
+        }))
+    });
+    let original = Arc::downgrade(&setup.session);
+    frozen_sources::PREPARATION_PROBE.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            let scope = original.upgrade().unwrap();
+            let _actual = scope.state.try_lock().unwrap();
+        }))
+    });
+    setup.session.complete_pending_fulls();
+    assert!(!native_called.load(Ordering::SeqCst));
+    assert!(setup.session.metadata_completion_pending());
+    assert!(setup.session.state.try_lock().unwrap().flows[0]
+        .requests
+        .iter()
+        .all(|r| r.native_credit.is_none()));
+    setup.session.complete_pending_fulls();
+    assert!(native_called.load(Ordering::SeqCst));
+    assert_original_negative(&setup.session);
 }

@@ -113,7 +113,7 @@ impl CaptureSession {
                         .as_ref()
                         .map(|input| input.snapshot()),
                     #[cfg(any(target_os = "linux", all(unix, test)))]
-                    original_write_window: read.original_write_window.clone(),
+                    original_write_window: read.original_write_window.as_ref().cloned(),
                 });
             }
         }

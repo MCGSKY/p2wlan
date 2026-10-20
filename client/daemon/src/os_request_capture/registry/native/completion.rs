@@ -150,6 +150,8 @@ struct PreparedCompletion {
 pub(in crate::os_request_capture::registry) struct NativeCompletionBatch {
     flows: Vec<(usize, Arc<FrozenFlowSources>)>,
     requests: Vec<PreparedCompletion>,
+    version: Option<u64>,
+    unstable: bool,
 }
 
 impl NativeCompletionBatch {
@@ -157,23 +159,30 @@ impl NativeCompletionBatch {
         Self {
             flows: Vec::new(),
             requests: Vec::new(),
+            version: None,
+            unstable: false,
         }
     }
-    fn prepare(
-        &mut self,
-        scope: &Arc<CaptureSession>,
-        state: &RegistryState,
-        flow: usize,
-        slot: usize,
-    ) {
-        let Some(claim) = state.flows[flow].requests[slot].native_credit.claim(scope) else {
+    fn prepare(&mut self, scope: &Arc<CaptureSession>, flow: usize, slot: usize) {
+        if !self.begin(scope) {
+            return;
+        }
+        let Some(original) = scope
+            .sources
+            .flows
+            .get(flow)
+            .and_then(|f| f.requests.get(slot))
+        else {
+            return;
+        };
+        let Some(claim) = original.credit.claim(scope) else {
             return;
         };
         let sources =
             if let Some((_, sources)) = self.flows.iter().find(|(index, _)| *index == flow) {
                 sources.clone()
             } else {
-                let Some(sources) = FrozenFlowSources::capture(state, flow) else {
+                let Some(sources) = FrozenFlowSources::capture(&scope.sources, flow) else {
                     claim.finish(NativeFrameOutcome::failure(unknown()));
                     return;
                 };
@@ -190,11 +199,54 @@ impl NativeCompletionBatch {
             return;
         }
         self.requests.push(PreparedCompletion {
-            source: FrozenRequestSources::capture(state, flow, slot, sources),
+            source: FrozenRequestSources::capture(original, flow, slot, sources),
             claim,
         });
     }
-    pub(in crate::os_request_capture::registry) fn finish(self, scope: &Arc<CaptureSession>) {
+    pub(in crate::os_request_capture::registry) fn begin(
+        &mut self,
+        scope: &CaptureSession,
+    ) -> bool {
+        if self.unstable {
+            return false;
+        }
+        match scope.state.try_metadata_version() {
+            Ok(version) if self.version.is_none_or(|old| old == version) => {
+                self.version = Some(version);
+                true
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                scope.original_full_retention_lost(FullRetentionLossReason::HistoryContended);
+                scope.pending_full.clear();
+                self.unstable = true;
+                false
+            }
+            _ => {
+                self.unstable = true;
+                false
+            }
+        }
+    }
+    pub(in crate::os_request_capture::registry) fn finish(mut self, scope: &Arc<CaptureSession>) {
+        if !self.begin(scope) {
+            for prepared in self.requests {
+                prepared.claim.not_ready();
+            }
+            if matches!(
+                scope.state.try_metadata_version(),
+                Err(std::sync::TryLockError::Poisoned(_))
+            ) {
+                scope.pending_full.clear();
+                return;
+            }
+            scope.pending_full.defer_window_until_unlock();
+            // Subscribe first, then check: an unlock that already happened
+            // must not strand the one existing metadata actor's pending work.
+            if scope.state.try_metadata_version().is_ok() {
+                scope.pending_full.request_window();
+            }
+            return;
+        }
         if self.requests.is_empty() {
             return;
         }
@@ -232,15 +284,14 @@ impl NativeCompletionBatch {
 }
 
 impl CaptureSession {
-    pub(in crate::os_request_capture::registry) fn prepare_original_frames_in(
+    pub(in crate::os_request_capture::registry) fn prepare_original_frames(
         self: &Arc<Self>,
-        state: &RegistryState,
         flow: usize,
         slots: &[usize],
         batch: &mut NativeCompletionBatch,
     ) {
         for &slot in slots {
-            batch.prepare(self, state, flow, slot);
+            batch.prepare(self, flow, slot);
         }
     }
 }

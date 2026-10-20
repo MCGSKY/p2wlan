@@ -46,7 +46,7 @@ impl CaptureSession {
                 return Err(CaptureFailure::Expired);
             }
             let ready = {
-                let mut state = self.state.lock_until(end).await?;
+                let state = self.state.lock_until(end).await?;
                 let index = {
                     let mut matches = state
                         .flows
@@ -64,9 +64,15 @@ impl CaptureSession {
                 {
                     return Err(CaptureFailure::InvalidPlan);
                 }
+                // Eight metadata handles only, never a scope/descriptor or
+                // daemon owner. No terminal/native work holds the input lock.
+                let outcomes = std::array::from_fn::<_, 8, _>(|slot| {
+                    state.flows[index].requests[slot].native_credit.shared()
+                });
+                drop(state);
                 // Only the existing bounded real-Full markers are drained.
                 // Some terminal outcome, including every refusal, is enough.
-                let mut completion = self.prepare_pending_fulls_in(&mut state);
+                let mut completion = self.prepare_pending_fulls();
                 if !self.read_complete.load(Ordering::Acquire)
                     || !self.full_complete.load(Ordering::Acquire)
                     || !self.inbound_complete.load(Ordering::Acquire)
@@ -75,19 +81,8 @@ impl CaptureSession {
                     // predicate returns Unknown(OriginalPublication) before
                     // any native owner/once check. Preserve recorded rows;
                     // a lost input need not have a real-Full marker to wake us.
-                    self.prepare_original_frames_in(
-                        &state,
-                        index,
-                        &[0, 1, 2, 3, 4, 5, 6, 7],
-                        &mut completion,
-                    );
+                    self.prepare_original_frames(index, &[0, 1, 2, 3, 4, 5, 6, 7], &mut completion);
                 }
-                // Eight metadata handles only, never a scope/descriptor or
-                // daemon owner. No terminal/native work holds the input lock.
-                let outcomes = std::array::from_fn::<_, 8, _>(|slot| {
-                    state.flows[index].requests[slot].native_credit.shared()
-                });
-                drop(state);
                 completion.finish(self);
                 outcomes.iter().all(|outcome| outcome.is_some())
             };
