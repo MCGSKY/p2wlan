@@ -29,6 +29,10 @@ mod full;
 mod full_completion;
 mod full_loss;
 mod inbound_loss;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+mod registration;
+#[cfg(all(unix, test))]
+mod registration_tests;
 #[cfg(unix)]
 mod snapshot;
 #[cfg(unix)]
@@ -288,6 +292,11 @@ impl CaptureSession {
             system_device.clone(),
             current_owners.clone(),
         );
+        // All possible flow slots are reserved before this scope is exposed.
+        let mut flows = Vec::new();
+        flows
+            .try_reserve_exact(MAX_REQUESTS)
+            .map_err(|_| CaptureFailure::Capacity)?;
         let session = Arc::new(Self {
             owner,
             active: AtomicBool::new(true),
@@ -316,7 +325,7 @@ impl CaptureSession {
             state: RegistryMutex::new(RegistryState {
                 current_owners,
                 original_room_owner: None,
-                flows: Vec::new(),
+                flows,
                 native_flows,
                 original_device: None,
                 system_device,
@@ -334,18 +343,20 @@ impl CaptureSession {
         Ok(session)
     }
 
-    /// Append immutable expected inputs under the actual descriptor scope.
-    /// No flow is replaced, rearmed or assigned connection-owner authority.
+    /// Prepare immutable labels before entering the sole registration writer.
     #[cfg(any(target_os = "linux", all(unix, test)))]
     pub(super) fn register(
         &self,
         plan: RegistrationPlan,
     ) -> Result<RegistrationReceipt, CaptureFailure> {
+        let mut prepared = registration::PreparedRegistration::new(plan);
         let mut state = self
             .state
             .try_lock()
             .map_err(|_| CaptureFailure::Contended)?;
-        self.register_in(plan, &mut state)
+        let result = prepared.append(self, &mut state);
+        drop(state);
+        result
     }
 
     #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -354,101 +365,11 @@ impl CaptureSession {
         plan: RegistrationPlan,
         end: tokio::time::Instant,
     ) -> Result<RegistrationReceipt, CaptureFailure> {
+        let mut prepared = registration::PreparedRegistration::new(plan);
         let mut state = self.state.lock_until(end).await?;
-        self.register_in(plan, &mut state)
-    }
-
-    #[cfg(any(target_os = "linux", all(unix, test)))]
-    fn register_in(
-        &self,
-        plan: RegistrationPlan,
-        state: &mut RegistryState,
-    ) -> Result<RegistrationReceipt, CaptureFailure> {
-        if plan.capture_id != self.capture_id || plan.flows.is_empty() {
-            return Err(CaptureFailure::InvalidPlan);
-        }
-        let producer = plan.producer_scope;
-        let added: usize = plan.flows.iter().map(|flow| flow.requests.len()).sum();
-        if !self.is_live(Instant::now()) {
-            return Err(CaptureFailure::Expired);
-        }
-        let total = state
-            .requests
-            .checked_add(added)
-            .filter(|n| *n <= MAX_REQUESTS)
-            .ok_or(CaptureFailure::Capacity)?;
-        if state.producers.contains(&producer)
-            || plan.flows.iter().any(|incoming| {
-                state.flows.iter().any(|old| {
-                    (old.plan.protocol == incoming.protocol && old.plan.flow == incoming.flow)
-                        || (old.plan.protocol == incoming.protocol
-                            && incoming
-                                .requests
-                                .iter()
-                                .any(|key| old.plan.requests.contains(key)))
-                })
-            })
-        {
-            return Err(CaptureFailure::RegistrationConflict);
-        }
-        let revision = state
-            .revision
-            .checked_add(1)
-            .ok_or(CaptureFailure::CounterExhausted)?;
-        let incoming: Vec<_> = plan
-            .flows
-            .into_iter()
-            .map(|plan| {
-                let requests = plan
-                    .requests
-                    .iter()
-                    .map(|_| RequestReadState {
-                        native_credit: native::completion::NativeFrameSlot::new(),
-                        first_request_room: None,
-                        original_write_window: First::new(),
-                        first_peer: First::new(),
-                        first_response: First::new(),
-                        read_events: 0,
-                        first_read: None,
-                        last_read: None,
-                        tcp: None,
-                        udp_complete: false,
-                    })
-                    .collect();
-                FlowState {
-                    inbound: ingress::InboundFlow::new(plan.requests.len()),
-                    plan: Arc::new(plan),
-                    producer_scope: producer,
-                    tcp_open: None,
-                    invalid: Arc::new(AtomicBool::new(false)),
-                    requests,
-                }
-            })
-            .collect();
-        let mut sources = Vec::new();
-        sources
-            .try_reserve_exact(incoming.len())
-            .map_err(|_| CaptureFailure::Capacity)?;
-        for flow in &incoming {
-            sources.push(native::source_index::FlowSources::capture(flow)?);
-        }
-        state.native_flows.try_reserve(sources.len())?;
-        for source in sources {
-            state.native_flows.push(source)?;
-        }
-        state.flows.extend(incoming);
-        state.producers.insert(producer);
-        state.requests = total;
-        state.revision = revision;
-        Ok(RegistrationReceipt {
-            scope: "registered_expected_inputs_only",
-            owner: self.owner,
-            capture_id: hex::encode(self.capture_id),
-            producer_scope: hex::encode(producer),
-            registration_revision: revision,
-            added_requests: added,
-            total_requests: total,
-        })
+        let result = prepared.append(self, &mut state);
+        drop(state);
+        result
     }
 
     pub(crate) fn retire(&self) {
