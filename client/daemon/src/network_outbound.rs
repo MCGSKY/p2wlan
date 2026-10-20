@@ -440,6 +440,7 @@ mod diagnostics;
 mod direct;
 mod fast_path;
 mod physical_attempt;
+mod preparation_log;
 mod queue;
 mod relay;
 mod send;
@@ -452,6 +453,8 @@ mod test_support;
 mod path_log_test_entry;
 #[cfg(test)]
 pub(crate) use path_log_test_entry::one_direct_budget_preparation_without_session_for_test;
+#[cfg(test)]
+pub(crate) use path_log_test_entry::one_emit_preparation_with_resources_for_test;
 #[cfg(test)]
 pub(crate) use path_log_test_entry::one_expiring_session_send_for_path_log_test;
 #[cfg(test)]

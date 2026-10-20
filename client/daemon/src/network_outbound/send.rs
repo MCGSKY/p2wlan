@@ -1,4 +1,5 @@
 use super::*;
+use crate::dataplane::{DeferredOutboundPreparationProfile, OutboundPreparationStage};
 
 /// Compatibility entry for unit tests of one isolated send. The worker
 /// supplies the FIFO's original deadline through the bounded entry below.
@@ -113,6 +114,19 @@ pub(super) async fn encrypt_then_send_with_deadline(
             reason: "original FIFO deadline expired before encryption/handoff".into(),
         };
     }
+    // These scalar diagnostics outlive the cancellable preparation and actual
+    // physical owner. Original observation sites retain values and clocks;
+    // histogram/logger callbacks run after this attempt releases its guards.
+    let mut preparation_profile = DeferredOutboundPreparationProfile::new(profiler);
+    let mut crypto_profile = crate::dataplane::DeferredCryptoProfile::new(profiler);
+    let mut epoch_profile = crate::dataplane::DeferredEpochProfile::new(
+        profiler,
+        sampled_trace.as_ref().is_some_and(|trace| trace.sampled),
+    );
+    let mut preparation_log = super::preparation_log::DeferredPreparationLog::new(
+        packet.peer_id.clone(),
+        expected_generation,
+    );
     // This future contains no UDP syscall or Relay writer admission. A
     // cancellation may abandon an allocated counter, but its ciphertext has
     // never been handed off, so only the original plaintext can be retried.
@@ -121,27 +135,46 @@ pub(super) async fn encrypt_then_send_with_deadline(
         // the corresponding buffers, including cancellation before encryption.
         let original_buffer_lease = original_buffer_lease;
         let _preparation_buffer_lease = preparation_buffer_lease;
+        // These are resource snapshots, never a path or generation fence.
+        // A slot replacement must not make original read observation wait
+        // behind an epoch guard held by this pre-encryption preparation.
+        // The unchanged epoch transaction below validates generation/path;
+        // actual budget, socket and native handoff fences remain authoritative.
+        let relay_available = relay_transport.read().await.is_some();
+        let udp = udp_transport.read().await.clone();
+        // Resolve only the resource named by the current committed tuple
+        // before entering the original epoch transaction. Its canonical
+        // generation/path/budget checks still run below. Exact socket and
+        // lease-owner identity are rechecked before consuming this hint;
+        // any mismatch or busy registry retains the original resolver.
+        // At most one extra lease lives within the original preparation
+        // timeout, including cancellation and the unchanged fallback.
+        let mut committed_socket_resource = if prefer_direct
+            && peers.current_network_generation_sync() == expected_generation
+            && !preparation_retry
+                .original_echo()
+                .is_some_and(|echo| echo.source().original_relay_read().is_some())
+        {
+            if let Some(udp) = udp.as_ref() {
+                udp.try_prepare_direct_business_socket_resource(&preparation_retry.peer_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let emit_lock_started = Instant::now();
         let emit_guard = Arc::new(transport.acquire_outbound_emit_guard(&packet.peer_id).await);
         let emit_guard_acquired = Instant::now();
         let emit_lock_wait_ms = emit_lock_started.elapsed().as_millis() as u64;
         if let Some(trace) = sampled_trace.as_ref() {
-            profiler.record(
+            preparation_profile.record(
                 trace.sampled,
-                "tx_emit_guard_wait_us",
+                OutboundPreparationStage::EmitWait,
                 emit_guard_acquired.duration_since(emit_lock_started),
             );
         }
-        debug!(
-            event = "outbound_business_emit_lock_acquired",
-            peer_id = %packet.peer_id,
-            generation = expected_generation,
-            lock_wait_ms = emit_lock_wait_ms,
-            "business packet acquired its per-peer WireGuard counter-ordering lock"
-        );
-        // Histogram publication belongs to this future, outside the real
-        // epoch/session guards on success, early return and cancellation.
-        let mut crypto_profile = crate::dataplane::DeferredCryptoProfile::new(profiler);
+        preparation_log.acquired(emit_lock_wait_ms);
         let (
             encrypted,
             direct_business_plan,
@@ -149,41 +182,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
             physical_preparation,
             serialized_buffer_lease,
         ) = {
-            // These are resource snapshots, never a path or generation fence.
-            // A slot replacement must not make original read observation wait
-            // behind an epoch guard held by this pre-encryption preparation.
-            // The unchanged epoch transaction below validates generation/path;
-            // actual budget, socket and native handoff fences remain authoritative.
-            let relay_available = relay_transport.read().await.is_some();
-            let udp = udp_transport.read().await.clone();
-            // Resolve only the resource named by the current committed tuple
-            // before entering the original epoch transaction. Its canonical
-            // generation/path/budget checks still run below. Exact socket and
-            // lease-owner identity are rechecked before consuming this hint;
-            // any mismatch or busy registry retains the original resolver.
-            // At most one extra lease lives within the original preparation
-            // timeout, including cancellation and the unchanged fallback.
-            let mut committed_socket_resource = if prefer_direct
-                && peers.current_network_generation_sync() == expected_generation
-                && !preparation_retry
-                    .original_echo()
-                    .is_some_and(|echo| echo.source().original_relay_read().is_some())
-            {
-                if let Some(udp) = udp.as_ref() {
-                    udp.try_prepare_direct_business_socket_resource(&preparation_retry.peer_id)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
             let epoch_gate_wait_started = Instant::now();
-            // Declare before the real guard: success, early return and future
-            // cancellation release epoch before histogram locks/log callbacks.
-            let mut epoch_profile = crate::dataplane::DeferredEpochProfile::new(
-                profiler,
-                sampled_trace.as_ref().is_some_and(|trace| trace.sampled),
-            );
             let (_epoch_guard, mut path_connections) =
                 peers.lock_epoch_and_connections_write().await;
             let epoch_gate_acquired = Instant::now();
@@ -194,14 +193,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
             let current_generation = peers.current_network_generation_sync();
             if current_generation != expected_generation {
                 drop(path_connections);
-                debug!(
-                    event = "outbound_counter_allocation_rejected",
-                    peer_id = %preparation_retry.peer_id,
-                    expected_generation,
-                    current_generation,
-                    reason_code = REASON_OUTBOUND_GENERATION_CHANGED,
-                    "business packet was not encrypted because its network generation is stale"
-                );
+                preparation_log.generation_rejected(current_generation);
                 return Err(EncryptSendOutcome::Retryable {
                 packet: preparation_retry,
                 reason_code: REASON_OUTBOUND_GENERATION_CHANGED,
@@ -392,14 +384,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
             {
                 Ok(Some(value)) => value,
                 Ok(None) => {
-                    debug!(
-                        event = "outbound_session_unavailable",
-                        peer_id = %preparation_retry.peer_id,
-                        generation = expected_generation,
-                        bytes = preparation_retry.packet.len(),
-                        reason_code = REASON_OUTBOUND_SESSION_NOT_READY,
-                        "business packet remained plaintext because no usable WireGuard session exists"
-                    );
+                    preparation_log.missing_session(preparation_retry.packet.len());
                     return Err(EncryptSendOutcome::Retryable {
                         packet: preparation_retry,
                         reason_code: REASON_OUTBOUND_SESSION_NOT_READY,
@@ -407,19 +392,13 @@ pub(super) async fn encrypt_then_send_with_deadline(
                     });
                 }
                 Err(err) => {
-                    warn!(
-                        event = "outbound_encrypt_failed",
-                        peer_id = %preparation_retry.peer_id,
-                        generation = expected_generation,
-                        bytes = preparation_retry.packet.len(),
-                        reason_code = REASON_OUTBOUND_ENCRYPT_FAILED,
-                        error = %err,
-                        "business packet encryption failed before a transport handoff"
-                    );
+                    let reason = err.to_string();
+                    preparation_log
+                        .encryption_failed(preparation_retry.packet.len(), reason.clone());
                     return Err(EncryptSendOutcome::Terminal {
                         packet: preparation_retry,
                         reason_code: REASON_OUTBOUND_ENCRYPT_FAILED,
-                        reason: err.to_string(),
+                        reason,
                     });
                 }
             };
@@ -462,7 +441,6 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 serialized_buffer_lease,
             )
         };
-        drop(crypto_profile);
         Ok((
             emit_guard,
             encrypted,
@@ -515,26 +493,26 @@ pub(super) async fn encrypt_then_send_with_deadline(
         plan.udp.wait_at_direct_business_send_gate_for_test().await;
     }
     if let Some(trace) = retry_packet.trace.as_ref() {
-        profiler.record(
+        preparation_profile.record(
             trace.sampled,
-            "tun_read_to_encrypt_us",
+            OutboundPreparationStage::TunToEncrypt,
             encrypt_started.duration_since(trace.tun_read_completed),
         );
         if let Some(route_ready) = trace.route_ready {
-            profiler.record(
+            preparation_profile.record(
                 trace.sampled,
-                "route_to_encrypt_us",
+                OutboundPreparationStage::RouteToEncrypt,
                 encrypt_started.duration_since(route_ready),
             );
         }
-        profiler.record(
+        preparation_profile.record(
             trace.sampled,
-            "encrypt_us",
+            OutboundPreparationStage::Encrypt,
             encrypt_completed.duration_since(encrypt_started),
         );
-        profiler.record(
+        preparation_profile.record(
             trace.sampled,
-            "tx_slow_path_encrypt_us",
+            OutboundPreparationStage::SlowEncrypt,
             encrypt_completed.duration_since(encrypt_started),
         );
     }

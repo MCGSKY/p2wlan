@@ -9,6 +9,9 @@ use crate::request_carriage::test_support::{mint_input_request, InputRequestFixt
 use crate::request_carriage::test_support::{mint_routed_request, RoutedRequestFixture, PEER};
 use crate::udp::UdpSendFence;
 
+#[path = "preparation_diagnostics.rs"]
+mod preparation_diagnostics;
+
 async fn direct_fixture(
     lan: bool,
 ) -> (
@@ -106,9 +109,9 @@ async fn preparation_slot_wait_control(hold_relay: bool, advance_generation: boo
             &udps, &relays, false, Some(Instant::now() + Duration::from_secs(1)), None,
         ));
         assert!(matches!(futures_util::poll!(send.as_mut()), std::task::Poll::Pending));
-        // The real preparation owns emit but has not encrypted or sent.
+        // Resource waiting has not acquired emit, encrypted or sent.
         // Physical publication remains Idle until crypto actually succeeds.
-        assert!(transport.try_acquire_outbound_emit_guard(PEER).is_none());
+        assert!(transport.try_acquire_outbound_emit_guard(PEER).is_some());
         assert!(f.peers.network_epoch_gate().try_lock_owned().is_ok());
         assert_eq!(f.record.physical_publication.state(), PhysicalPublicationState::Idle);
         let mut wire = [0u8; 2048];
