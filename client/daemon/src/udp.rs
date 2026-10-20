@@ -426,6 +426,8 @@ mod birthday_tests;
 mod core;
 
 mod business_mtu;
+mod committed_socket_preparation;
+pub(crate) use committed_socket_preparation::PreparedCommittedSocket;
 mod ingress_origin;
 mod send_origin;
 #[allow(unused_imports)] // Staged source/guard consumers; no final credit yet.

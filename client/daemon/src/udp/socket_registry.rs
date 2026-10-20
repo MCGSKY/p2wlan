@@ -559,12 +559,29 @@ impl UdpTransport {
         local_endpoint: SocketAddr,
         generation: u64,
     ) -> Option<(usize, Arc<UdpSocket>, DynamicSocketSendLease)> {
-        // Fixed pool/IPv6 sockets are immutable members of this transport.
-        // Their exact endpoint lookup does not read dynamic ownership state.
-        // Callers still fence generation/path/budget and the final native send.
         if generation != self.peers.current_network_generation_sync() {
             return None;
         }
+        if let Some(fixed) = self.resolve_committed_fixed_socket_with_lease(local_endpoint) {
+            return Some(fixed);
+        }
+        let state = self.socket_state.lock().await;
+        self.resolve_committed_dynamic_socket_with_lease(
+            &state,
+            peer_id,
+            local_endpoint,
+            generation,
+        )
+    }
+
+    // Fixed membership is immutable. Both preparation and the original
+    // resolver use this exact lookup and the same no-op lease construction.
+    pub(super) fn resolve_committed_fixed_socket_with_lease(
+        &self,
+        local_endpoint: SocketAddr,
+    ) -> Option<(usize, Arc<UdpSocket>, DynamicSocketSendLease)> {
+        #[cfg(test)]
+        tracing::debug!(target: "p2pnet_daemon::committed_socket_lookup", "resolving the actual committed socket resource");
         for (index, socket) in self.active_sockets().iter().enumerate() {
             if socket.local_addr().ok() == Some(local_endpoint) {
                 return Some((index, socket.clone(), DynamicSocketSendLease::noop(index)));
@@ -581,7 +598,18 @@ impl UdpTransport {
                 DynamicSocketSendLease::noop(IPV6_SOCKET_INDEX),
             ));
         }
-        let state = self.socket_state.lock().await;
+        None
+    }
+
+    // The original real registry remains the sole dynamic owner. Its
+    // generation check runs after whichever actual acquisition the caller used.
+    pub(super) fn resolve_committed_dynamic_socket_with_lease(
+        &self,
+        state: &SocketState,
+        peer_id: &str,
+        local_endpoint: SocketAddr,
+        generation: u64,
+    ) -> Option<(usize, Arc<UdpSocket>, DynamicSocketSendLease)> {
         // The original mutable-registry lookup must qualify generation after
         // its await, before selecting a dynamic owner or acquiring its lease.
         if generation != self.peers.current_network_generation_sync() {

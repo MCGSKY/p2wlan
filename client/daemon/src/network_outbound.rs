@@ -451,6 +451,8 @@ mod test_support;
 #[cfg(test)]
 mod path_log_test_entry;
 #[cfg(test)]
+pub(crate) use path_log_test_entry::one_direct_budget_preparation_without_session_for_test;
+#[cfg(test)]
 pub(crate) use path_log_test_entry::one_expiring_session_send_for_path_log_test;
 #[cfg(test)]
 pub(crate) use path_log_test_entry::one_missing_session_send_for_path_log_test;

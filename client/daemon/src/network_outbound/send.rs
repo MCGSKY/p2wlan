@@ -156,6 +156,27 @@ pub(super) async fn encrypt_then_send_with_deadline(
             // actual budget, socket and native handoff fences remain authoritative.
             let relay_available = relay_transport.read().await.is_some();
             let udp = udp_transport.read().await.clone();
+            // Resolve only the resource named by the current committed tuple
+            // before entering the original epoch transaction. Its canonical
+            // generation/path/budget checks still run below. Exact socket and
+            // lease-owner identity are rechecked before consuming this hint;
+            // any mismatch or busy registry retains the original resolver.
+            // At most one extra lease lives within the original preparation
+            // timeout, including cancellation and the unchanged fallback.
+            let mut committed_socket_resource = if prefer_direct
+                && peers.current_network_generation_sync() == expected_generation
+                && !preparation_retry
+                    .original_echo()
+                    .is_some_and(|echo| echo.source().original_relay_read().is_some())
+            {
+                if let Some(udp) = udp.as_ref() {
+                    udp.try_prepare_direct_business_socket_resource(&preparation_retry.peer_id)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let epoch_gate_wait_started = Instant::now();
             // Declare before the real guard: success, early return and future
             // cancellation release epoch before histogram locks/log callbacks.
@@ -217,7 +238,11 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 match (udp, selection.direct_endpoint) {
                     (Some(udp), Some(endpoint)) => {
                         match udp
-                            .prepare_direct_business_send(&preparation_retry.peer_id, endpoint)
+                            .prepare_direct_business_send_with_resource(
+                                &preparation_retry.peer_id,
+                                endpoint,
+                                &mut committed_socket_resource,
+                            )
                             .await
                         {
                             DirectBusinessBudgetGate::Unmanaged => None,
