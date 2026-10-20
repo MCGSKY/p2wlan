@@ -198,36 +198,35 @@ pub(super) fn frame_complete(
 #[cfg(unix)]
 pub(super) fn snapshot(
     reads: &super::Published<Arc<KernelReadBinding>>,
+    mut output: Vec<FullPacketSnapshot>,
 ) -> Vec<FullPacketSnapshot> {
-    reads
-        .iter()
-        .filter_map(|read| {
-            let observed_monotonic_ns = read.full_observed_ns()?;
-            let record = read.physical_publication.record()?;
-            Some(FullPacketSnapshot {
-                flow: read.flow,
-                read_ordinal: read.read.ordinal(),
-                read_monotonic_ns: read.read.monotonic_ns(),
-                full_observed_monotonic_ns: observed_monotonic_ns,
-                publication_observed_monotonic_ns: read.original_publication_ns.get().copied(),
-                packet_len: read.packet_len,
-                packet_sha256: read.packet_sha256,
-                spans: read.spans.clone(),
-                attempt_id: record.attempt_id(),
-                encryption_generation: record.encryption_generation(),
-                encryption_session_instance: record.encryption().session_instance(),
-                encryption_peer_lifecycle: record
-                    .encryption()
-                    .authorized_peer_lifecycle()
-                    .map(|life| life.value()),
-                physical_path: if record.udp().is_some() {
-                    "udp"
-                } else {
-                    "relay"
-                },
-            })
+    output.extend(reads.iter().filter_map(|read| {
+        let observed_monotonic_ns = read.full_observed_ns()?;
+        let record = read.physical_publication.record()?;
+        Some(FullPacketSnapshot {
+            flow: read.flow,
+            read_ordinal: read.read.ordinal(),
+            read_monotonic_ns: read.read.monotonic_ns(),
+            full_observed_monotonic_ns: observed_monotonic_ns,
+            publication_observed_monotonic_ns: read.original_publication_ns.get().copied(),
+            packet_len: read.packet_len,
+            packet_sha256: read.packet_sha256,
+            spans: read.spans.clone(),
+            attempt_id: record.attempt_id(),
+            encryption_generation: record.encryption_generation(),
+            encryption_session_instance: record.encryption().session_instance(),
+            encryption_peer_lifecycle: record
+                .encryption()
+                .authorized_peer_lifecycle()
+                .map(|life| life.value()),
+            physical_path: if record.udp().is_some() {
+                "udp"
+            } else {
+                "relay"
+            },
         })
-        .collect()
+    }));
+    output
 }
 
 impl KernelReadBinding {

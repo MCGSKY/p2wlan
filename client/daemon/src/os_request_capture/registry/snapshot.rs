@@ -3,6 +3,11 @@
 //! no scope, original owner, native permission or mutable history is retained.
 use super::*;
 
+mod buffers;
+pub(super) use buffers::SnapshotBuffers;
+#[cfg(all(unix, test))]
+mod allocation_tests;
+
 pub(super) struct SnapshotCoverage {
     rows: Vec<(usize, Vec<full::ReadFrameSpan>)>,
 }
@@ -53,11 +58,27 @@ impl CapturedSnapshot {
 }
 
 impl CaptureSession {
+    #[cfg(all(unix, test))]
     pub(super) fn capture_snapshot_in(
         &self,
         state: &RegistryState,
     ) -> Result<CapturedSnapshot, CaptureFailure> {
-        let mut requests = Vec::new();
+        self.capture_snapshot_with_buffers(state, SnapshotBuffers::prepare())
+    }
+
+    pub(super) fn capture_snapshot_with_buffers(
+        &self,
+        state: &RegistryState,
+        buffers: SnapshotBuffers,
+    ) -> Result<CapturedSnapshot, CaptureFailure> {
+        let SnapshotBuffers {
+            mut requests,
+            mut plans,
+            mut full_coverage,
+            inbound_coverage,
+            full_packets,
+            system_writes,
+        } = buffers;
         #[cfg(any(target_os = "linux", all(unix, test)))]
         let mut captured_native_verified = true;
         for (flow_index, flow) in state.flows.iter().enumerate() {
@@ -129,17 +150,18 @@ impl CaptureSession {
             && captured_native_verified;
         #[cfg(not(any(target_os = "linux", all(unix, test))))]
         let native_verified = false;
+        plans.extend(state.flows.iter().map(|flow| flow.plan.clone()));
+        full_coverage.extend(
+            state
+                .read_history
+                .iter()
+                .filter(|read| read.full_observed_ns().is_some())
+                .map(|read| (read.flow, read.spans.clone())),
+        );
         Ok(CapturedSnapshot {
-            plans: state.flows.iter().map(|flow| flow.plan.clone()).collect(),
-            full: SnapshotCoverage::from_rows(
-                state
-                    .read_history
-                    .iter()
-                    .filter(|read| read.full_observed_ns().is_some())
-                    .map(|read| (read.flow, read.spans.clone()))
-                    .collect(),
-            ),
-            inbound: state.inbound_history.snapshot_coverage(),
+            plans,
+            full: SnapshotCoverage::from_rows(full_coverage),
+            inbound: state.inbound_history.snapshot_coverage(inbound_coverage),
             value: ReadSnapshot {
                 schema_version: 2,
                 scope: "registered_native_frame_capture",
@@ -154,8 +176,8 @@ impl CaptureSession {
                 active: self.is_live(Instant::now()),
                 gaps: self.gaps.load(Ordering::Relaxed),
                 requests,
-                historical_full_packets: full::snapshot(&state.read_history),
-                system_tun_full_writes: state.inbound_history.snapshot(),
+                historical_full_packets: full::snapshot(&state.read_history, full_packets),
+                system_tun_full_writes: state.inbound_history.snapshot(system_writes),
                 // Registration alone leaves these false. Only the sole native
                 // current-owner/once transaction can make every frame verified;
                 // original application OS-write qualification stays separate.
