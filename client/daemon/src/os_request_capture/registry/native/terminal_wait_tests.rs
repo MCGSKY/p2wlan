@@ -52,7 +52,8 @@ async fn terminal_handoff_irrevocable_loss_before_wait_keeps_original_negative_a
         let mut state = setup.session.state.lock().unwrap();
         state.flows[0].requests[0].native_credit = Some(NativeFrameOutcome::failure(
             Outcome::Unknown(Unknown::OriginalSource),
-        ));
+        ))
+        .into();
     }
     setup
         .session
@@ -237,10 +238,16 @@ async fn terminal_handoff_keeps_recorded_failure_and_once_false_across_later_met
         .await
         .unwrap();
     {
-        let mut state = setup.session.state.lock().unwrap();
-        setup
-            .session
-            .try_complete_original_frames(&mut state, 0, &[0, 1, 2, 3, 4, 5, 6, 7]);
+        let state = setup.session.state.lock().unwrap();
+        let mut completion = completion::NativeCompletionBatch::new();
+        setup.session.prepare_original_frames_in(
+            &state,
+            0,
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+            &mut completion,
+        );
+        drop(state);
+        completion.finish(&setup.session);
     }
     setup
         .session

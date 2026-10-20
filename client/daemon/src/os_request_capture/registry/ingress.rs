@@ -36,7 +36,7 @@ pub(super) struct OriginalIncomingRoom {
 
 pub(super) struct InboundFlow {
     tcp_open: Option<u32>,
-    pub(super) invalid: bool,
+    pub(super) invalid: Arc<AtomicBool>,
     coverage: Vec<Option<TcpFrameCoverage>>,
     original_room: Vec<Option<Arc<OriginalIncomingRoom>>>,
 }
@@ -46,7 +46,7 @@ impl InboundFlow {
     pub(super) fn new(requests: usize) -> Self {
         Self {
             tcp_open: None,
-            invalid: false,
+            invalid: Arc::new(AtomicBool::new(false)),
             coverage: (0..requests).map(|_| None).collect(),
             original_room: (0..requests).map(|_| None).collect(),
         }
@@ -169,7 +169,11 @@ impl CaptureSession {
             {
                 return Err(CaptureFailure::ForeignDevice);
             }
-            if state.flows[binding.flow].inbound.invalid {
+            if state.flows[binding.flow]
+                .inbound
+                .invalid
+                .load(Ordering::Acquire)
+            {
                 return Err(CaptureFailure::FrameConflict);
             }
             if state.inbound_history.writes.len() >= MAX_SYSTEM_WRITES {
@@ -196,7 +200,12 @@ impl CaptureSession {
             }
             state.inbound_history.writes.push(binding);
             #[cfg(any(target_os = "linux", all(unix, test)))]
-            self.try_complete_original_frames(&mut state, flow, &slots[..count]);
+            {
+                let mut completion = native::completion::NativeCompletionBatch::new();
+                self.prepare_original_frames_in(&state, flow, &slots[..count], &mut completion);
+                drop(state);
+                completion.finish(self);
+            }
             Ok(())
         };
         if let Err(error) = retain() {
@@ -311,7 +320,7 @@ impl KernelCaptureRuntime {
             return Err(CaptureFailure::InvalidPlan);
         }
         let flow = &mut state.flows[index];
-        if flow.inbound.invalid {
+        if flow.inbound.invalid.load(Ordering::Acquire) {
             return Err(CaptureFailure::FrameConflict);
         }
         let mut spans = Vec::with_capacity(MAX_BINDINGS_PER_PACKET);
@@ -332,7 +341,7 @@ impl KernelCaptureRuntime {
             if segment.is_syn() {
                 let base = segment.sequence().wrapping_add(1);
                 if flow.inbound.tcp_open.is_some_and(|old| old != base) {
-                    flow.inbound.invalid = true;
+                    flow.inbound.invalid.store(true, Ordering::Release);
                     return Err(CaptureFailure::FrameConflict);
                 }
                 flow.inbound.tcp_open = Some(base);
@@ -351,7 +360,7 @@ impl KernelCaptureRuntime {
                 if segment.overlaps_frame(base.wrapping_add(slot as u32 * length), length as usize)
                 {
                     if slots.len() == MAX_BINDINGS_PER_PACKET {
-                        flow.inbound.invalid = true;
+                        flow.inbound.invalid.store(true, Ordering::Release);
                         return Err(CaptureFailure::Capacity);
                     }
                     slots.push(slot);
@@ -386,7 +395,7 @@ impl KernelCaptureRuntime {
                     coverage.observe(&segment, authenticated),
                     TcpCoverageResult::Conflict | TcpCoverageResult::Invalidated
                 ) {
-                    flow.inbound.invalid = true;
+                    flow.inbound.invalid.store(true, Ordering::Release);
                     return Err(CaptureFailure::FrameConflict);
                 }
                 let (start, end) = coverage

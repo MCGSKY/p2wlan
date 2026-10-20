@@ -58,15 +58,21 @@ impl CaptureSession {
         state: &RegistryState,
     ) -> Result<CapturedSnapshot, CaptureFailure> {
         let mut requests = Vec::new();
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        let mut captured_native_verified = true;
         for (flow_index, flow) in state.flows.iter().enumerate() {
             let plan = &flow.plan;
             for (key, read) in plan.requests.iter().zip(&flow.requests) {
+                #[cfg(any(target_os = "linux", all(unix, test)))]
+                let native_credit = read.native_credit.as_ref();
+                #[cfg(any(target_os = "linux", all(unix, test)))]
+                {
+                    captured_native_verified &=
+                        native_credit.is_some_and(native::NativeFrameOutcome::verified);
+                }
                 requests.push(RequestSnapshot {
                     #[cfg(any(target_os = "linux", all(unix, test)))]
-                    native_credit: read
-                        .native_credit
-                        .as_ref()
-                        .map(native::NativeFrameOutcome::snapshot),
+                    native_credit: native_credit.map(native::NativeFrameOutcome::snapshot),
                     flow: flow_index,
                     producer_scope: flow.producer_scope,
                     sequence: key.sequence,
@@ -89,14 +95,14 @@ impl CaptureSession {
                         .as_ref()
                         .map(|read| read.monotonic_ns()),
                     last_read_monotonic_ns: read.last_read.as_ref().map(|read| read.monotonic_ns()),
-                    kernel_frame_read_complete: !flow.invalid
+                    kernel_frame_read_complete: !flow.invalid.load(Ordering::Acquire)
                         && (read.udp_complete
                             || read.tcp.as_ref().is_some_and(|tcp| tcp.is_complete())),
-                    flow_invalid: flow.invalid,
+                    flow_invalid: flow.invalid.load(Ordering::Acquire),
                     // Only frozen original history is interpreted after release.
                     historical_frame_full_complete: false,
                     incoming_frame_system_write_complete: false,
-                    incoming_flow_invalid: flow.inbound.invalid,
+                    incoming_flow_invalid: flow.inbound.invalid.load(Ordering::Acquire),
                     original_peer: read.first_peer.as_ref().map(|peer| peer.snapshot()),
                     original_request_room: read
                         .first_request_room
@@ -116,20 +122,11 @@ impl CaptureSession {
             && self.read_complete.load(Ordering::Acquire)
             && self.inbound_complete.load(Ordering::Acquire)
             && self.full_complete.load(Ordering::Acquire)
-            && state
-                .flows
-                .iter()
-                .all(|flow| !flow.invalid && !flow.inbound.invalid)
-            && state
-                .flows
-                .iter()
-                .flat_map(|flow| &flow.requests)
-                .all(|request| {
-                    request
-                        .native_credit
-                        .as_ref()
-                        .is_some_and(native::NativeFrameOutcome::verified)
-                });
+            && state.flows.iter().all(|flow| {
+                !flow.invalid.load(Ordering::Acquire)
+                    && !flow.inbound.invalid.load(Ordering::Acquire)
+            })
+            && captured_native_verified;
         #[cfg(not(any(target_os = "linux", all(unix, test))))]
         let native_verified = false;
         Ok(CapturedSnapshot {

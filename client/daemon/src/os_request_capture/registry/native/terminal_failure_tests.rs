@@ -99,7 +99,8 @@ async fn terminal_failure_metadata_existing_negative_outcomes_and_once_are_not_r
         for row in &mut state.flows[0].requests {
             row.native_credit = Some(NativeFrameOutcome::failure(Outcome::Unknown(
                 Unknown::OriginalSource,
-            )));
+            )))
+            .into();
         }
     }
     let before = serde_json::to_value(setup.session.snapshot().unwrap()).unwrap();

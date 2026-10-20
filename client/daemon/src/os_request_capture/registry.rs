@@ -75,6 +75,8 @@ pub(crate) struct CaptureSession {
     #[cfg(any(target_os = "linux", all(unix, test)))]
     pending_full: full_completion::CompletionSignal,
     #[cfg(any(target_os = "linux", all(unix, test)))]
+    native_completion: native::completion_gate::NativeCompletionGate,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
     native_terminal_revision: AtomicU64,
     #[cfg(any(target_os = "linux", all(unix, test)))]
     epoch_trace: crate::peer::EpochTraceLease,
@@ -93,7 +95,7 @@ pub(crate) struct CaptureSession {
 }
 
 struct RegistryState {
-    current_owners: Option<owners::OriginalKernelOwners>,
+    current_owners: Option<Arc<owners::OriginalKernelOwners>>,
     original_room_owner: Option<Weak<crate::rooms::RoomAuthorization>>,
     flows: Vec<FlowState>,
     original_device: Option<Arc<KernelRead>>,
@@ -114,13 +116,13 @@ struct FlowState {
     #[cfg(unix)]
     producer_scope: [u8; 16],
     tcp_open: Option<u32>,
-    invalid: bool,
+    invalid: Arc<AtomicBool>,
     requests: Vec<RequestReadState>,
     inbound: ingress::InboundFlow,
 }
 struct RequestReadState {
     #[cfg(any(target_os = "linux", all(unix, test)))]
-    native_credit: Option<native::NativeFrameOutcome>,
+    native_credit: native::completion::NativeFrameSlot,
     first_request_room: Option<Arc<ingress::OriginalIncomingRoom>>,
     #[cfg(any(target_os = "linux", all(unix, test)))]
     original_write_window: Option<write_window::WriteWindow>,
@@ -279,6 +281,7 @@ impl CaptureSession {
             full_loss: FullRetentionLoss::new(),
             inbound_loss: inbound_loss::InboundLoss::new(),
             pending_full: full_completion::CompletionSignal::new(),
+            native_completion: native::completion_gate::NativeCompletionGate::new(),
             native_terminal_revision: AtomicU64::new(0),
             epoch_trace: peers.network_epoch_gate().capture_diagnostics(
                 owner,
@@ -380,7 +383,7 @@ impl CaptureSession {
                     .requests
                     .iter()
                     .map(|_| RequestReadState {
-                        native_credit: None,
+                        native_credit: native::completion::NativeFrameSlot::new(),
                         first_request_room: None,
                         original_write_window: None,
                         first_peer: None,
@@ -397,7 +400,7 @@ impl CaptureSession {
                     plan: Arc::new(plan),
                     producer_scope: producer,
                     tcp_open: None,
-                    invalid: false,
+                    invalid: Arc::new(AtomicBool::new(false)),
                     requests,
                 }
             })
@@ -539,7 +542,7 @@ impl CaptureSession {
         let room = state.original_room_owner.clone();
         let flow = &mut state.flows[index];
         let plan = flow.plan.clone();
-        if flow.invalid {
+        if flow.invalid.load(Ordering::Acquire) {
             return Err(CaptureFailure::FrameConflict);
         }
         let mut slots = Vec::with_capacity(MAX_BINDINGS_PER_PACKET);
@@ -560,7 +563,7 @@ impl CaptureSession {
             if segment.is_syn() {
                 let opened = segment.sequence().wrapping_add(1);
                 if flow.tcp_open.is_some_and(|previous| previous != opened) {
-                    flow.invalid = true;
+                    flow.invalid.store(true, Ordering::Release);
                     return Err(CaptureFailure::FrameConflict);
                 }
                 flow.tcp_open = Some(opened);
@@ -578,7 +581,7 @@ impl CaptureSession {
                 let start = base.wrapping_add((slot as u32).wrapping_mul(wire_len));
                 if segment.overlaps_frame(start, wire_len as usize) {
                     if slots.len() == MAX_BINDINGS_PER_PACKET {
-                        flow.invalid = true;
+                        flow.invalid.store(true, Ordering::Release);
                         return Err(CaptureFailure::Capacity);
                     }
                     slots.push(slot);
@@ -612,7 +615,7 @@ impl CaptureSession {
                     coverage.observe(&segment, original.at()),
                     TcpCoverageResult::Conflict | TcpCoverageResult::Invalidated
                 ) {
-                    flow.invalid = true;
+                    flow.invalid.store(true, Ordering::Release);
                     return Err(CaptureFailure::FrameConflict);
                 }
                 let (start, end) = coverage
@@ -737,6 +740,7 @@ impl KernelReadBinding {
         };
         state.flows[self.flow]
             .invalid
+            .load(Ordering::Acquire)
             .then_some(Reason::InputFlowInvalid)
     }
 }

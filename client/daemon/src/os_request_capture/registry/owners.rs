@@ -66,7 +66,7 @@ impl CaptureSession {
             if let Some(previous) = &state.current_owners {
                 previous.same_owner(&original)
             } else {
-                state.current_owners = Some(original);
+                state.current_owners = Some(Arc::new(original));
                 true
             }
         });

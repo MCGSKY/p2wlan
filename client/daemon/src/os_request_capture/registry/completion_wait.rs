@@ -21,17 +21,15 @@ pub(in crate::os_request_capture) struct TerminalMetadataReceipt {
 }
 
 impl CaptureSession {
-    // Called only under the existing registry guard after new terminal rows
-    // were stored. Its ordinary drop already releases before waking the actor.
-    // This revision is a wakeup hint; readiness always reads the sole rows.
+    // Results are immutable before this release/wake. Concurrent completion
+    // owners publish revisions atomically; readiness reads the sole slots.
     pub(super) fn record_native_terminal_progress(&self) {
-        if let Some(next) = self
-            .native_terminal_revision
-            .load(Ordering::Relaxed)
-            .checked_add(1)
-        {
-            self.native_terminal_revision.store(next, Ordering::Release);
-        }
+        let _ = self.native_terminal_revision.try_update(
+            Ordering::Release,
+            Ordering::Relaxed,
+            |value| value.checked_add(1),
+        );
+        self.pending_full.notify_ready();
     }
 
     pub(in crate::os_request_capture) async fn wait_original_outcomes(
@@ -68,7 +66,7 @@ impl CaptureSession {
                 }
                 // Only the existing bounded real-Full markers are drained.
                 // Some terminal outcome, including every refusal, is enough.
-                self.complete_pending_fulls_in(&mut state);
+                let mut completion = self.prepare_pending_fulls_in(&mut state);
                 if !self.read_complete.load(Ordering::Acquire)
                     || !self.full_complete.load(Ordering::Acquire)
                     || !self.inbound_complete.load(Ordering::Acquire)
@@ -77,12 +75,21 @@ impl CaptureSession {
                     // predicate returns Unknown(OriginalPublication) before
                     // any native owner/once check. Preserve recorded rows;
                     // a lost input need not have a real-Full marker to wake us.
-                    self.try_complete_original_frames(&mut state, index, &[0, 1, 2, 3, 4, 5, 6, 7]);
+                    self.prepare_original_frames_in(
+                        &state,
+                        index,
+                        &[0, 1, 2, 3, 4, 5, 6, 7],
+                        &mut completion,
+                    );
                 }
-                state.flows[index]
-                    .requests
-                    .iter()
-                    .all(|row| row.native_credit.is_some())
+                // Eight metadata handles only, never a scope/descriptor or
+                // daemon owner. No terminal/native work holds the input lock.
+                let outcomes = std::array::from_fn::<_, 8, _>(|slot| {
+                    state.flows[index].requests[slot].native_credit.shared()
+                });
+                drop(state);
+                completion.finish(self);
+                outcomes.iter().all(|outcome| outcome.is_some())
             };
             if ready {
                 if tokio::time::Instant::now() >= end {

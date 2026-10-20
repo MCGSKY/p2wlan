@@ -55,7 +55,9 @@ impl KernelResponseInput {
     ) -> Outcome<Self> {
         use OverlayCreditOutcome::{Stale, Unknown};
         let flow = &state.flows[flow_index];
-        if !scope.inbound_complete.load(Ordering::Acquire) || flow.inbound.invalid {
+        if !scope.inbound_complete.load(Ordering::Acquire)
+            || flow.inbound.invalid.load(Ordering::Acquire)
+        {
             return Err(Unknown(OverlayCreditUnknown::OriginalSource));
         }
         if flow.plan.requests[slot].kind != RequestKind::Response {

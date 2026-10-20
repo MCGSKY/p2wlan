@@ -27,6 +27,18 @@ impl CompletionSignal {
         self.ready.notify_one();
     }
 
+    pub(super) fn notify_ready(&self) {
+        // A readiness wake only. The sole metadata rows and pending markers
+        // remain authoritative; this cannot create a native observation.
+        self.ready.notify_one();
+    }
+
+    pub(super) fn defer_window_until_unlock(&self) {
+        // A busy metadata executor will wake after releasing its own mutex.
+        // Do not spin the descriptor actor by immediately notifying it here.
+        self.window_pending.store(true, Ordering::Release);
+    }
+
     pub(super) fn request_window(&self) {
         // A bounded metadata wakeup, never a real Full marker or I/O fact.
         self.window_pending.store(true, Ordering::Release);
@@ -53,18 +65,24 @@ impl CompletionSignal {
 
 impl KernelReadBinding {
     pub(super) fn complete_original_full_or_notify(self: &Arc<Self>, scope: &Arc<CaptureSession>) {
-        match scope.state.try_lock() {
-            Ok(mut state) => scope.try_complete_original_frames(&mut state, self.flow, &self.slots),
+        let completion = match scope.state.try_lock() {
+            Ok(state) => {
+                let mut completion = super::native::completion::NativeCompletionBatch::new();
+                scope.prepare_original_frames_in(&state, self.flow, &self.slots, &mut completion);
+                drop(state);
+                completion
+            }
             Err(TryLockError::WouldBlock) => {
-                // This read already owns a sealed actual Full observation.
-                // Its marker is bounded by the same 1024-entry read index.
                 self.full_completion_pending.store(true, Ordering::Release);
                 scope.pending_full.request();
+                return;
             }
             Err(TryLockError::Poisoned(_)) => {
                 scope.original_full_retention_lost(FullRetentionLossReason::HistoryContended);
+                return;
             }
-        }
+        };
+        completion.finish(scope);
     }
 }
 
@@ -104,12 +122,18 @@ impl CaptureSession {
                 return;
             }
         };
-        self.complete_pending_fulls_in(&mut state);
+        let completion = self.prepare_pending_fulls_in(&mut state);
+        drop(state);
+        completion.finish(self);
     }
 
-    pub(super) fn complete_pending_fulls_in(self: &Arc<Self>, state: &mut RegistryState) {
+    pub(super) fn prepare_pending_fulls_in(
+        self: &Arc<Self>,
+        state: &mut RegistryState,
+    ) -> super::native::completion::NativeCompletionBatch {
+        let mut completion = super::native::completion::NativeCompletionBatch::new();
         if !self.metadata_completion_pending() || !self.is_live(std::time::Instant::now()) {
-            return;
+            return completion;
         }
         // Clear only after acquisition. A contended attempt keeps its marker
         // and waits for an unlock, rather than polling or losing the event.
@@ -123,7 +147,7 @@ impl CaptureSession {
                 let read = read.clone();
                 // The original transaction still checks its original window and
                 // current owners try-only. Existing terminal outcomes are skipped.
-                self.try_complete_original_frames(state, read.flow, &read.slots);
+                self.prepare_original_frames_in(state, read.flow, &read.slots, &mut completion);
             }
         }
         let window_pending = self
@@ -149,11 +173,12 @@ impl CaptureSession {
                                 .original_write_window
                                 .is_some())
                     {
-                        self.try_complete_original_frames(state, flow, &[slot]);
+                        self.prepare_original_frames_in(state, flow, &[slot], &mut completion);
                     }
                 }
             }
         }
+        completion
     }
 }
 
