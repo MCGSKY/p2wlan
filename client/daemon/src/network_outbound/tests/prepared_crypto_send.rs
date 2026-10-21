@@ -300,8 +300,14 @@ async fn cancelling_actual_crypto_wait_invalidates_read_view_before_epoch_unlock
 }
 
 #[cfg(unix)]
-async fn exercise_storage_before_emit(deadline_expires: bool) {
+async fn exercise_metadata_before_emit(deadline_expires: bool) {
     let peers = PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+    // This interest enables metadata preparation only, never an IO fact.
+    let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    peers.register_original_kernel_read_observer(
+        Arc::downgrade(&active),
+        Instant::now() + Duration::from_secs(30),
+    );
     let capture = ResourceCapture::new([0xa1 + u8::from(deadline_expires); 16]);
     let (session, mut remote) = establish_sessions();
     let (transport, mut receiver) = WireGuardTransport::new();
@@ -329,15 +335,19 @@ async fn exercise_storage_before_emit(deadline_expires: bool) {
         None,
     ));
     assert!(futures_util::poll!(attempt.as_mut()).is_pending());
-    // Both preparation buffers already exist, even though this send has never
-    // acquired the actual emit turn, epoch, or session/counter owner.
+    // Pure expectation metadata can be prepared before Emit. Real wire
+    // storage must wait for its actual turn and the original endpoint query.
+    // Keep the original one-preparation/three-total plaintext owner budget.
     assert_eq!(
         capture
             .snapshot()
             .buffer(BufferStage::PreparationPlaintext)
             .live_buffers,
-        2
+        1
     );
+    let live = capture.residency_snapshot();
+    assert!(live.valid && live.coherent);
+    assert_eq!(live.total.unwrap().live_buffers, 3);
     assert!(peers.network_epoch_gate().try_lock().is_ok());
     if deadline_expires {
         let outcome = tokio::time::timeout(Duration::from_secs(2), attempt.as_mut())
@@ -383,12 +393,12 @@ async fn exercise_storage_before_emit(deadline_expires: bool) {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn pure_storage_precedes_emit_and_cancellation_keeps_original_counter() {
-    exercise_storage_before_emit(false).await;
+async fn metadata_before_emit_keeps_original_buffer_budget_and_counter_on_cancel() {
+    exercise_metadata_before_emit(false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn pre_emit_storage_wait_uses_original_deadline_and_drains_on_timeout() {
-    exercise_storage_before_emit(true).await;
+async fn emit_wait_metadata_keeps_original_deadline_and_buffer_budget() {
+    exercise_metadata_before_emit(true).await;
 }

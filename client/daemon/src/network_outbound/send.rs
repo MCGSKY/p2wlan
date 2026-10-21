@@ -193,16 +193,28 @@ async fn encrypt_then_send_bounded(
         } else {
             None
         };
-        // Resolve this owned primary socket before the epoch transaction.
-        // The original generation/path/budget and final owner fences remain.
-        let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
         let prepared_read_view = peers.prepare_original_kernel_read_view(
             &preparation_retry.peer_id,
             &preparation_retry.dst_ip,
         );
-        // Prepare pure storage before emit/epoch/sessions. The original emit turn
-        // still owns every session/counter operation and physical handoff;
-        // the same outer timeout/cancellation owner covers these buffers.
+        let emit_lock_started = Instant::now();
+        let emit_guard = Arc::new(transport.acquire_outbound_emit_guard(&packet.peer_id).await);
+        let emit_guard_acquired = Instant::now();
+        let emit_lock_wait_ms = emit_lock_started.elapsed().as_millis() as u64;
+        if let Some(trace) = sampled_trace.as_ref() {
+            preparation_profile.record(
+                trace.sampled,
+                OutboundPreparationStage::EmitWait,
+                emit_guard_acquired.duration_since(emit_lock_started),
+            );
+        }
+        preparation_log.acquired(emit_lock_wait_ms);
+        // Resolve this owned primary socket before the epoch transaction.
+        // The original generation/path/budget and final owner fences remain.
+        let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
+        // Materialize real wire storage after the original emit turn and endpoint
+        // query. Emit wait retains only its original plaintext buffer budget;
+        // the same outer timeout/cancellation owner covers this allocation.
         let prepared_wire = match crate::transport::PreparedEncryptionBuffer::new(
             packet.packet.len(),
             transport.resource_capture(),
@@ -216,18 +228,6 @@ async fn encrypt_then_send_bounded(
                 })
             }
         };
-        let emit_lock_started = Instant::now();
-        let emit_guard = Arc::new(transport.acquire_outbound_emit_guard(&packet.peer_id).await);
-        let emit_guard_acquired = Instant::now();
-        let emit_lock_wait_ms = emit_lock_started.elapsed().as_millis() as u64;
-        if let Some(trace) = sampled_trace.as_ref() {
-            preparation_profile.record(
-                trace.sampled,
-                OutboundPreparationStage::EmitWait,
-                emit_guard_acquired.duration_since(emit_lock_started),
-            );
-        }
-        preparation_log.acquired(emit_lock_wait_ms);
         let (
             encrypted,
             direct_business_plan,

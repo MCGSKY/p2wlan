@@ -293,10 +293,7 @@ impl CaptureSession {
             current_owners.clone(),
         );
         // All possible flow slots are reserved before this scope is exposed.
-        let mut flows = Vec::new();
-        flows
-            .try_reserve_exact(MAX_REQUESTS)
-            .map_err(|_| CaptureFailure::Capacity)?;
+        let flows = registration::flow_storage()?;
         let session = Arc::new(Self {
             owner,
             active: Arc::new(AtomicBool::new(true)),

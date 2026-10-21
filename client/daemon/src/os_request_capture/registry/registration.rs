@@ -4,6 +4,20 @@ use super::*;
 
 mod conflicts;
 
+// Only initialize spare MaybeUninit bytes: no FlowState or observed fact is
+// created, and the vector's published length remains zero. Keep these possible
+// first page writes out of the input mutex's later append transaction.
+pub(super) fn flow_storage() -> Result<Vec<FlowState>, CaptureFailure> {
+    let mut flows = Vec::new();
+    flows
+        .try_reserve_exact(MAX_REQUESTS)
+        .map_err(|_| CaptureFailure::Capacity)?;
+    let spare = flows.spare_capacity_mut();
+    spare.fill_with(std::mem::MaybeUninit::zeroed);
+    std::hint::black_box(spare);
+    Ok(flows)
+}
+
 // Each valid registration adds at least one of the original MAX_REQUESTS.
 // Reserve membership before exposing the scope so the sole append transaction
 // never grows this table while excluding the input reader's single try.
@@ -12,6 +26,13 @@ pub(super) fn producer_membership() -> Result<std::collections::HashSet<[u8; 16]
     producers
         .try_reserve(MAX_REQUESTS)
         .map_err(|_| CaptureFailure::Capacity)?;
+    // Touch the already reserved key buckets before exposing the scope.
+    // These temporary labels are never published and leave no membership.
+    for index in 0..MAX_REQUESTS {
+        producers.insert((index as u128).to_be_bytes());
+    }
+    std::hint::black_box(&producers);
+    producers.clear();
     Ok(producers)
 }
 
