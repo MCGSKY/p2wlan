@@ -12,7 +12,9 @@ use crate::dataplane_resources::{
 use crate::error::{DaemonError, Result};
 use crate::transport::EncryptedPeerPacket;
 
-pub(crate) struct PreparedEncryptionBuffer {
+pub(crate) struct PreparedEncryptionBuffer(Box<PreparedStorage>);
+
+struct PreparedStorage {
     wire: Option<PreparedTransportBuffer>,
     residency: Option<ResidencyLease>,
     _buffer_lease: Option<OwnedBufferLease>,
@@ -32,11 +34,11 @@ impl PreparedEncryptionBuffer {
         });
         let buffer_lease =
             OwnedBufferLease::observe(capture, BufferStage::PreparationPlaintext, wire.buffer());
-        Ok(Self {
+        Ok(Self(Box::new(PreparedStorage {
             wire: Some(wire),
             residency,
             _buffer_lease: buffer_lease,
-        })
+        })))
     }
 
     pub(super) fn encrypt(
@@ -44,7 +46,7 @@ impl PreparedEncryptionBuffer {
         session: &mut TransportSession,
         packet: &[u8],
     ) -> p2pnet_wireguard::Result<Vec<u8>> {
-        let wire = self.wire.take().ok_or_else(|| {
+        let wire = self.0.wire.take().ok_or_else(|| {
             WireGuardError::InvalidPacket("prepared transport buffer already consumed".into())
         })?;
         session.encrypt_into_prepared(packet, wire)
@@ -52,10 +54,10 @@ impl PreparedEncryptionBuffer {
 
     #[allow(clippy::ptr_arg)] // Compare the actual allocation, including capacity.
     fn into_residency(mut self, wire: &Vec<u8>) -> Option<ResidencyLease> {
-        if let Some(lease) = self.residency.as_mut() {
+        if let Some(lease) = self.0.residency.as_mut() {
             lease.relocate(ResidencyStage::SerializedWire, wire);
         }
-        self.residency.take()
+        self.0.residency.take()
     }
 }
 
