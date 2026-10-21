@@ -371,16 +371,13 @@ impl PeerConnection {
         policy: crate::config::PathPolicy,
         relay_available: bool,
     ) -> PathSelection {
-        let direct_endpoint = self.direct_endpoint_for_send(local_generation);
-        let relay_score = self.relay_path_score(relay_available);
-
         if policy == crate::config::PathPolicy::RelayOnly {
             return if relay_available {
                 PathSelection::relay(
                     REASON_PATH_DIRECT_DISABLED,
                     "relay policy disables direct UDP",
                 )
-                .with_scores(None, relay_score)
+                .with_scores(None, self.relay_path_score(relay_available))
             } else {
                 PathSelection::unavailable(
                     REASON_PATH_UNAVAILABLE,
@@ -389,6 +386,9 @@ impl PeerConnection {
                 .with_scores(None, None)
             };
         }
+
+        let direct_endpoint = self.direct_endpoint_for_send(local_generation);
+        let relay_score = self.relay_path_score(relay_available);
 
         if policy == crate::config::PathPolicy::DirectFirst
             && self.direct_first_pending()
