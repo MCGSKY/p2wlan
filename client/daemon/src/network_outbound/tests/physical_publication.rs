@@ -11,6 +11,8 @@ use crate::udp::UdpSendFence;
 
 #[path = "encryption_diagnostics.rs"]
 mod encryption_diagnostics;
+#[path = "local_endpoint_preparation.rs"]
+mod local_endpoint_preparation;
 #[path = "preparation_diagnostics.rs"]
 mod preparation_diagnostics;
 
