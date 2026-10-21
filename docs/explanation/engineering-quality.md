@@ -117,6 +117,10 @@ Path State Machine 的 Linux workspace 步骤使用包装器的默认 target 范
 
 原 Cargo 退出后，两条输出流合计最多等待 5 秒收尾，避免后代继承管道导致 EOF 永不抵达；这不改变测试运行期限。到期记录 `stream_not_closed_after_cargo_exit`，日志标为不完整，不宣称最终摘要或已绑定的失败程序。泵线程停止接受新数据，残留阻塞读取随包装器进程退出关闭；不等待不归包装器直接所有的后代，也不向它们发送信号。原 Cargo 非零退出码仍保留；原退出为零而采证失败时包装器失败。
 
+## 跨工作流门禁
+
+`scripts/quality/check_required_gates.py` 将验证运行绑定到源码 SHA、所属工作流、触发事件和实际任务。同一查询已观察到的 `push` 或 `pull_request` 运行若从后续完整列表中消失，会在既有 API 重试上限内重新读取列表；若当前列表仍不完整，门禁按原轮询间隔在同一总截止时间内等待新快照，到期仍不一致返回 `api_error`。只保留运行身份用于发现列表回退，先前的成功不能代替当前结果。最初缺失的运行、真实失败、取消和无效响应仍拒绝合并；重读使用原分页上限和命令行总截止时间，不重置期限。
+
 ## Android CI 插件仓库
 
 Android APK 的两个 CI 构建任务使用 runner 临时目录中的独立 `GRADLE_USER_HOME`。`scripts/release/prepare_android_gradle_repositories.py` 只接受 Git checkout 外尚未存在的绝对路径，验证 Flutter SDK 后，将仓库内的 init 脚本按原字节安装到私有 `init.d`；已有目录或符号链接会使准备失败。
