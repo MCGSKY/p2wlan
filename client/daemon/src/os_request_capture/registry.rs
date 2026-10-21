@@ -457,6 +457,7 @@ impl CaptureSession {
     ) -> Result<Option<Arc<KernelReadBinding>>, CaptureFailure> {
         let udp = parse_os_udp(packet).ok();
         let tcp = parse_tcp_segment(packet).ok();
+        let packet_sha256: [u8; 32] = Sha256::digest(packet).into();
         #[cfg(unix)]
         let state = self.state.try_original_read_lock(original.ordinal());
         #[cfg(not(unix))]
@@ -614,7 +615,7 @@ impl CaptureSession {
             flow: index,
             slots,
             packet_len: packet.len(),
-            packet_sha256: Sha256::digest(packet).into(),
+            packet_sha256,
             plan,
             spans,
             physical_publication: crate::overlay_requests::PhysicalSendPublication::new(),
