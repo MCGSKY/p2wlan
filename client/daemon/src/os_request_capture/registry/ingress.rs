@@ -152,6 +152,16 @@ impl CaptureSession {
             {
                 return Err(CaptureFailure::InvalidPlan);
             }
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            let (flow, count, mut slots) = (
+                binding.flow,
+                binding.spans.len(),
+                [0; MAX_BINDINGS_PER_PACKET],
+            );
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            for (slot, span) in slots.iter_mut().zip(&binding.spans) {
+                *slot = span.slot();
+            }
             #[cfg(unix)]
             let mut state = self
                 .state
@@ -188,16 +198,6 @@ impl CaptureSession {
                 .write
                 .set(original)
                 .map_err(|_| CaptureFailure::DuplicateWrite)?;
-            #[cfg(any(target_os = "linux", all(unix, test)))]
-            let (flow, count, mut slots) = (
-                binding.flow,
-                binding.spans.len(),
-                [0; MAX_BINDINGS_PER_PACKET],
-            );
-            #[cfg(any(target_os = "linux", all(unix, test)))]
-            for (slot, span) in slots.iter_mut().zip(&binding.spans) {
-                *slot = span.slot();
-            }
             state.inbound_history.writes.push(binding)?;
             #[cfg(any(target_os = "linux", all(unix, test)))]
             {
