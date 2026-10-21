@@ -2,11 +2,10 @@
 //! No diagnostic can authorize a read, Full, current owner or once commit.
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
-#[cfg(any(target_os = "linux", all(unix, test)))]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 #[cfg(any(target_os = "linux", all(unix, test)))]
-use std::sync::{OnceLock, Weak};
+use std::sync::OnceLock;
+use std::sync::{Arc, Weak};
 #[cfg(any(target_os = "linux", all(unix, test)))]
 use std::time::Instant;
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, TryLockError};
@@ -57,6 +56,7 @@ pub(crate) struct NetworkEpochGuard<'a> {
     inner: Option<MutexGuard<'a, ()>>,
     owner: &'a NetworkEpochGate,
     token: Option<u64>,
+    read_view_active: Option<Weak<AtomicBool>>,
 }
 
 pub(crate) struct OwnedNetworkEpochGuard {
@@ -146,6 +146,7 @@ impl NetworkEpochGate {
             inner: Some(inner),
             owner: self,
             token: self.acquired(site),
+            read_view_active: None,
         }
     }
 
@@ -258,6 +259,23 @@ impl Drop for EpochTraceLease {
 }
 
 impl NetworkEpochGuard<'_> {
+    pub(super) fn protects(&self, gate: &NetworkEpochGate) -> bool {
+        std::ptr::eq(self.owner, gate)
+    }
+
+    pub(super) fn bind_read_view(&mut self, active: &Arc<AtomicBool>) -> bool {
+        if self
+            .read_view_active
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|previous| previous.load(Ordering::Acquire))
+        {
+            return false;
+        }
+        self.read_view_active = Some(Arc::downgrade(active));
+        true
+    }
+
     pub(crate) fn note_outbound_phase(&self, phase: OutboundEpochPhase) {
         #[cfg(any(target_os = "linux", all(unix, test)))]
         if let (Some(token), Some(trace)) = (self.token, self.owner.trace.get()) {
@@ -296,6 +314,9 @@ impl Drop for NetworkEpochGuard<'_> {
     fn drop(&mut self) {
         let ended = observed_end(self.token);
         self.owner.ending(self.token, ended);
+        if let Some(active) = self.read_view_active.as_ref().and_then(Weak::upgrade) {
+            active.store(false, Ordering::Release);
+        }
         drop(self.inner.take());
         self.owner.released(self.token, ended);
     }

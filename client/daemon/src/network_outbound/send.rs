@@ -33,7 +33,36 @@ pub(super) async fn encrypt_then_send(
 /// Encrypt a RAW packet (holding the peer's emit lock) and send it while the
 /// guard is still held.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn encrypt_then_send_with_deadline(
+pub(super) fn encrypt_then_send_with_deadline<'a>(
+    packet: impl Into<RawRequestDelivery> + Send + 'a,
+    transport: &'a WireGuardTransport,
+    peers: &'a PeerManager,
+    expected_generation: u64,
+    prefer_direct: bool,
+    udp_transport: &'a RwLock<Option<UdpTransport>>,
+    relay_transport: &'a RwLock<Option<RelayTransport>>,
+    relay_expected: bool,
+    admission_deadline: Option<Instant>,
+    stopping: Option<&'a AtomicBool>,
+) -> impl std::future::Future<Output = EncryptSendOutcome> + Send + 'a {
+    // Return a small heap-owned frame to callers that nest several sends.
+    // Boxing acquires no guards; original clocks still start on first poll.
+    Box::pin(encrypt_then_send_bounded(
+        packet,
+        transport,
+        peers,
+        expected_generation,
+        prefer_direct,
+        udp_transport,
+        relay_transport,
+        relay_expected,
+        admission_deadline,
+        stopping,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn encrypt_then_send_bounded(
     packet: impl Into<RawRequestDelivery> + Send,
     transport: &WireGuardTransport,
     peers: &PeerManager,
@@ -164,6 +193,10 @@ pub(super) async fn encrypt_then_send_with_deadline(
         } else {
             None
         };
+        let prepared_read_view = peers.prepare_original_kernel_read_view(
+            &preparation_retry.peer_id,
+            &preparation_retry.dst_ip,
+        );
         let emit_lock_started = Instant::now();
         let emit_guard = Arc::new(transport.acquire_outbound_emit_guard(&packet.peer_id).await);
         let emit_guard_acquired = Instant::now();
@@ -179,6 +212,22 @@ pub(super) async fn encrypt_then_send_with_deadline(
         // Resolve this owned primary socket before the epoch transaction.
         // The original generation/path/budget and final owner fences remain.
         let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
+        // Materialize real wire storage after the original emit turn and endpoint
+        // query. Emit wait retains only its original plaintext buffer budget;
+        // the same outer timeout/cancellation owner covers this allocation.
+        let prepared_wire = match crate::transport::PreparedEncryptionBuffer::new(
+            packet.packet.len(),
+            transport.resource_capture(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(EncryptSendOutcome::Terminal {
+                    packet: preparation_retry,
+                    reason_code: REASON_OUTBOUND_ENCRYPT_FAILED,
+                    reason: error.to_string(),
+                })
+            }
+        };
         let (
             encrypted,
             direct_business_plan,
@@ -187,7 +236,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
             serialized_buffer_lease,
         ) = {
             let epoch_gate_wait_started = Instant::now();
-            let (_epoch_guard, mut path_connections) =
+            let (mut _epoch_guard, mut path_connections) =
                 peers.lock_epoch_and_connections_write().await;
             let epoch_gate_acquired = Instant::now();
             if sampled_trace.is_some() {
@@ -381,9 +430,13 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 }
             }
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Encryption);
+            let read_view_phase = prepared_read_view.as_ref().and_then(|prepared| {
+                peers.publish_original_kernel_read_view(&mut _epoch_guard, prepared)
+            });
             let mut result = match transport
-                .encrypt_request_with_emit_guard_diagnostics(
+                .encrypt_request_with_prepared_buffer_diagnostics(
                     packet,
+                    prepared_wire,
                     Some(&mut crypto_profile),
                     Some(&mut encryption_log),
                 )
@@ -409,6 +462,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
                     });
                 }
             };
+            drop(read_view_phase);
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::PhysicalMetadata);
             // The original plaintext has been consumed by the crypto call.
             // Bind the returned wire owner before any further awaited work.
@@ -1369,6 +1423,10 @@ mod resource_capture_tests;
 #[cfg(test)]
 #[path = "tests/resource_capture_active_buffers.rs"]
 mod resource_capture_active_buffers_tests;
+
+#[cfg(test)]
+#[path = "tests/prepared_crypto_send.rs"]
+mod prepared_crypto_tests;
 
 #[cfg(test)]
 #[path = "tests/request_carriage_send.rs"]

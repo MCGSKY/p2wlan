@@ -2,11 +2,13 @@ use super::*;
 
 mod diagnostics;
 mod origin;
+mod prepared;
 pub(crate) use diagnostics::DeferredEncryptionLog;
 pub(crate) use origin::{
     EncryptedOutboundWithSource, OriginalEchoSessionGuard, OriginalEncryptionSource,
     SessionBoundEncryptionWithSource,
 };
+pub(crate) use prepared::PreparedEncryptionBuffer;
 
 impl WireGuardTransport {
     /// Encrypt and emit one packet while holding the peer's counter-ordering
@@ -279,6 +281,29 @@ impl WireGuardTransport {
         .await
     }
 
+    /// Same original session transaction, with storage prepared before epoch/sessions.
+    pub(crate) async fn encrypt_outbound_with_prepared_buffer_diagnostics(
+        &self,
+        packet: OutboundPacket,
+        prepared: PreparedEncryptionBuffer,
+        capture_source: bool,
+        profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
+        log: Option<&mut DeferredEncryptionLog>,
+    ) -> Result<Option<EncryptedOutboundWithSource>> {
+        self.encrypt_outbound_inner_with_capture(
+            prepared::EncryptionInput {
+                packet,
+                prepared: Some(prepared),
+            },
+            false,
+            true,
+            capture_source,
+            profile,
+            log,
+        )
+        .await
+    }
+
     pub(crate) fn try_encrypt_outbound_with_emit_guard_diagnostics(
         &self,
         packet: OutboundPacket,
@@ -522,13 +547,17 @@ impl WireGuardTransport {
     // One actual slow crypto path, shared by compatibility and sourced entries.
     async fn encrypt_outbound_inner_with_capture(
         &self,
-        packet: OutboundPacket,
+        input: impl Into<prepared::EncryptionInput>,
         queue_if_unavailable: bool,
         is_business: bool,
         capture_source: bool,
         mut profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
         mut log: Option<&mut DeferredEncryptionLog>,
     ) -> Result<Option<EncryptedOutboundWithSource>> {
+        let prepared::EncryptionInput {
+            packet,
+            mut prepared,
+        } = input.into();
         let profiler = global_dataplane_profiler();
         let sampled = packet.trace.as_ref().map(|trace| trace.sampled);
         let session_lock_started = Instant::now();
@@ -596,7 +625,10 @@ impl WireGuardTransport {
 
         let session_instance = active.session_instance;
         let crypto_started = Instant::now();
-        let wire_result = active.session.encrypt_to_bytes(&packet.packet);
+        let wire_result = match prepared.as_mut() {
+            Some(prepared) => prepared.encrypt(&mut active.session, &packet.packet),
+            None => active.session.encrypt_to_bytes(&packet.packet),
+        };
         let encrypted_at = if capture_source && wire_result.is_ok() {
             Some(Instant::now())
         } else {
@@ -655,7 +687,8 @@ impl WireGuardTransport {
         }
         drop(sessions);
 
-        Ok(Some(EncryptedOutboundWithSource::new(
+        Ok(Some(prepared::finish_encryption(
+            prepared,
             EncryptedPeerPacket {
                 room_authorization: packet.room_authorization,
                 peer_id: packet.peer_id,

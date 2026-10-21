@@ -37,6 +37,7 @@ impl PeerManager {
             local_node_id_for_traversal: std::sync::RwLock::new(config.node.node_id.clone()),
             connections: Arc::new(RwLock::new(HashMap::new())),
             peer_membership: Arc::new(std::sync::Mutex::new(PeerMembershipState::default())),
+            kernel_read_views: kernel_read_view::ReadViewRegistry::default(),
             #[cfg(test)]
             authenticated_probe_verify_gate: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]

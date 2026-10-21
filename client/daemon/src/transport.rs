@@ -640,7 +640,7 @@ pub(crate) use sessions::OriginalKernelTransportOwners;
 pub(crate) use sessions::{
     DeferredEncryptionLog, EncryptedOutboundWithSource, OriginalEchoSessionGuard,
     OriginalEncryptionSource, OriginalOverlaySessionFailure, OriginalOverlaySessionGuard,
-    SessionBoundEncryptionWithSource,
+    PreparedEncryptionBuffer, SessionBoundEncryptionWithSource,
 };
 #[cfg(any(target_os = "linux", all(unix, test)))]
 pub(crate) use sessions::{OriginalKernelEmitFailure, OriginalKernelTransportCurrent};

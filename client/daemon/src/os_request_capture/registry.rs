@@ -70,7 +70,7 @@ static NEXT_SCOPE: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct CaptureSession {
     #[cfg(unix)]
     owner: u64,
-    active: AtomicBool,
+    active: Arc<AtomicBool>,
     inbound_complete: AtomicBool,
     read_complete: AtomicBool,
     #[cfg(unix)]
@@ -293,13 +293,10 @@ impl CaptureSession {
             current_owners.clone(),
         );
         // All possible flow slots are reserved before this scope is exposed.
-        let mut flows = Vec::new();
-        flows
-            .try_reserve_exact(MAX_REQUESTS)
-            .map_err(|_| CaptureFailure::Capacity)?;
+        let flows = registration::flow_storage()?;
         let session = Arc::new(Self {
             owner,
-            active: AtomicBool::new(true),
+            active: Arc::new(AtomicBool::new(true)),
             inbound_complete: AtomicBool::new(true),
             read_complete: AtomicBool::new(true),
             #[cfg(unix)]
@@ -340,6 +337,7 @@ impl CaptureSession {
         if !plan.flows.is_empty() {
             session.register(plan)?;
         }
+        peers.register_original_kernel_read_observer(Arc::downgrade(&session.active), expires);
         Ok(session)
     }
 
@@ -457,6 +455,7 @@ impl CaptureSession {
     ) -> Result<Option<Arc<KernelReadBinding>>, CaptureFailure> {
         let udp = parse_os_udp(packet).ok();
         let tcp = parse_tcp_segment(packet).ok();
+        let packet_sha256: [u8; 32] = Sha256::digest(packet).into();
         #[cfg(unix)]
         let state = self.state.try_original_read_lock(original.ordinal());
         #[cfg(not(unix))]
@@ -614,7 +613,7 @@ impl CaptureSession {
             flow: index,
             slots,
             packet_len: packet.len(),
-            packet_sha256: Sha256::digest(packet).into(),
+            packet_sha256,
             plan,
             spans,
             physical_publication: crate::overlay_requests::PhysicalSendPublication::new(),

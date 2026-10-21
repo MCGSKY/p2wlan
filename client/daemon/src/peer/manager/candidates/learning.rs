@@ -5,24 +5,56 @@ impl PeerManager {
     /// address that was not present in the control-plane candidate set because
     /// the probe MAC proves the sender controls the peer identity.
     pub async fn learn_authenticated_endpoint(&self, node_id: &str, endpoint: SocketAddr) -> bool {
-        let epoch_gate = self.network_epoch_gate();
-        let epoch_guard = epoch_gate.lock().await;
-        self.learn_authenticated_endpoint_in_epoch(&epoch_guard, node_id, endpoint)
-            .await
+        // Release epoch while waiting for the actual connection writer. The
+        // shared helper returns both real guards in their original lock order.
+        let (epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
+        let learned = self.learn_authenticated_endpoint_with_connections(
+            &epoch_guard,
+            &mut conns,
+            node_id,
+            endpoint,
+        );
+        drop(conns);
+        if !learned {
+            return false;
+        }
+        self.finish_authenticated_endpoint_in_epoch(&epoch_guard, node_id)
+            .await;
+        true
     }
 
-    /// Learn authenticated endpoint evidence inside an existing network-epoch
-    /// transaction. The explicit guard prevents UDP adoption from accidentally
-    /// calling the public lock-taking wrapper while it already owns the same
-    /// non-reentrant mutex.
+    /// The caller already owns the actual epoch during UDP adoption. Do not
+    /// reacquire its non-reentrant gate; retain the original writer and fences.
     pub(crate) async fn learn_authenticated_endpoint_in_epoch(
         &self,
         epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
         node_id: &str,
         endpoint: SocketAddr,
     ) -> bool {
-        let generation = self.current_network_generation_sync();
         let mut conns = self.connections.write().await;
+        let learned = self.learn_authenticated_endpoint_with_connections(
+            epoch_guard,
+            &mut conns,
+            node_id,
+            endpoint,
+        );
+        drop(conns);
+        if !learned {
+            return false;
+        }
+        self.finish_authenticated_endpoint_in_epoch(epoch_guard, node_id)
+            .await;
+        true
+    }
+
+    fn learn_authenticated_endpoint_with_connections(
+        &self,
+        _epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
+        conns: &mut HashMap<String, PeerConnection>,
+        node_id: &str,
+        endpoint: SocketAddr,
+    ) -> bool {
+        let generation = self.current_network_generation_sync();
         let Some(conn) = conns.get_mut(node_id) else {
             return false;
         };
@@ -62,7 +94,14 @@ impl PeerManager {
                 ),
             );
         }
-        drop(conns);
+        true
+    }
+
+    async fn finish_authenticated_endpoint_in_epoch(
+        &self,
+        epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
+        node_id: &str,
+    ) {
         // An authenticated inbound punch is authoritative live-path evidence:
         // the peer can reach us RIGHT NOW, so a frozen or quota-exhausted
         // recovery epoch must re-open for one bounded retry instead of
@@ -80,7 +119,6 @@ impl PeerManager {
             "authenticated inbound punch observed",
         )
         .await;
-        true
     }
 
     /// Whether an endpoint was independently authenticated for this peer in

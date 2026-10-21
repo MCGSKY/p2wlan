@@ -8,6 +8,8 @@ use std::time::Instant;
 
 mod last_interval;
 use last_interval::{CompletedInterval, LastInterval};
+mod release_observation;
+use release_observation::{ReleaseObservation, ReleaseObservationSlot};
 
 pub(super) fn now_ns() -> Option<u64> {
     #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -88,6 +90,8 @@ impl Site {
             21
         } else if file.ends_with("peer/manager/path/admission.rs") {
             22
+        } else if file.ends_with("peer/manager/candidates/learning.rs") {
+            23
         } else {
             0
         };
@@ -120,6 +124,7 @@ impl Site {
             20 => "peer_incarnation",
             21 => "fresh_mapping",
             22 => "peer_path_admission",
+            23 => "authenticated_endpoint_learning",
             _ => "unclassified",
         }
     }
@@ -144,6 +149,7 @@ struct Refusal {
     returned: Option<u64>,
     holder: Option<Holder>,
     last_completed: Option<CompletedInterval>,
+    release_observation: Option<ReleaseObservation>,
     completion_claimed: AtomicBool,
     completion_observed: AtomicBool,
     ended: AtomicU64,
@@ -167,6 +173,7 @@ pub(super) struct Trace {
     read_peer_claimed: AtomicBool,
     read_peer_first: OnceLock<Refusal>,
     last: LastInterval,
+    release_observation: ReleaseObservationSlot,
 }
 
 impl Trace {
@@ -190,6 +197,7 @@ impl Trace {
             read_peer_claimed: AtomicBool::new(false),
             read_peer_first: OnceLock::new(),
             last: LastInterval::new(),
+            release_observation: ReleaseObservationSlot::new(),
         }
     }
     fn live(&self) -> bool {
@@ -271,6 +279,7 @@ impl Trace {
             returned: returned.filter(|n| *n != 0),
             holder,
             last_completed: self.last.observed_completed(),
+            release_observation: self.release_observation.try_snapshot(),
             completion_claimed: AtomicBool::new(false),
             completion_observed: AtomicBool::new(false),
             ended: AtomicU64::new(0),
@@ -282,6 +291,9 @@ impl Trace {
         }
     }
     pub(super) fn released(&self, token: u64, ended: Option<u64>) {
+        // The original actual guard has already been dropped by both wrappers.
+        // This upper release bound never replaces the old held-interval clock.
+        self.release_observation.record(token, now_ns());
         self.last.complete(token);
         let _ = self
             .current
@@ -368,6 +380,24 @@ impl Trace {
                 let (holder, covers) = interval.snapshot(first.started, first.returned);
                 (Some(holder), covers)
             });
+        let release_after_unlock_observation = first.release_observation.and_then(|release| {
+            let matches_recorded_first_holder = holder
+                .as_ref()
+                .is_some_and(|holder| holder.token == release.token);
+            let matches_recorded_last_completed_holder = last_completed_holder
+                .as_ref()
+                .is_some_and(|holder| holder.token == release.token);
+            (matches_recorded_first_holder || matches_recorded_last_completed_holder).then(|| {
+                EpochReleaseAfterUnlockSnapshot {
+                    token: release.token,
+                    observed_after_unlock_monotonic_ns: release.observed_after_unlock_ns,
+                    matches_recorded_first_holder,
+                    matches_recorded_last_completed_holder,
+                    definitely_before_failed_try: release
+                        .definitely_before(release.token, first.started),
+                }
+            })
+        });
         let context = first.context;
         Some(EpochRefusalSnapshot {
             scope,
@@ -390,6 +420,7 @@ impl Trace {
             holder_interval_covers_failed_try: covers,
             last_completed_holder,
             last_completed_holder_interval_covers_failed_try,
+            release_after_unlock_observation,
             native_os_write_verified: false,
             physical_send_verified: false,
             canonical_current_owner_verified: false,
@@ -456,6 +487,8 @@ pub(crate) struct EpochRefusalSnapshot {
     // A separate bounded observation; it never replaces the first holder.
     last_completed_holder: Option<EpochHolderSnapshot>,
     last_completed_holder_interval_covers_failed_try: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_after_unlock_observation: Option<EpochReleaseAfterUnlockSnapshot>,
     native_os_write_verified: bool,
     physical_send_verified: bool,
     canonical_current_owner_verified: bool,
@@ -499,3 +532,17 @@ mod tests {
 
 #[cfg(test)]
 mod completed_interval_tests;
+
+// A copied diagnostic upper bound after actual unlock, never a held interval
+// or a cause/permission. The first refusal alone freezes this observation.
+#[derive(Serialize)]
+struct EpochReleaseAfterUnlockSnapshot {
+    token: u64,
+    observed_after_unlock_monotonic_ns: u64,
+    matches_recorded_first_holder: bool,
+    matches_recorded_last_completed_holder: bool,
+    definitely_before_failed_try: bool,
+}
+
+#[cfg(all(unix, test))]
+mod release_observation_tests;

@@ -5,7 +5,7 @@
 //! - Transport messages: 12-byte nonce (4 zero bytes + 8-byte little-endian counter)
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
+    aead::{Aead, AeadInPlace, KeyInit, Payload},
     ChaCha20Poly1305, Key, Nonce,
 };
 
@@ -112,6 +112,22 @@ pub fn encrypt_with_counter(
 ) -> Result<Vec<u8>> {
     let nonce = nonce_from_counter(counter);
     encrypt(key, &nonce, aad, plaintext)
+}
+
+/// Encrypt an existing payload allocation, returning its detached tag.
+/// The caller owns the buffer and appends the tag to its wire representation.
+pub fn encrypt_in_place_with_counter(
+    key: &AeadKey,
+    counter: u64,
+    aad: &[u8],
+    payload: &mut [u8],
+) -> Result<[u8; TAG_SIZE]> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let nonce = nonce_from_counter(counter);
+    cipher
+        .encrypt_in_place_detached(Nonce::from_slice(&nonce), aad, payload)
+        .map(Into::into)
+        .map_err(|e| CryptoError::CipherError(format!("AEAD encrypt failed: {e}")))
 }
 
 /// Decrypt with a counter-based nonce (for WireGuard transport messages).

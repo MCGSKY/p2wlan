@@ -40,6 +40,27 @@ impl PeerManager {
                 return true;
             }
         }
+        // A settled Direct scheduling check also has no state to commit.
+        // Read the canonical connection, without joining the epoch writer
+        // queue. This grants neither a counter nor a physical/native permit;
+        // the actual preparation and final transaction revalidate all fences.
+        {
+            let conns = self.connections.read().await;
+            if generation == self.current_network_generation_sync()
+                && conns.get(node_id).is_some_and(|conn| {
+                    conn.online
+                        && conn.state != ConnectionState::Closed
+                        && (!(relay_available || self.relay_first_required())
+                            || conn.relay_first.gate_generation == Some(generation))
+                        && !conn.direct_first_pending()
+                        && conn.path_state_machine.direct_first_deadline().is_none()
+                        && (conn.has_current_authoritative_direct(generation)
+                            || conn.is_on_link_direct_for_generation(generation))
+                })
+            {
+                return true;
+            }
+        }
         // Release the reader before the unchanged epoch -> writer fallback.
         let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
         if generation != self.current_network_generation_sync() {

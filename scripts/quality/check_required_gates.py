@@ -81,6 +81,10 @@ class GateRequestError(RuntimeError):
     """The query could not be completed; the caller must not read this as success."""
 
 
+class GateVisibilityError(GateRequestError):
+    """A known authoritative run set is temporarily absent from current metadata."""
+
+
 @dataclass(frozen=True)
 class JobResult:
     name: str
@@ -239,6 +243,8 @@ class GitHubClient:
         self.api = api.rstrip("/")
         self.retries = retries
         self._job_cache: dict[tuple[int, int], tuple[JobResult, ...]] = {}
+        self._visibility_scope: tuple[str, frozenset[str] | None] | None = None
+        self._observed_run_keys: frozenset[tuple[int, str, str]] = frozenset()
 
     def _paginate(self, path: str, key: str, params: Mapping[str, str]) -> list[dict]:
         items: list[dict] = []
@@ -312,10 +318,7 @@ class GitHubClient:
             self._job_cache[key] = tuple(parsed)
         return tuple(parsed)
 
-    def runs_for(
-        self, head_sha: str, *, required_workflows: Iterable[str] | None = None
-    ) -> list[WorkflowRun]:
-        wanted = None if required_workflows is None else frozenset(required_workflows)
+    def _run_metadata_for(self, head_sha: str) -> list[WorkflowRun]:
         raw = self._paginate(
             f"/repos/{self.repo}/actions/runs", "workflow_runs", {"head_sha": head_sha}
         )
@@ -363,6 +366,36 @@ class GitHubClient:
                     created_at=created_at,
                 )
             )
+        return runs
+
+    def runs_for(
+        self, head_sha: str, *, required_workflows: Iterable[str] | None = None
+    ) -> list[WorkflowRun]:
+        wanted = None if required_workflows is None else frozenset(required_workflows)
+        scope = (head_sha, wanted)
+        if scope != self._visibility_scope:
+            self._visibility_scope = scope
+            self._observed_run_keys = frozenset()
+        for attempt in range(self.retries):
+            runs = self._run_metadata_for(head_sha)
+            current = frozenset(
+                (run.run_id, run.workflow_name, run.event)
+                for run in runs
+                if run.authoritative and (wanted is None or run.workflow_name in wanted)
+            )
+            missing = self._observed_run_keys - current
+            if not missing:
+                # Only identities are retained, never a prior pass/pending result.
+                # Pagination already bounds this set to MAX_PAGES * 100 entries.
+                self._observed_run_keys = current
+                break
+            if attempt + 1 == self.retries:
+                raise GateVisibilityError(
+                    f"run visibility regressed after {self.retries} metadata reads: "
+                    f"{len(missing)} previously observed authoritative runs disappeared"
+                )
+        else:
+            raise GateRequestError("no run metadata read was attempted")
         # Validate every head-filtered metadata page before omitting unrelated
         # jobs. Compatibility callers without a scope still read all jobs.
         return [
@@ -419,6 +452,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             runs = client.runs_for(args.sha, required_workflows=required_workflows)
             findings = evaluate(args.require, runs, head_sha=args.sha)
+        except GateVisibilityError as error:
+            # No previous finding is reused. Await a complete fresh snapshot
+            # within the same deadline; generic API errors still fail below.
+            print(f"required gate metadata pending for {args.sha}: {error}")
+            if time.monotonic() >= deadline:
+                print(f"FAIL required gates for {args.sha}: api_error: {error}", file=sys.stderr)
+                return 1
+            time.sleep(args.poll_seconds)
+            continue
         except GateRequestError as error:
             # A query that cannot be completed is an API error, not a pass.
             print(f"FAIL required gates for {args.sha}: api_error: {error}", file=sys.stderr)

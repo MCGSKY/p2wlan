@@ -54,6 +54,11 @@ mod tests {
         include!("tests/request_carriage_crypto.rs");
     }
 
+    mod prepared_crypto_tests {
+        use super::*;
+        include!("tests/prepared_crypto.rs");
+    }
+
     #[test]
     fn first_usable_evidence_requires_a_decrypted_overlay_ip_packet() {
         assert!(!is_real_overlay_business_packet(&[]));

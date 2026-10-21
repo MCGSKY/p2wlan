@@ -64,3 +64,11 @@ mod epoch_lock_callers;
 #[cfg(unix)]
 #[path = "tests/relay_admission_reader.rs"]
 mod relay_admission_reader;
+
+#[cfg(unix)]
+#[path = "tests/kernel_read_view.rs"]
+mod kernel_read_view;
+
+#[cfg(unix)]
+#[path = "tests/authenticated_endpoint_learning.rs"]
+mod authenticated_endpoint_learning;

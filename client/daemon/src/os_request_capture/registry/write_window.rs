@@ -3,6 +3,7 @@
 use super::*;
 use serde::Deserialize;
 
+mod expected;
 mod selection;
 
 #[derive(Deserialize)]
@@ -158,6 +159,7 @@ impl CaptureSession {
             .map(|(plan, _)| plan)
     }
 
+    #[cfg(all(unix, test))]
     async fn original_window_plan_with_prefix(
         &self,
         producer: [u8; 16],
@@ -206,19 +208,25 @@ impl CaptureSession {
         let supplied_nonce = super::super::plan::nonce(&wire.request_nonce)?;
         let supplied_producer = wire.validate(received, wire.frame_bytes, &supplied_nonce)?;
         let end = self.metadata_command_deadline(wire.original_deadline_ns)?;
-        let (prepared, prefix) = self
-            .original_window_plan_with_prefix(supplied_producer, end)
-            .await?;
-        // The first guard has already been dropped. Hash the unchanged full
-        // request bytes without excluding the real input's single try-lock.
-        let frame_matches = wire.matches_registered_request_frame(&prepared.plan);
-        let registered_validation = prepared.validate_registered_wire(&wire, received);
+        // Only expected input metadata is selected from the existing immutable
+        // published cells. No registry guard or IO authority is obtained here.
+        let prepared = expected::prepare(self, supplied_producer);
+        let frame_matches = prepared
+            .as_ref()
+            .is_ok_and(|plan| wire.matches_registered_request_frame(&plan.plan));
+        let registered_validation = prepared
+            .as_ref()
+            .map_err(|error| *error)
+            .and_then(|plan| plan.validate_registered_wire(&wire, received));
         let mut state = self.state.lock_until(end).await?;
         let now = monotonic_ns().ok_or(CaptureFailure::InvalidPlan)?;
         if !self.is_live(Instant::now()) {
             return Err(CaptureFailure::Expired);
         }
-        let flow_index = prefix.current_index(&prepared, &state)?;
+        let prepared = prepared?;
+        // This sole actual guard repeats the original unique producer/shape
+        // checks and exact Arc fence before any metadata can be installed.
+        let flow_index = selection::current_original_index(&prepared, &state)?;
         let flow = &mut state.flows[flow_index];
         if flow.requests.iter().any(|request| {
             request

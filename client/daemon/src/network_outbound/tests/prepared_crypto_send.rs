@@ -1,0 +1,404 @@
+//! Poll the actual bounded send against its real epoch gate; no physical I/O.
+use super::super::test_support::*;
+use super::*;
+use crate::config::Config;
+use crate::dataplane_resources::{BufferStage, ResidencyStage, ResourceCapture};
+
+fn packet() -> OutboundPacket {
+    OutboundPacket {
+        room_authorization: None,
+        peer_id: "peer-a".into(),
+        dst_ip: "10.20.0.2".into(),
+        packet: Ipv4Packet::build_icmp_echo_request(
+            "10.20.0.1".parse().unwrap(),
+            "10.20.0.2".parse().unwrap(),
+            3,
+            4,
+            b"prepared-epoch-storage",
+        ),
+        trace: None,
+    }
+}
+
+fn assert_drained(capture: &ResourceCapture) {
+    let residency = capture.residency_snapshot();
+    assert!(residency.valid && residency.coherent);
+    assert_eq!(residency.gap_bits, 0);
+    assert_eq!(residency.total.unwrap().live_buffers, 0);
+    for stage in [
+        BufferStage::ActiveOriginal,
+        BufferStage::RetryPlaintext,
+        BufferStage::PreparationPlaintext,
+        BufferStage::SerializedWire,
+    ] {
+        assert_eq!(capture.snapshot().buffer(stage).live_buffers, 0);
+    }
+}
+
+async fn exercise(mode: u8) {
+    let capture = ResourceCapture::new([0x95 + mode; 16]);
+    let peers = PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+    peers
+        .add_peer(&test_peer("peer-a", "127.0.0.1:41000".parse().unwrap()))
+        .await;
+    let (session, mut remote) = establish_sessions();
+    let (transport, mut receiver) = WireGuardTransport::new();
+    let transport = transport.with_resource_capture(capture.clone()).unwrap();
+    assert!(!transport.add_session("peer-a", session).await);
+    let original = packet();
+    let len = original.packet.len() as u64;
+    let gate = peers.network_epoch_gate();
+    let epoch = gate.lock().await;
+    let udps = RwLock::new(None);
+    let relays = RwLock::new(None);
+    let generation = peers.current_network_generation_sync();
+    let deadline = Instant::now()
+        + if mode == 1 {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(2)
+        };
+    // Queue the real generation writer first. Polling send first would give
+    // the fair mutex's reserved turn to an unpolled future, deadlocking this
+    // test driver rather than exercising the generation fence.
+    let mut advance =
+        Box::pin(peers.advance_network_generation("prepared buffer is not generation authority"));
+    if mode == 2 {
+        assert!(matches!(
+            futures_util::poll!(advance.as_mut()),
+            std::task::Poll::Pending
+        ));
+    }
+    let mut attempt = Box::pin(encrypt_then_send_with_deadline(
+        original.clone(),
+        &transport,
+        &peers,
+        generation,
+        true,
+        &udps,
+        &relays,
+        false,
+        Some(deadline),
+        None,
+    ));
+    assert!(matches!(
+        futures_util::poll!(attempt.as_mut()),
+        std::task::Poll::Pending
+    ));
+    assert!(transport
+        .try_acquire_outbound_emit_guard("peer-a")
+        .is_none());
+    drop(transport.hold_session_registry_for_test().await);
+    let live = capture.residency_snapshot();
+    assert!(live.valid && live.coherent);
+    assert_eq!(live.gap_bits, 0);
+    assert_eq!(live.unknown_bits, 1); // Fixture enters at the actual send boundary.
+    assert_eq!(live.total.unwrap().live_buffers, 4);
+    assert_eq!(live.total.unwrap().len_bytes, 4 * len + 32);
+    let buffers = capture.snapshot();
+    assert_eq!(
+        buffers
+            .buffer(BufferStage::PreparationPlaintext)
+            .live_buffers,
+        2
+    );
+    assert_eq!(
+        buffers.buffer(BufferStage::PreparationPlaintext).len,
+        2 * len + 32
+    );
+    assert_eq!(
+        live.stage(ResidencyStage::SerializedWire)
+            .unwrap()
+            .live_buffers,
+        0
+    );
+    assert_eq!(buffers.buffer(BufferStage::SerializedWire).live_buffers, 0);
+    if mode == 2 {
+        drop(epoch);
+        assert_ne!(
+            tokio::time::timeout(Duration::from_secs(2), advance.as_mut())
+                .await
+                .unwrap(),
+            generation
+        );
+        let outcome = attempt.await;
+        assert!(matches!(
+            outcome,
+            EncryptSendOutcome::Retryable {
+                reason_code: REASON_OUTBOUND_GENERATION_CHANGED,
+                ..
+            }
+        ));
+    } else {
+        if mode == 1 {
+            let outcome = tokio::time::timeout(Duration::from_secs(2), attempt.as_mut())
+                .await
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                EncryptSendOutcome::Retryable {
+                    reason_code: REASON_OUTBOUND_ADMISSION_TIMEOUT,
+                    ..
+                }
+            ));
+            assert!(Instant::now() >= deadline);
+        }
+        drop(attempt);
+        drop(epoch);
+    }
+    assert_drained(&capture);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    let emit = transport.acquire_outbound_emit_guard("peer-a").await;
+    let encrypted = transport
+        .encrypt_outbound_with_emit_guard(original.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(emit);
+    assert_eq!(
+        crate::transport::wire_counter(&encrypted.wire_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        remote.decrypt_from_bytes(&encrypted.wire_bytes).unwrap(),
+        original.packet
+    );
+    assert_drained(&capture);
+}
+
+#[tokio::test]
+async fn prepared_send_cancelled_epoch_wait_releases_storage_and_original_emit() {
+    exercise(0).await;
+}
+
+#[tokio::test]
+async fn prepared_send_original_deadline_releases_epoch_wait_without_counter_or_handoff() {
+    exercise(1).await;
+}
+
+#[tokio::test]
+async fn prepared_send_generation_change_rejects_storage_before_counter_or_handoff() {
+    exercise(2).await;
+}
+
+#[tokio::test]
+async fn unpolled_bounded_send_has_small_stack_state_and_takes_no_guards() {
+    let peers = PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+    let (transport, _receiver) = WireGuardTransport::new();
+    let gate = peers.network_epoch_gate();
+    let epoch = gate.lock().await;
+    let emit = transport.acquire_outbound_emit_guard("peer-a").await;
+    let udp = RwLock::new(None);
+    let relay = RwLock::new(None);
+    let future = encrypt_then_send_with_deadline(
+        packet(),
+        &transport,
+        &peers,
+        peers.current_network_generation_sync(),
+        true,
+        &udp,
+        &relay,
+        false,
+        Some(Instant::now() + Duration::from_secs(1)),
+        None,
+    );
+    // The outer caller may nest several operations on Windows' default test
+    // stack. Keep this API's retained frame under a fixed 1KiB budget.
+    assert!(std::mem::size_of_val(&future) <= 1024);
+    drop(future);
+    assert!(gate.try_lock().is_err());
+    assert!(transport
+        .try_acquire_outbound_emit_guard("peer-a")
+        .is_none());
+    drop(emit);
+    drop(epoch);
+    assert!(transport
+        .try_acquire_outbound_emit_guard("peer-a")
+        .is_some());
+    assert!(gate.try_lock().is_ok());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_actual_crypto_wait_invalidates_read_view_before_epoch_unlock() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // This interest is a metadata label, never a KernelRead/Full/native fact.
+    let active = Arc::new(AtomicBool::new(true));
+    let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::RelayOnly;
+    let peers = Arc::new(PeerManager::new(config));
+    peers
+        .add_peer(&test_peer("peer-a", "127.0.0.1:41000".parse().unwrap()))
+        .await;
+    peers.register_original_kernel_read_observer(
+        Arc::downgrade(&active),
+        Instant::now() + Duration::from_secs(30),
+    );
+    let capture = ResourceCapture::new([0x99; 16]);
+    let (session, mut remote) = establish_sessions();
+    let (transport, mut receiver) = WireGuardTransport::new();
+    let transport = transport.with_resource_capture(capture.clone()).unwrap();
+    assert!(!transport.add_session("peer-a", session).await);
+    let sessions = transport.hold_session_registry_for_test().await;
+    let udp = RwLock::new(None);
+    let relay = RwLock::new(None);
+    let mut attempt = Box::pin(encrypt_then_send_with_deadline(
+        packet(),
+        &transport,
+        &peers,
+        peers.current_network_generation_sync(),
+        false,
+        &udp,
+        &relay,
+        true,
+        Some(Instant::now() + Duration::from_secs(2)),
+        None,
+    ));
+    assert!(futures_util::poll!(attempt.as_mut()).is_pending());
+    let first = peers
+        .try_capture_original_kernel_read_peer("peer-a", "10.20.0.2".parse().unwrap(), None)
+        .unwrap();
+    assert!(first.try_identity_at(&peers, Instant::now()).is_err());
+    assert!(peers.network_epoch_gate().try_lock().is_err());
+    drop(attempt);
+    assert_drained(&capture);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    let gate = peers.network_epoch_gate();
+    let epoch = gate.lock().await;
+    assert!(peers
+        .try_capture_original_kernel_read_peer("peer-a", "10.20.0.2".parse().unwrap(), None)
+        .is_err());
+    drop(epoch);
+    active.store(false, Ordering::Release);
+    drop(sessions);
+    assert!(transport
+        .try_acquire_outbound_emit_guard("peer-a")
+        .is_some());
+    let emit = transport.acquire_outbound_emit_guard("peer-a").await;
+    let encrypted = transport
+        .encrypt_outbound_with_emit_guard(packet())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(emit);
+    assert_eq!(
+        crate::transport::wire_counter(&encrypted.wire_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        remote.decrypt_from_bytes(&encrypted.wire_bytes).unwrap(),
+        packet().packet
+    );
+    drop(encrypted);
+    assert_drained(&capture);
+}
+
+#[cfg(unix)]
+async fn exercise_metadata_before_emit(deadline_expires: bool) {
+    let peers = PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+    // This interest enables metadata preparation only, never an IO fact.
+    let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    peers.register_original_kernel_read_observer(
+        Arc::downgrade(&active),
+        Instant::now() + Duration::from_secs(30),
+    );
+    let capture = ResourceCapture::new([0xa1 + u8::from(deadline_expires); 16]);
+    let (session, mut remote) = establish_sessions();
+    let (transport, mut receiver) = WireGuardTransport::new();
+    let transport = transport.with_resource_capture(capture.clone()).unwrap();
+    assert!(!transport.add_session("peer-a", session).await);
+    let held_emit = transport.acquire_outbound_emit_guard("peer-a").await;
+    let udp = RwLock::new(None);
+    let relay = RwLock::new(None);
+    let deadline = Instant::now()
+        + if deadline_expires {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(2)
+        };
+    let mut attempt = Box::pin(encrypt_then_send_with_deadline(
+        packet(),
+        &transport,
+        &peers,
+        peers.current_network_generation_sync(),
+        true,
+        &udp,
+        &relay,
+        false,
+        Some(deadline),
+        None,
+    ));
+    assert!(futures_util::poll!(attempt.as_mut()).is_pending());
+    // Pure expectation metadata can be prepared before Emit. Real wire
+    // storage must wait for its actual turn and the original endpoint query.
+    // Keep the original one-preparation/three-total plaintext owner budget.
+    assert_eq!(
+        capture
+            .snapshot()
+            .buffer(BufferStage::PreparationPlaintext)
+            .live_buffers,
+        1
+    );
+    let live = capture.residency_snapshot();
+    assert!(live.valid && live.coherent);
+    assert_eq!(live.total.unwrap().live_buffers, 3);
+    assert!(peers.network_epoch_gate().try_lock().is_ok());
+    if deadline_expires {
+        let outcome = tokio::time::timeout(Duration::from_secs(2), attempt.as_mut())
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            EncryptSendOutcome::Retryable {
+                reason_code: REASON_OUTBOUND_ADMISSION_TIMEOUT,
+                ..
+            }
+        ));
+        assert!(Instant::now() >= deadline);
+    }
+    drop(attempt);
+    assert_drained(&capture);
+    assert!(transport
+        .try_acquire_outbound_emit_guard("peer-a")
+        .is_none());
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    drop(held_emit);
+    let emit = transport.acquire_outbound_emit_guard("peer-a").await;
+    let encrypted = transport
+        .encrypt_outbound_with_emit_guard(packet())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(emit);
+    assert_eq!(
+        crate::transport::wire_counter(&encrypted.wire_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        remote.decrypt_from_bytes(&encrypted.wire_bytes).unwrap(),
+        packet().packet
+    );
+    drop(encrypted);
+    assert_drained(&capture);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn metadata_before_emit_keeps_original_buffer_budget_and_counter_on_cancel() {
+    exercise_metadata_before_emit(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn emit_wait_metadata_keeps_original_deadline_and_buffer_budget() {
+    exercise_metadata_before_emit(true).await;
+}
