@@ -298,3 +298,97 @@ async fn cancelling_actual_crypto_wait_invalidates_read_view_before_epoch_unlock
     drop(encrypted);
     assert_drained(&capture);
 }
+
+#[cfg(unix)]
+async fn exercise_storage_before_emit(deadline_expires: bool) {
+    let peers = PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+    let capture = ResourceCapture::new([0xa1 + u8::from(deadline_expires); 16]);
+    let (session, mut remote) = establish_sessions();
+    let (transport, mut receiver) = WireGuardTransport::new();
+    let transport = transport.with_resource_capture(capture.clone()).unwrap();
+    assert!(!transport.add_session("peer-a", session).await);
+    let held_emit = transport.acquire_outbound_emit_guard("peer-a").await;
+    let udp = RwLock::new(None);
+    let relay = RwLock::new(None);
+    let deadline = Instant::now()
+        + if deadline_expires {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(2)
+        };
+    let mut attempt = Box::pin(encrypt_then_send_with_deadline(
+        packet(),
+        &transport,
+        &peers,
+        peers.current_network_generation_sync(),
+        true,
+        &udp,
+        &relay,
+        false,
+        Some(deadline),
+        None,
+    ));
+    assert!(futures_util::poll!(attempt.as_mut()).is_pending());
+    // Both preparation buffers already exist, even though this send has never
+    // acquired the actual emit turn, epoch, or session/counter owner.
+    assert_eq!(
+        capture
+            .snapshot()
+            .buffer(BufferStage::PreparationPlaintext)
+            .live_buffers,
+        2
+    );
+    assert!(peers.network_epoch_gate().try_lock().is_ok());
+    if deadline_expires {
+        let outcome = tokio::time::timeout(Duration::from_secs(2), attempt.as_mut())
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            EncryptSendOutcome::Retryable {
+                reason_code: REASON_OUTBOUND_ADMISSION_TIMEOUT,
+                ..
+            }
+        ));
+        assert!(Instant::now() >= deadline);
+    }
+    drop(attempt);
+    assert_drained(&capture);
+    assert!(transport
+        .try_acquire_outbound_emit_guard("peer-a")
+        .is_none());
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    drop(held_emit);
+    let emit = transport.acquire_outbound_emit_guard("peer-a").await;
+    let encrypted = transport
+        .encrypt_outbound_with_emit_guard(packet())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(emit);
+    assert_eq!(
+        crate::transport::wire_counter(&encrypted.wire_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        remote.decrypt_from_bytes(&encrypted.wire_bytes).unwrap(),
+        packet().packet
+    );
+    drop(encrypted);
+    assert_drained(&capture);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pure_storage_precedes_emit_and_cancellation_keeps_original_counter() {
+    exercise_storage_before_emit(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pre_emit_storage_wait_uses_original_deadline_and_drains_on_timeout() {
+    exercise_storage_before_emit(true).await;
+}
