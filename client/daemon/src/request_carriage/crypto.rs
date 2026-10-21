@@ -2,7 +2,8 @@
 use super::{DeliveryMetadata, EncryptedRequestDelivery, RawRequestDelivery};
 use crate::error::{DaemonError, Result};
 use crate::transport::{
-    SessionBoundEncryptionWithSource, SessionUnavailableReason, WireGuardTransport,
+    PreparedEncryptionBuffer, SessionBoundEncryptionWithSource, SessionUnavailableReason,
+    WireGuardTransport,
 };
 
 fn observe_crypto_input(transport: &WireGuardTransport, packet: &mut RawRequestDelivery) {
@@ -49,16 +50,48 @@ impl WireGuardTransport {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn encrypt_request_with_emit_guard_diagnostics(
         &self,
+        packet: RawRequestDelivery,
+        profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
+        log: Option<&mut crate::transport::DeferredEncryptionLog>,
+    ) -> Result<Option<EncryptedRequestDelivery>> {
+        self.encrypt_request_in_original_session(packet, None, profile, log)
+            .await
+    }
+
+    pub(crate) async fn encrypt_request_with_prepared_buffer_diagnostics(
+        &self,
+        packet: RawRequestDelivery,
+        prepared: PreparedEncryptionBuffer,
+        profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
+        log: Option<&mut crate::transport::DeferredEncryptionLog>,
+    ) -> Result<Option<EncryptedRequestDelivery>> {
+        self.encrypt_request_in_original_session(packet, Some(prepared), profile, log)
+            .await
+    }
+
+    async fn encrypt_request_in_original_session(
+        &self,
         mut packet: RawRequestDelivery,
+        prepared: Option<PreparedEncryptionBuffer>,
         profile: Option<&mut crate::dataplane::DeferredCryptoProfile<'_>>,
         log: Option<&mut crate::transport::DeferredEncryptionLog>,
     ) -> Result<Option<EncryptedRequestDelivery>> {
         observe_crypto_input(self, &mut packet);
         let RawRequestDelivery { raw, metadata } = packet;
         let (binding, original_residency) = metadata.into_parts();
-        let encrypted = if let Some(log) = log {
+        let encrypted = if let Some(prepared) = prepared {
+            self.encrypt_outbound_with_prepared_buffer_diagnostics(
+                raw,
+                prepared,
+                binding.is_some(),
+                profile,
+                log,
+            )
+            .await?
+        } else if let Some(log) = log {
             self.encrypt_outbound_with_emit_guard_diagnostics(raw, binding.is_some(), profile, log)
                 .await?
         } else if binding.is_some() {

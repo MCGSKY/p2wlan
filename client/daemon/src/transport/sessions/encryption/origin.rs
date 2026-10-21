@@ -94,7 +94,7 @@ impl OriginalEncryptionSource {
         self.owner.upgrade().is_some()
     }
 
-    // Only the encryption parent may capture after encrypt_to_bytes Ok, while
+    // Only the encryption parent may capture after actual session crypto Ok, while
     // the same original sessions guard still owns this actual active slot.
     pub(super) fn capture_successful_slot(
         transport: &WireGuardTransport,
@@ -152,6 +152,18 @@ pub(crate) struct EncryptedOutboundWithSource {
 }
 
 impl EncryptedOutboundWithSource {
+    pub(super) fn with_residency(
+        packet: EncryptedPeerPacket,
+        source: Option<OriginalEncryptionSource>,
+        residency: Option<crate::dataplane_resources::ResidencyLease>,
+    ) -> Self {
+        Self {
+            packet,
+            source,
+            residency: residency.map(Box::new),
+        }
+    }
+
     pub(super) fn new(
         packet: EncryptedPeerPacket,
         source: Option<OriginalEncryptionSource>,

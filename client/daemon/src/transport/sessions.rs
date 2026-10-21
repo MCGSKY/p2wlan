@@ -7,7 +7,7 @@ mod kernel_owner;
 mod overlay_credit;
 pub(crate) use encryption::{
     DeferredEncryptionLog, EncryptedOutboundWithSource, OriginalEchoSessionGuard,
-    OriginalEncryptionSource, SessionBoundEncryptionWithSource,
+    OriginalEncryptionSource, PreparedEncryptionBuffer, SessionBoundEncryptionWithSource,
 };
 pub(crate) use kernel_owner::OriginalKernelTransportOwners;
 #[cfg(any(target_os = "linux", all(unix, test)))]

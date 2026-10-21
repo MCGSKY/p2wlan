@@ -51,7 +51,7 @@ pub mod types;
 // Re-export primary types
 pub use error::{Result, WireGuardError};
 pub use handshake::{HandshakeInitiator, HandshakeResponder, TransportKeyPair};
-pub use session::TransportSession;
+pub use session::{PreparedTransportBuffer, TransportSession};
 pub use types::{
     MessageInitiation, MessageResponse, MessageTransport, PeerConfig, SessionKeys,
     INITIALIZATION_MSG_SIZE, RESPONSE_MSG_SIZE, TYPE_COOKIE_REPLY, TYPE_INITIALIZATION,

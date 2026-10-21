@@ -179,6 +179,21 @@ pub(super) async fn encrypt_then_send_with_deadline(
         // Resolve this owned primary socket before the epoch transaction.
         // The original generation/path/budget and final owner fences remain.
         let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
+        // Prepare storage before epoch/sessions. Keep the original emit turn,
+        // timeout and cancellation owner; no key, index or counter is cached.
+        let prepared_wire = match crate::transport::PreparedEncryptionBuffer::new(
+            packet.packet.len(),
+            transport.resource_capture(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(EncryptSendOutcome::Terminal {
+                    packet: preparation_retry,
+                    reason_code: REASON_OUTBOUND_ENCRYPT_FAILED,
+                    reason: error.to_string(),
+                })
+            }
+        };
         let (
             encrypted,
             direct_business_plan,
@@ -382,8 +397,9 @@ pub(super) async fn encrypt_then_send_with_deadline(
             }
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Encryption);
             let mut result = match transport
-                .encrypt_request_with_emit_guard_diagnostics(
+                .encrypt_request_with_prepared_buffer_diagnostics(
                     packet,
+                    prepared_wire,
                     Some(&mut crypto_profile),
                     Some(&mut encryption_log),
                 )
@@ -1369,6 +1385,10 @@ mod resource_capture_tests;
 #[cfg(test)]
 #[path = "tests/resource_capture_active_buffers.rs"]
 mod resource_capture_active_buffers_tests;
+
+#[cfg(test)]
+#[path = "tests/prepared_crypto_send.rs"]
+mod prepared_crypto_tests;
 
 #[cfg(test)]
 #[path = "tests/request_carriage_send.rs"]

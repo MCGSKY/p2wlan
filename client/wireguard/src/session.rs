@@ -14,6 +14,9 @@ use crate::error::{Result, WireGuardError};
 use crate::handshake::TransportKeyPair;
 use crate::types::MessageTransport;
 
+mod prepared;
+pub use prepared::PreparedTransportBuffer;
+
 /// Sliding window size for replay protection (64 packets).
 const REPLAY_WINDOW_SIZE: u64 = 64;
 
@@ -117,6 +120,21 @@ impl TransportSession {
     ///
     /// A WireGuard transport data message (Type 4).
     pub fn encrypt(&mut self, packet: &[u8]) -> Result<MessageTransport> {
+        let (encrypted_payload, counter) = self
+            .encrypt_payload(|key, counter| Ok(encrypt_with_counter(key, counter, b"", packet)?))?;
+        Ok(MessageTransport {
+            receiver_index: self.peer_index,
+            counter,
+            encrypted_payload,
+        })
+    }
+
+    // Both representations allocate their nonce only at this actual session.
+    // Expiry and overflow precede crypto; only successful crypto advances it.
+    fn encrypt_payload<T>(
+        &mut self,
+        encrypt: impl FnOnce(&Hash, u64) -> Result<T>,
+    ) -> Result<(T, u64)> {
         if self.is_expired() {
             return Err(WireGuardError::InvalidPacket(
                 "session expired; rekey required".into(),
@@ -128,18 +146,9 @@ impl TransportSession {
 
         let counter = self.send_counter;
 
-        // The associated data for transport messages is empty in WireGuard.
-        // But the nonce encodes the counter, and the receiver_index identifies the session.
-        // Actually, WireGuard transport messages use empty AAD.
-        let encrypted = encrypt_with_counter(&self.send_key, counter, b"", packet)?;
-
+        let encrypted = encrypt(&self.send_key, counter)?;
         self.send_counter += 1;
-
-        Ok(MessageTransport {
-            receiver_index: self.peer_index,
-            counter,
-            encrypted_payload: encrypted,
-        })
+        Ok((encrypted, counter))
     }
 
     /// Encrypt a packet and serialize to wire format in one call.
@@ -291,3 +300,6 @@ impl std::fmt::Debug for TransportSession {
 
 #[cfg(test)]
 include!("session/tests.rs");
+
+#[cfg(test)]
+mod prepared_tests;
