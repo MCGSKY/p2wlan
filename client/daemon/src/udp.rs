@@ -479,6 +479,8 @@ use punch_pacing::HardHardProbePacer;
 mod punch_reports;
 
 #[cfg(test)]
+pub(crate) mod local_addr_test;
+#[cfg(test)]
 mod original_dynamic_test;
 #[cfg(test)]
 pub(crate) use original_dynamic_test::{
