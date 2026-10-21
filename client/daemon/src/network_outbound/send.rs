@@ -176,6 +176,9 @@ pub(super) async fn encrypt_then_send_with_deadline(
             );
         }
         preparation_log.acquired(emit_lock_wait_ms);
+        // Resolve this owned primary socket before the epoch transaction.
+        // The original generation/path/budget and final owner fences remain.
+        let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
         let (
             encrypted,
             direct_business_plan,
@@ -204,7 +207,6 @@ pub(super) async fn encrypt_then_send_with_deadline(
             });
             }
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Path);
-            let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
             let selection = peers.select_path_for_data_with_local_endpoint_in_epoch_with_conns(
                 &mut path_connections,
                 &preparation_retry.peer_id,

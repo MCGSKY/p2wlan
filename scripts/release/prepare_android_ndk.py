@@ -18,6 +18,8 @@ import time
 import xml.etree.ElementTree as ET
 import zipfile
 
+from prepare_android_sdk_view import prepare_sdk_view
+
 
 CATALOG_URL = "https://dl.google.com/android/repository/repository2-1.xml"
 BASE_URL = "https://dl.google.com/android/repository/"
@@ -275,7 +277,7 @@ def bind_gradle_properties(properties, root):
                 after_sha256=digest(target), ndk_dir=str(root), other_properties_preserved=True)
 
 
-def prepare(flutter_sdk, work_dir, github_env, source_commit, android_local_properties=None):
+def prepare(flutter_sdk, work_dir, github_env, source_commit, android_local_properties=None, android_sdk_root=None):
     if not re.fullmatch(r"[a-f0-9]{40}", source_commit):
         raise SetupError("source_commit_invalid", "Expected a complete checkout commit")
     if not work_dir.is_absolute() or any(c in str(work_dir) for c in "\r\n"):
@@ -307,6 +309,10 @@ def prepare(flutter_sdk, work_dir, github_env, source_commit, android_local_prop
         receipt["successful_archive_reclaimed_after_verification"] = True
         receipt["gradle_local_properties"] = bind_gradle_properties(android_local_properties, root)
         values = {key: str(root) for key in ["ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "P2WLAN_ANDROID_NDK_PATH"]}
+        if android_sdk_root is not None:
+            view = prepare_sdk_view(android_sdk_root, work_dir, root, version, end=end)
+            receipt["android_sdk_view"] = view
+            values.update(ANDROID_HOME=view["sdk_root"], ANDROID_SDK_ROOT=view["sdk_root"])
         with github_env.open("a") as stream:
             stream.write("".join(f"{key}={value}\n" for key, value in values.items()))
         receipt["github_environment_exported_after_verification"] = True
@@ -326,9 +332,10 @@ def main():
     parser.add_argument("--github-env", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--android-local-properties", type=Path)
+    parser.add_argument("--android-sdk-root", type=Path)
     args = parser.parse_args()
     try:
-        receipt = prepare(args.flutter_sdk, args.work_dir, args.github_env, args.source_commit, args.android_local_properties)
+        receipt = prepare(args.flutter_sdk, args.work_dir, args.github_env, args.source_commit, args.android_local_properties, args.android_sdk_root)
     except (SetupError, OSError, ValueError, subprocess.TimeoutExpired, zipfile.BadZipFile) as error:
         parser.exit(1, json.dumps(dict(reason_code=getattr(error, "code", "ndk_setup_invalid"), detail=str(error))) + "\n")
     print(json.dumps(receipt, sort_keys=True))

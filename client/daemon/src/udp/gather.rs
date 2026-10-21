@@ -11,6 +11,8 @@ struct LiveStunResponse {
 impl UdpTransport {
     /// Return the local UDP socket address.
     pub fn local_addr(&self) -> Result<SocketAddr> {
+        #[cfg(test)]
+        local_addr_test::observe(self);
         self.socket
             .local_addr()
             .map_err(|e| DaemonError::Network(format!("failed to read UDP local addr: {e}")))
