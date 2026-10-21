@@ -208,6 +208,10 @@ async fn encrypt_then_send_bounded(
         // Resolve this owned primary socket before the epoch transaction.
         // The original generation/path/budget and final owner fences remain.
         let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
+        let prepared_read_view = peers.prepare_original_kernel_read_view(
+            &preparation_retry.peer_id,
+            &preparation_retry.dst_ip,
+        );
         // Prepare storage before epoch/sessions. Keep the original emit turn,
         // timeout and cancellation owner; no key, index or counter is cached.
         let prepared_wire = match crate::transport::PreparedEncryptionBuffer::new(
@@ -231,7 +235,7 @@ async fn encrypt_then_send_bounded(
             serialized_buffer_lease,
         ) = {
             let epoch_gate_wait_started = Instant::now();
-            let (_epoch_guard, mut path_connections) =
+            let (mut _epoch_guard, mut path_connections) =
                 peers.lock_epoch_and_connections_write().await;
             let epoch_gate_acquired = Instant::now();
             if sampled_trace.is_some() {
@@ -425,6 +429,9 @@ async fn encrypt_then_send_bounded(
                 }
             }
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::Encryption);
+            let read_view_phase = prepared_read_view.as_ref().and_then(|prepared| {
+                peers.publish_original_kernel_read_view(&mut _epoch_guard, prepared)
+            });
             let mut result = match transport
                 .encrypt_request_with_prepared_buffer_diagnostics(
                     packet,
@@ -454,6 +461,7 @@ async fn encrypt_then_send_bounded(
                     });
                 }
             };
+            drop(read_view_phase);
             _epoch_guard.note_outbound_phase(crate::peer::OutboundEpochPhase::PhysicalMetadata);
             // The original plaintext has been consumed by the crypto call.
             // Bind the returned wire owner before any further awaited work.

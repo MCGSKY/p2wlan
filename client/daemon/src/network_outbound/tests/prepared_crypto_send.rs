@@ -220,3 +220,81 @@ async fn unpolled_bounded_send_has_small_stack_state_and_takes_no_guards() {
         .is_some());
     assert!(gate.try_lock().is_ok());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_actual_crypto_wait_invalidates_read_view_before_epoch_unlock() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // This interest is a metadata label, never a KernelRead/Full/native fact.
+    let active = Arc::new(AtomicBool::new(true));
+    let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::RelayOnly;
+    let peers = Arc::new(PeerManager::new(config));
+    peers
+        .add_peer(&test_peer("peer-a", "127.0.0.1:41000".parse().unwrap()))
+        .await;
+    peers.register_original_kernel_read_observer(
+        Arc::downgrade(&active),
+        Instant::now() + Duration::from_secs(30),
+    );
+    let capture = ResourceCapture::new([0x99; 16]);
+    let (session, mut remote) = establish_sessions();
+    let (transport, mut receiver) = WireGuardTransport::new();
+    let transport = transport.with_resource_capture(capture.clone()).unwrap();
+    assert!(!transport.add_session("peer-a", session).await);
+    let sessions = transport.hold_session_registry_for_test().await;
+    let udp = RwLock::new(None);
+    let relay = RwLock::new(None);
+    let mut attempt = Box::pin(encrypt_then_send_with_deadline(
+        packet(),
+        &transport,
+        &peers,
+        peers.current_network_generation_sync(),
+        false,
+        &udp,
+        &relay,
+        true,
+        Some(Instant::now() + Duration::from_secs(2)),
+        None,
+    ));
+    assert!(futures_util::poll!(attempt.as_mut()).is_pending());
+    let first = peers
+        .try_capture_original_kernel_read_peer("peer-a", "10.20.0.2".parse().unwrap(), None)
+        .unwrap();
+    assert!(first.try_identity_at(&peers, Instant::now()).is_err());
+    assert!(peers.network_epoch_gate().try_lock().is_err());
+    drop(attempt);
+    assert_drained(&capture);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    let gate = peers.network_epoch_gate();
+    let epoch = gate.lock().await;
+    assert!(peers
+        .try_capture_original_kernel_read_peer("peer-a", "10.20.0.2".parse().unwrap(), None)
+        .is_err());
+    drop(epoch);
+    active.store(false, Ordering::Release);
+    drop(sessions);
+    assert!(transport
+        .try_acquire_outbound_emit_guard("peer-a")
+        .is_some());
+    let emit = transport.acquire_outbound_emit_guard("peer-a").await;
+    let encrypted = transport
+        .encrypt_outbound_with_emit_guard(packet())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(emit);
+    assert_eq!(
+        crate::transport::wire_counter(&encrypted.wire_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        remote.decrypt_from_bytes(&encrypted.wire_bytes).unwrap(),
+        packet().packet
+    );
+    drop(encrypted);
+    assert_drained(&capture);
+}

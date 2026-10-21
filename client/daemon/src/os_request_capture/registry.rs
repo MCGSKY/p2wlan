@@ -70,7 +70,7 @@ static NEXT_SCOPE: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct CaptureSession {
     #[cfg(unix)]
     owner: u64,
-    active: AtomicBool,
+    active: Arc<AtomicBool>,
     inbound_complete: AtomicBool,
     read_complete: AtomicBool,
     #[cfg(unix)]
@@ -299,7 +299,7 @@ impl CaptureSession {
             .map_err(|_| CaptureFailure::Capacity)?;
         let session = Arc::new(Self {
             owner,
-            active: AtomicBool::new(true),
+            active: Arc::new(AtomicBool::new(true)),
             inbound_complete: AtomicBool::new(true),
             read_complete: AtomicBool::new(true),
             #[cfg(unix)]
@@ -340,6 +340,7 @@ impl CaptureSession {
         if !plan.flows.is_empty() {
             session.register(plan)?;
         }
+        peers.register_original_kernel_read_observer(Arc::downgrade(&session.active), expires);
         Ok(session)
     }
 

@@ -141,20 +141,39 @@ impl PeerManager {
             crate::peer::EpochTryContext,
         >,
     ) -> std::result::Result<OriginalKernelReadPeer, OverlayCreditOutcome> {
-        let (generation, lifecycle) = self.try_kernel_read_peer_values(
+        let preobserved = self.kernel_read_views.observe(peer, target);
+        let original = self.try_kernel_read_peer_values(
             peer,
             target,
             #[cfg(any(target_os = "linux", all(unix, test)))]
             context,
-        )?;
-        Ok(OriginalKernelReadPeer {
+        );
+        let (generation, lifecycle, used_view) = match original {
+            Ok((generation, lifecycle)) => (generation, lifecycle, false),
+            Err(OverlayCreditOutcome::Contended(CreditLock::Epoch)) => {
+                let Some((_, generation, lifecycle)) = preobserved.as_ref() else {
+                    return Err(OverlayCreditOutcome::Contended(CreditLock::Epoch));
+                };
+                (*generation, *lifecycle, true)
+            }
+            Err(error) => return Err(error),
+        };
+        let captured = OriginalKernelReadPeer {
             owner: Arc::downgrade(self),
             peer: peer.to_owned(),
             target,
             generation,
             lifecycle,
             observed_at: Instant::now(),
-        })
+        };
+        if used_view
+            && !preobserved
+                .as_ref()
+                .is_some_and(|(view, _, _)| view.is_live(captured.observed_at))
+        {
+            return Err(OverlayCreditOutcome::Contended(CreditLock::Epoch));
+        }
+        Ok(captured)
     }
 
     fn try_kernel_read_peer_values(
@@ -165,7 +184,7 @@ impl PeerManager {
             crate::peer::EpochTryContext,
         >,
     ) -> std::result::Result<(u64, PeerSessionGeneration), OverlayCreditOutcome> {
-        use OverlayCreditOutcome::{Contended, Stale};
+        use OverlayCreditOutcome::Contended;
         #[cfg(any(target_os = "linux", all(unix, test)))]
         let _epoch = self
             .network_epoch_gate
@@ -176,6 +195,16 @@ impl PeerManager {
             .network_epoch_gate
             .try_lock()
             .map_err(|_| Contended(CreditLock::Epoch))?;
+        self.try_kernel_read_peer_values_in_epoch(&_epoch, peer, target)
+    }
+
+    fn try_kernel_read_peer_values_in_epoch(
+        &self,
+        _epoch: &tokio::sync::MutexGuard<'_, ()>,
+        peer: &str,
+        target: std::net::Ipv4Addr,
+    ) -> std::result::Result<(u64, PeerSessionGeneration), OverlayCreditOutcome> {
+        use OverlayCreditOutcome::{Contended, Stale};
         let connections = self
             .connections
             .try_read()

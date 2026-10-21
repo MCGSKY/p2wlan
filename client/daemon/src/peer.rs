@@ -653,6 +653,7 @@ pub(crate) use path_selection_log::DeferredPathSelectionLog;
 use path_selection_log::PathSelectionLog;
 
 mod epoch_gate;
+mod kernel_read_view;
 #[cfg(any(target_os = "linux", all(unix, test)))]
 pub(crate) use epoch_gate::{EpochRefusalSnapshot, EpochTraceLease, EpochTryContext};
 pub(crate) use epoch_gate::{
