@@ -183,3 +183,40 @@ async fn prepared_send_original_deadline_releases_epoch_wait_without_counter_or_
 async fn prepared_send_generation_change_rejects_storage_before_counter_or_handoff() {
     exercise(2).await;
 }
+
+#[tokio::test]
+async fn unpolled_bounded_send_has_small_stack_state_and_takes_no_guards() {
+    let peers = PeerManager::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+    let (transport, _receiver) = WireGuardTransport::new();
+    let gate = peers.network_epoch_gate();
+    let epoch = gate.lock().await;
+    let emit = transport.acquire_outbound_emit_guard("peer-a").await;
+    let udp = RwLock::new(None);
+    let relay = RwLock::new(None);
+    let future = encrypt_then_send_with_deadline(
+        packet(),
+        &transport,
+        &peers,
+        peers.current_network_generation_sync(),
+        true,
+        &udp,
+        &relay,
+        false,
+        Some(Instant::now() + Duration::from_secs(1)),
+        None,
+    );
+    // The outer caller may nest several operations on Windows' default test
+    // stack. Keep this API's retained frame under a fixed 1KiB budget.
+    assert!(std::mem::size_of_val(&future) <= 1024);
+    drop(future);
+    assert!(gate.try_lock().is_err());
+    assert!(transport
+        .try_acquire_outbound_emit_guard("peer-a")
+        .is_none());
+    drop(emit);
+    drop(epoch);
+    assert!(transport
+        .try_acquire_outbound_emit_guard("peer-a")
+        .is_some());
+    assert!(gate.try_lock().is_ok());
+}

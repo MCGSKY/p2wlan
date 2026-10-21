@@ -33,7 +33,36 @@ pub(super) async fn encrypt_then_send(
 /// Encrypt a RAW packet (holding the peer's emit lock) and send it while the
 /// guard is still held.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn encrypt_then_send_with_deadline(
+pub(super) fn encrypt_then_send_with_deadline<'a>(
+    packet: impl Into<RawRequestDelivery> + Send + 'a,
+    transport: &'a WireGuardTransport,
+    peers: &'a PeerManager,
+    expected_generation: u64,
+    prefer_direct: bool,
+    udp_transport: &'a RwLock<Option<UdpTransport>>,
+    relay_transport: &'a RwLock<Option<RelayTransport>>,
+    relay_expected: bool,
+    admission_deadline: Option<Instant>,
+    stopping: Option<&'a AtomicBool>,
+) -> impl std::future::Future<Output = EncryptSendOutcome> + Send + 'a {
+    // Return a small heap-owned frame to callers that nest several sends.
+    // Boxing acquires no guards; original clocks still start on first poll.
+    Box::pin(encrypt_then_send_bounded(
+        packet,
+        transport,
+        peers,
+        expected_generation,
+        prefer_direct,
+        udp_transport,
+        relay_transport,
+        relay_expected,
+        admission_deadline,
+        stopping,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn encrypt_then_send_bounded(
     packet: impl Into<RawRequestDelivery> + Send,
     transport: &WireGuardTransport,
     peers: &PeerManager,
