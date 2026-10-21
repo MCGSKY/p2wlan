@@ -1,12 +1,14 @@
-//! Reuse the original unique-producer lookup only for the same registration
-//! revision and length. Appends advance that sole owner's checked revision.
+//! Recheck producer uniqueness, shape and the exact original registration Arc.
+//! Expected metadata cannot authorize a window outside the real owner.
 use super::*;
 
+#[cfg(all(unix, test))]
 pub(super) struct RegistrationPrefix {
     revision: u64,
     flows: usize,
 }
 
+#[cfg(all(unix, test))]
 impl RegistrationPrefix {
     pub(super) fn capture(state: &RegistryState) -> Self {
         Self {
@@ -48,6 +50,28 @@ impl RegistrationPrefix {
         }
         Ok(index)
     }
+}
+
+// Expected published labels never authorize the selection. Recheck the whole
+// original unique-producer condition under the actual registration owner.
+pub(super) fn current_original_index(
+    prepared: &OriginalWindowPlan,
+    state: &RegistryState,
+) -> Result<usize, CaptureFailure> {
+    let mut flows = state
+        .flows
+        .iter()
+        .enumerate()
+        .filter(|(_, flow)| flow.producer_scope == prepared.producer);
+    let (index, flow) = flows.next().ok_or(CaptureFailure::InvalidPlan)?;
+    if flows.next().is_some()
+        || flow.requests.len() != 8
+        || flow.plan.payload_bytes != 128
+        || !prepared.is_current(index, flow)
+    {
+        return Err(CaptureFailure::InvalidPlan);
+    }
+    Ok(index)
 }
 
 #[cfg(all(unix, test))]

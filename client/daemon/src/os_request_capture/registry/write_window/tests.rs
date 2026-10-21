@@ -2,6 +2,8 @@
 use super::*;
 
 #[cfg(unix)]
+mod expected;
+#[cfg(unix)]
 mod selection;
 
 fn labels() -> WireWriteWindow {
